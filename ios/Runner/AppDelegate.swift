@@ -224,7 +224,7 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
         result(FlutterError(code: "bad_args", message: "url/title 缺失", details: nil))
         return
       }
-      let asset = AVURLAsset(url: urlObj)
+      let asset = makeAsset(urlObj, headers: headersOf(args))
       let downloadConfig = AVAssetDownloadConfiguration(asset: asset, title: title)
       let task = session.makeAssetDownloadTask(downloadConfiguration: downloadConfig)
       // taskId 优先沿用 Dart 侧生成的 id（让首帧进度事件就能对上资源库条目），
@@ -335,7 +335,7 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
         result(false)
         return
       }
-      let asset = AVURLAsset(url: urlObj)
+      let asset = makeAsset(urlObj, headers: headersOf(args))
       let downloadConfig = AVAssetDownloadConfiguration(asset: asset, title: title)
       let task = session.makeAssetDownloadTask(downloadConfiguration: downloadConfig)
       taskIds[taskId] = task
@@ -345,6 +345,27 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
     default:
       result(FlutterMethodNotImplemented)
     }
+  }
+
+  /// 从方法参数里取请求头（Dart 侧只有防盗链站才传，通常只有 Referer）
+  private func headersOf(_ args: [String: Any]) -> [String: String] {
+    if let h = args["headers"] as? [String: String] { return h }
+    return [:]
+  }
+
+  /// 带 HTTP 头的 AVURLAsset。
+  ///
+  /// AVAssetDownloadTask 走的是独立的 URLSession，没有 WKWebView 的页面会话：
+  /// 不带 Referer / UA 时，防盗链源站会直接 403 —— 表现就是「页面里能播、
+  /// 嗅探也 ok，一点离线下载就失败」。AVFoundation 至今没有公开的「给下载任务
+  /// 加请求头」API，只能靠 AVURLAssetHTTPHeaderFieldsKey（私有 key，但这是
+  /// AVAssetDownloadTask 唯一可行的途径，AVPlayer 生态里广泛使用）。
+  private func makeAsset(_ url: URL, headers: [String: String]) -> AVURLAsset {
+    if headers.isEmpty { return AVURLAsset(url: url) }
+    return AVURLAsset(
+      url: url,
+      options: ["AVURLAssetHTTPHeaderFieldsKey": headers]
+    )
   }
 
   private func playOffline(localUrl: URL) {
@@ -823,6 +844,23 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
   private var completionHandlers: [String: () -> Void] = [:]
   private let lock = NSLock()
 
+  /// 在途 task 的字节计数（taskIdentifier → 已写/预期），仅内存态。
+  /// didWriteData 只在 App 运行时（前台）被调用，后台期间不更新，所以它只用于
+  /// 「前台真实字节进度」；正确性仍以磁盘分片 + state.json 为准。
+  private struct LiveBytes {
+    var jobId: String
+    var written: Int64 = 0
+    var expected: Int64 = 0
+  }
+  private var live: [Int: LiveBytes] = [:]
+  /// jobId → 已落盘分片的字节数（缓存；缺失时扫盘重建）
+  private var diskBytes: [String: Int64] = [:]
+  /// taskIdentifier → jobId（taskDescription 在后台重启后可能丢失，兜底缓存）
+  private var taskJob: [Int: String] = [:]
+  /// 事件节流：每个作业最多每 0.5s 推一次（几百个 task 每个都写 state.json 会把 IO 打满）
+  private var lastEmitAt: [String: Date] = [:]
+  private static let emitInterval: TimeInterval = 0.5
+
   override init() {
     super.init()
     // 必须用同一 identifier 重建 session，才能接管系统代跑的 task（含冷启动唤醒）。
@@ -904,10 +942,13 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
     let base = URL(fileURLWithPath: workDir)
     var pending = [[String: Any]]()
     var skipped = 0
+    var skippedBytes: Int64 = 0
     for part in parts {
       let name = part["name"] as? String ?? ""
-      if hasNonEmptyFile(base.appendingPathComponent(name).path) {
+      let path = base.appendingPathComponent(name).path
+      if hasNonEmptyFile(path) {
         skipped += 1
+        skippedBytes += fileSize(path)
       } else {
         pending.append(part)
       }
@@ -924,8 +965,13 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
       "finished": skipped,
       "failed": 0,
       "total": parts.count,
+      "bytes": Int(skippedBytes),
     ]
     saveState(jobId, state)
+    lock.lock()
+    diskBytes[jobId] = skippedBytes
+    lastEmitAt.removeValue(forKey: jobId)
+    lock.unlock()
 
     if pending.isEmpty {
       state["state"] = "ready"
@@ -944,6 +990,10 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
       let task = session.downloadTask(with: req)
       // 后台 relaunch 后 taskDescription 不保证保留，didFinish 里另有 URL 查表兜底
       task.taskDescription = "\(jobId)|\(name)"
+      lock.lock()
+      taskJob[task.taskIdentifier] = jobId
+      live[task.taskIdentifier] = LiveBytes(jobId: jobId)
+      lock.unlock()
       task.resume()
     }
     return true
@@ -958,6 +1008,7 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
         t.cancel()
       }
     }
+    dropCaches(jobId)
     clearJob(arguments)
     return true
   }
@@ -970,24 +1021,139 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
     else { return false }
     let dir = stateURL(jobId).deletingLastPathComponent()
     try? FileManager.default.removeItem(at: dir)
+    dropCaches(jobId)
     return true
+  }
+
+  /// 清掉内存态计数，避免作业被删后还留着字节数
+  private func dropCaches(_ jobId: String) {
+    lock.lock()
+    defer { lock.unlock() }
+    let ids = live.filter { $0.value.jobId == jobId }.map { $0.key }
+    for tid in ids {
+      live.removeValue(forKey: tid)
+      taskJob.removeValue(forKey: tid)
+    }
+    diskBytes.removeValue(forKey: jobId)
+    lastEmitAt.removeValue(forKey: jobId)
   }
 
   private func listJobs() -> [[String: Any]] {
     allStates().map { entry -> [String: Any] in
       let st = entry.1
+      let p = progress(for: entry.0, state: st)
       return [
         "jobId": st["jobId"] as? String ?? "",
         "state": st["state"] as? String ?? "downloading",
         "workDir": st["workDir"] as? String ?? "",
         "done": st["done"] as? Int ?? 0,
         "total": st["total"] as? Int ?? 0,
+        "bytes": Int(p.bytes),
+        "bytesTotal": Int(p.total),
+        "bytesEstimated": p.estimated,
         "error": st["error"] as? String ?? "",
       ]
     }
   }
 
+  // MARK: - 字节进度
+
+  /// 已下字节 = 已落盘分片 + 在途 task 已写字节；总量在拿不到 Content-Length
+  /// 的分片上按已知分片均值外推（estimated=true 时 Dart 侧标 ≈）。
+  private func progress(for jobId: String, state: [String: Any])
+    -> (bytes: Int64, total: Int64, estimated: Bool)
+  {
+    let workDir = state["workDir"] as? String ?? ""
+    lock.lock()
+    if diskBytes[jobId] == nil { diskBytes[jobId] = scanBytes(workDir) }
+    let disk = diskBytes[jobId] ?? 0
+    var written: Int64 = 0
+    var knownExp: Int64 = 0
+    var knownCnt = 0
+    var unknownCnt = 0
+    for (_, c) in live where c.jobId == jobId {
+      written += c.written
+      if c.expected > 0 {
+        knownExp += c.expected
+        knownCnt += 1
+      } else {
+        unknownCnt += 1
+      }
+    }
+    lock.unlock()
+
+    let bytes = disk + written
+    // 一个 Content-Length 都还没拿到时（全部 task 排队中）不给总量：
+    // 返回 bytes 会让 Dart 算出「已下 == 总量 == 100%」，正是要避免的假进度。
+    var total: Int64 = 0
+    if knownCnt > 0 {
+      total = disk + knownExp
+      if unknownCnt > 0 {
+        total += Int64(Double(knownExp) / Double(knownCnt) * Double(unknownCnt))
+      }
+      if total < bytes { total = bytes }
+    }
+    return (bytes, total, unknownCnt > 0)
+  }
+
+  /// 目录内实际落盘字节（冷启动接管系统代跑 task 时用它重建基线）
+  private func scanBytes(_ workDir: String) -> Int64 {
+    guard !workDir.isEmpty else { return 0 }
+    let fm = FileManager.default
+    guard
+      let names = try? fm.contentsOfDirectory(atPath: workDir)
+    else { return 0 }
+    var sum: Int64 = 0
+    for n in names {
+      // playlist.m3u8 也在同一目录，几 KB，忽略不影响进度
+      if n.hasSuffix(".m3u8") { continue }
+      sum += fileSize((workDir as NSString).appendingPathComponent(n))
+    }
+    return sum
+  }
+
+  private func fileSize(_ path: String) -> Int64 {
+    let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+    return (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+  }
+
+  /// 节流判定（同时记录本次推送时间）
+  private func shouldEmit(_ jobId: String) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    let now = Date()
+    if let last = lastEmitAt[jobId], now.timeIntervalSince(last) < Self.emitInterval {
+      return false
+    }
+    lastEmitAt[jobId] = now
+    return true
+  }
+
   // MARK: - URLSessionDownloadDelegate
+
+  /// 前台实时字节进度。后台期间系统不会调用（App 被挂起），所以这里只用于
+  /// 「亮屏时的真实速度」，回前台/冷启动的进度由 listJobs() 扫盘重建。
+  func urlSession(
+    _ session: URLSession,
+    downloadTask: URLSessionDownloadTask,
+    didWriteData bytesWritten: Int64,
+    totalBytesWritten: Int64,
+    totalBytesExpectedToWrite: Int64
+  ) {
+    let tid = downloadTask.taskIdentifier
+    lock.lock()
+    let jobId = taskJob[tid] ?? Self.jobIdOf(downloadTask)
+    if let jobId {
+      var c = live[tid] ?? LiveBytes(jobId: jobId)
+      c.written = totalBytesWritten
+      if totalBytesExpectedToWrite > 0 { c.expected = totalBytesExpectedToWrite }
+      live[tid] = c
+      taskJob[tid] = jobId
+    }
+    lock.unlock()
+    guard let jid = jobId, shouldEmit(jid), let st = loadState(jid) else { return }
+    emit(st)
+  }
 
   func urlSession(
     _ session: URLSession,
@@ -1016,10 +1182,20 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
         ok = false
       }
     }
+    // 这一片的实际大小计入磁盘基线，同时清掉在途计数（避免同一片被算两次）
+    let tid = downloadTask.taskIdentifier
+    lock.lock()
+    if ok { diskBytes[jobId, default: 0] += fileSize(dest.path) }
+    live.removeValue(forKey: tid)
+    taskJob.removeValue(forKey: tid)
+    let diskNow = diskBytes[jobId] ?? 0
+    lock.unlock()
+
     if let updated = updateState(jobId, { state in
       state["finished"] = (state["finished"] as? Int ?? 0) + 1
       if ok {
         state["done"] = (state["done"] as? Int ?? 0) + 1
+        state["bytes"] = Int(diskNow)
       } else {
         state["failed"] = (state["failed"] as? Int ?? 0) + 1
         if state["error"] == nil { state["error"] = "分片落盘失败: \(name)" }
@@ -1031,6 +1207,11 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
   }
 
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    let tid = task.taskIdentifier
+    lock.lock()
+    live.removeValue(forKey: tid)
+    taskJob.removeValue(forKey: tid)
+    lock.unlock()
     // 成功路径已在 didFinishDownloadingTo 里计过 finished，这里只补失败
     guard let error else { return }
     guard let resolved = resolve(task: task) else { return }
@@ -1142,16 +1323,30 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
   }
 
   private func emit(_ state: [String: Any]) {
+    let jobId = state["jobId"] as? String ?? ""
+    let p = progress(for: jobId, state: state)
     let payload: [String: Any] = [
-      "jobId": state["jobId"] as? String ?? "",
+      "jobId": jobId,
       "state": state["state"] as? String ?? "downloading",
       "done": state["done"] as? Int ?? 0,
       "total": state["total"] as? Int ?? 0,
+      "bytes": Int(p.bytes),
+      "bytesTotal": Int(p.total),
+      "bytesEstimated": p.estimated,
       "error": state["error"] as? String ?? "",
     ]
     DispatchQueue.main.async { [weak self] in
       self?.eventSink?(payload)
     }
+  }
+
+  /// 从 taskDescription（`<jobId>|<name>`）取 jobId；后台重启后可能为空
+  private static func jobIdOf(_ task: URLSessionTask) -> String? {
+    guard let desc = task.taskDescription,
+      let range = desc.range(of: "|")
+    else { return nil }
+    let id = String(desc[desc.startIndex..<range.lowerBound])
+    return id.isEmpty ? nil : id
   }
 
   private func hasNonEmptyFile(_ path: String) -> Bool {

@@ -22,11 +22,19 @@ class DownloadTask {
   String title; // 重命名后同步更新（完成项仍驻留内存列表）
   final String kind;
   final DateTime startedAt;
+
+  /// 防盗链 Referer（嗅探到的那个 frame 的地址）。空串 = 未知，不加该头。
+  /// 页面能播而 Dio 直下 403，绝大多数就是缺这个（以及 Cookie）。
+  final String referer;
   String? localPath;
   String? partPath;
   double progress = 0;
   double speed = 0; // 字节/秒
   Duration? eta;
+  /// 已下载字节（含断点续传前已写入的部分）
+  int bytesDone = 0;
+  /// 总字节（Content-Length / Content-Range 给出；0 = 服务端未给长度）
+  int bytesTotal = 0;
   DownloadStatus status = DownloadStatus.queued;
   String? error;
 
@@ -35,6 +43,7 @@ class DownloadTask {
     required this.url,
     required this.title,
     required this.kind,
+    this.referer = '',
     DateTime? startedAt,
   }) : startedAt = startedAt ?? DateTime.now();
 
@@ -54,6 +63,7 @@ class DownloadTask {
         'url': url,
         'title': title,
         'kind': kind,
+        'referer': referer,
         'localPath': localPath,
         'folder': '',
         'savedAt': DateTime.now().toIso8601String(),
@@ -64,6 +74,7 @@ class DownloadTask {
         url: j['url'] as String,
         title: (j['title'] as String?) ?? '',
         kind: (j['kind'] as String?) ?? 'other',
+        referer: (j['referer'] as String?) ?? '',
       );
 
   /// 中断时的持久化状态（供下次启动恢复续传）
@@ -72,6 +83,7 @@ class DownloadTask {
         'url': url,
         'title': title,
         'kind': kind,
+        'referer': referer,
         'part': partPath,
         'startedAt': startedAt.toIso8601String(),
       };
@@ -82,6 +94,7 @@ class DownloadTask {
         url: j['url'] as String,
         title: (j['title'] as String?) ?? '',
         kind: (j['kind'] as String?) ?? 'other',
+        referer: (j['referer'] as String?) ?? '',
         startedAt: DateTime.tryParse((j['startedAt'] as String?) ?? ''),
       )..partPath = j['part'] as String?;
 }
@@ -178,7 +191,7 @@ class DownloadManager extends ChangeNotifier {
             }
             final part = File(t.partPath!);
             if (await part.exists() && await part.length() > 0) {
-              t.error = '已暂停，可继续下载';
+              t.error = '已暂停';
               _tasks.insert(0, t);
             } else {
               // 残留文件已丢失，清理无效 pending 记录
@@ -234,7 +247,11 @@ class DownloadManager extends ChangeNotifier {
     }
     final id = DateTime.now().millisecondsSinceEpoch.toString();
     final task = DownloadTask(
-        id: id, url: v.url, title: v.pageTitle, kind: v.kind);
+        id: id,
+        url: v.url,
+        title: v.pageTitle,
+        kind: v.kind,
+        referer: v.effectiveReferer);
     _tasks.insert(0, task);
     notifyListeners();
     await _run(task);
@@ -255,6 +272,8 @@ class DownloadManager extends ChangeNotifier {
     task.progress = 0;
     task.speed = 0;
     task.eta = null;
+    task.bytesDone = 0;
+    task.bytesTotal = 0;
     notifyListeners();
 
     final cancel = CancelToken();
@@ -287,6 +306,9 @@ class DownloadManager extends ChangeNotifier {
 
       final headers = <String, dynamic>{};
       if (offset > 0) headers['Range'] = 'bytes=$offset-';
+      // 防盗链：带嗅探到的那个 frame 的地址。不带的话，能正常播放的直链在
+      // Dio 这条链上会直接 403（用户看到的就是「网络问题」）。
+      if (task.referer.isNotEmpty) headers['Referer'] = task.referer;
 
       final resp = await _dio.get<ResponseBody>(
         task.url,
@@ -324,6 +346,10 @@ class DownloadManager extends ChangeNotifier {
         throw Exception('下载失败，HTTP ${resp.statusCode}');
       }
       if (total < 0) total = 0;
+      // 断点续传：已落盘的 offset 也算「已下载」，否则进度会从 0 重来
+      task.bytesDone = offset;
+      task.bytesTotal = total;
+      task.progress = total > 0 ? offset / total : 0;
 
       final raf = await partFile.open(mode: FileMode.append);
       var lastBytes = 0;
@@ -334,6 +360,8 @@ class DownloadManager extends ChangeNotifier {
           received += chunk.length;
           final done = offset + received;
           if (total > 0) task.progress = done / total;
+          task.bytesDone = done;
+          task.bytesTotal = total;
           // 网速与预计剩余时间（每 ~1s 采样一次）
           final now = DateTime.now();
           final dtMs = now.difference(lastTime).inMilliseconds;
@@ -393,11 +421,11 @@ class DownloadManager extends ChangeNotifier {
       }
       if (cancel.isCancelled) {
         task.status = DownloadStatus.failed;
-        task.error = '已暂停，可继续下载';
+        task.error = '已暂停';
         AppLog.instance.info('download', '下载已暂停: ${task.title}');
       } else {
         task.status = DownloadStatus.failed;
-        task.error = e.toString();
+        task.error = _explain(e);
         var detail = '下载失败: ${task.title}（${task.url}）';
         if (e is DioException) {
           detail += ' [${e.type.name} HTTP ${e.response?.statusCode ?? '-'}]';
@@ -414,6 +442,35 @@ class DownloadManager extends ChangeNotifier {
 
   void cancel(String id) {
     _cancels.remove(id)?.cancel();
+  }
+
+  /// 把异常翻成用户能看懂、且能据此行动的失败原因。
+  ///
+  /// 旧实现把 `e.toString()` 直接当提示，用户看到的一律是「网络问题」——
+  /// 而真实原因里最常见的是 403 防盗链和 404 过期，两者都不是网络问题，
+  /// 提示归因错了，用户既没法自查也没法自查要不要重试。
+  static String _explain(Object e) {
+    if (e is! DioException) return e.toString();
+    final code = e.response?.statusCode ?? 0;
+    if (code == 401 || code == 403) {
+      return '源站拒绝访问（HTTP $code）：多为防盗链（缺 Referer / Cookie）或签名已失效';
+    }
+    if (code == 404 || code == 410) {
+      return '链接已失效（HTTP $code）：回页面刷新后重新嗅探';
+    }
+    if (code >= 500) return '源站异常（HTTP $code），稍后重试';
+    switch (e.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.sendTimeout:
+      case DioExceptionType.receiveTimeout:
+        return '连接超时：网络不通或源站限速';
+      case DioExceptionType.connectionError:
+        return '连接失败：DNS / 证书 / 网络不可达';
+      case DioExceptionType.cancel:
+        return '已暂停';
+      default:
+        return code > 0 ? 'HTTP $code' : (e.message ?? e.toString());
+    }
   }
 
   /// 移动单个已保存视频到文件夹（'' = 移回「全部」）。

@@ -14,13 +14,17 @@ class HlsDownloader {
   static const _events = EventChannel('video_downloader/hls/events');
 
   /// 返回 taskId（原生建任务成功即返回，不等下载完成）
+  ///
+  /// [referer]：防盗链要用的页面地址。原生 AVAssetDownloadTask 走独立 URLSession，
+  /// 不带页面会话 —— 不给 Referer 的话，能正常播放的源也会 403。
   static Future<String> download(String url, String title,
-      {String taskId = ''}) async {
+      {String taskId = '', String referer = ''}) async {
     final r = await _method.invokeMethod<String>('download', {
       'url': url,
       'title': title,
       // 由 Dart 侧预生成，保证进度事件到达时能对上资源库条目
       if (taskId.isNotEmpty) 'taskId': taskId,
+      if (referer.isNotEmpty) 'headers': {'Referer': referer},
     });
     return r ?? '';
   }
@@ -72,12 +76,14 @@ class HlsDownloader {
   }
 
   /// 重试失败任务（原生重建 AVAssetDownloadTask，沿用同一 taskId）
-  static Future<bool> retry(String taskId, String url, String title) async {
+  static Future<bool> retry(String taskId, String url, String title,
+      {String referer = ''}) async {
     try {
       final r = await _method.invokeMethod<bool>('retry', {
         'taskId': taskId,
         'url': url,
         'title': title,
+        if (referer.isNotEmpty) 'headers': {'Referer': referer},
       });
       return r ?? false;
     } catch (_) {
@@ -94,6 +100,10 @@ class HlsTask {
   String taskId;
   final String url;
   String title; // 重命名后同步更新（完成项仍驻留内存列表）
+
+  /// 防盗链 Referer（嗅探到的那个 frame 的地址）；重启恢复 / 续传都要带着
+  final String referer;
+
   final DateTime startedAt;
   double progress = 0;
   Duration? eta; // 按进度速率估算
@@ -109,6 +119,7 @@ class HlsTask {
     required this.taskId,
     required this.url,
     required this.title,
+    this.referer = '',
     DateTime? startedAt,
   }) : startedAt = startedAt ?? DateTime.now();
 
@@ -163,11 +174,12 @@ class HlsManager extends ChangeNotifier {
               taskId: taskId,
               url: url,
               title: (j['title'] as String?) ?? '',
+              referer: (j['referer'] as String?) ?? '',
               startedAt: DateTime.tryParse((j['startedAt'] as String?) ?? ''),
             )
               ..failed = true
               ..startedOk = true
-              ..error = '已暂停，可继续下载';
+              ..error = '已暂停';
             tasks.add(t);
             restored.add({'taskId': taskId, 'url': url, 'title': t.title});
           } catch (e, st) {
@@ -253,7 +265,7 @@ class HlsManager extends ChangeNotifier {
     }
   }
 
-  Future<void> start(String url, String title) async {
+  Future<void> start(String url, String title, {String referer = ''}) async {
     // 同 URL 已有未完成任务：失败→继续，进行中→忽略（避免重复建条目）；
     // 已完成→允许重新下载（旧实现用 _started 永久去重，第二次点下载毫无反应）
     for (final t in tasks) {
@@ -268,12 +280,14 @@ class HlsManager extends ChangeNotifier {
       taskId: DateTime.now().millisecondsSinceEpoch.toString(),
       url: url,
       title: title,
+      referer: referer,
     );
     tasks.add(task);
     notifyListeners();
     try {
       // 超时兜底：原生若迟迟不回（通道未注册/引擎异常），不能让它一直 0% 转圈
-      final taskId = await HlsDownloader.download(url, title, taskId: task.taskId)
+      final taskId = await HlsDownloader.download(url, title,
+              taskId: task.taskId, referer: referer)
           .timeout(const Duration(seconds: 10));
       if (taskId.isEmpty) throw Exception('原生下载任务未创建');
       if (taskId != task.taskId) task.taskId = taskId;
@@ -315,10 +329,11 @@ class HlsManager extends ChangeNotifier {
     task.progress = 0;
     task.eta = null;
     notifyListeners();
-    final ok = await HlsDownloader.retry(task.taskId, task.url, task.title);
+    final ok = await HlsDownloader.retry(task.taskId, task.url, task.title,
+        referer: task.referer);
     if (!ok) {
       task.failed = true;
-      task.error = '继续失败，请重试';
+      task.error = '继续失败';
       notifyListeners();
       AppLog.instance
           .error('hls', 'HLS 继续下载失败: ${task.title}（${task.url}）');
@@ -389,6 +404,8 @@ class HlsManager extends ChangeNotifier {
         'taskId': t.taskId,
         'url': t.url,
         'title': t.title,
+        // 续传必须复用同一个 Referer：换掉可能就过不了防盗链
+        'referer': t.referer,
         'startedAt': t.startedAt.toIso8601String(),
       };
       await File(p.join(dir.path, '${t.taskId}.hls.json'))

@@ -66,6 +66,9 @@
     '.vdl-mse .vdl-ic{background:#64748b;}' +
     '.vdl-tx{max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
     '.vdl-card{position:fixed;z-index:2147483001;width:252px;max-height:360px;overflow:auto;' +
+    // overscroll-behavior:contain：卡片内滚到底后不要「链式」带动页面上滚，
+    // 页面一滚 dismiss 逻辑就会把卡片关掉（旧版 iOS 不支持时另有 touch 手势兜底）
+    'overscroll-behavior:contain;-webkit-overflow-scrolling:touch;' +
     'background:#fff;color:#0f172a;border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.35);' +
     'font:13px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;}' +
     '.vdl-card-h{padding:10px 12px;background:#f8fafc;border-bottom:1px solid #e2e8f0;}' +
@@ -78,7 +81,8 @@
     '.vdl-btn:hover{background:#eff6ff;}' +
     '.vdl-btn.hl{color:#1d4ed8;font-weight:600;}' +
     // 多线路候选列表：站点把多条 m3u8 一起下发时，让用户能自己挑一条能用的
-    '.vdl-lines{max-height:132px;overflow:auto;background:#f8fafc;border-top:1px solid #e2e8f0;}' +
+    '.vdl-lines{max-height:132px;overflow:auto;overscroll-behavior:contain;' +
+    '-webkit-overflow-scrolling:touch;background:#f8fafc;border-top:1px solid #e2e8f0;}' +
     '.vdl-lines-h{padding:6px 12px 4px;color:#64748b;font-size:11px;}' +
     '.vdl-line{display:flex;align-items:center;gap:6px;width:100%;text-align:left;' +
     'padding:6px 12px;border:0;border-top:1px solid #eef2f7;background:transparent;' +
@@ -89,6 +93,7 @@
     '.vdl-lm{flex:none;font-weight:700;width:10px;}' +
     '.vdl-line.on .vdl-lm{color:#16a34a;}' +
     '.vdl-line.dead .vdl-lm{color:#dc2626;}' +
+    '.vdl-warn{color:#b45309;background:#fffbeb;border-radius:6px;padding:6px 8px;margin-top:6px;}' +
     '.vdl-lu{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}';
   (document.head || document.documentElement).appendChild(style);
 
@@ -162,11 +167,16 @@
 
   // blob:/MSE 没有直链时，向嗅探器要「当前最可信」的候选（而不是「最近一条」）：
   // 站点逐个试探多条 m3u8 时，最近一条往往是失败的那条。
-  function bestOf(kind) {
+  // 返回整个对象（含 state/soon/why），卡片需要区分「未验证」「已过期」「确认失效」。
+  function capturedFor(video) {
     try {
       var s = window.__vdlSniff;
       if (!s || !s.best) return null;
-      return s.best(kind) || null;
+      if (kindOf(srcOf(video)) !== 'mse') return null;
+      var b = s.best('hls') || s.best('dash') || s.best('file');
+      if (b && b.url) return b;
+      var u = s.getLatest ? (s.getLatest('hls') || s.getLatest('file')) : '';
+      return u ? { url: u, kind: kindOf(u), state: s.stateOf ? s.stateOf(u) : '' } : null;
     } catch (e) { return null; }
   }
 
@@ -186,38 +196,26 @@
     } catch (e) { return ''; }
   }
 
-  function capturedFor(video) {
-    try {
-      var s = window.__vdlSniff;
-      if (!s) return '';
-      if (kindOf(srcOf(video)) !== 'mse') return '';
-      var b = s.best ? s.best('hls') : null;
-      if (!b) b = s.best ? s.best('dash') : null;
-      if (!b) b = s.best ? s.best('file') : null;
-      if (b && b.url) return b.url;
-      return s.getLatest ? (s.getLatest('hls') || s.getLatest('file')) : '';
-    } catch (e) { return ''; }
-  }
-
   function infoOf(video) {
     var src = srcOf(video);
     var kind = kindOf(src);
-    var captured = '';
+    var cap = null;
     // 用户手动选了线路（多条候选里挑一条）→ 以他选的为准
     var manual = video.__vdlLine || '';
     if (manual) {
       src = manual;
       kind = kindOf(manual);
-      captured = 'manual';
+      cap = { url: manual, kind: kind, state: stateOfUrl(manual) };
     } else if (kind === 'mse') {
-      captured = capturedFor(video);
-      if (captured) { src = captured; kind = kindOf(captured); }
+      // blob: 播放器：地址只能来自嗅探器（元素句柄 / 容器 data-url / 网络证据）
+      cap = capturedFor(video);
+      if (cap) { src = cap.url; kind = kindOf(cap.url); }
     } else if (kind === 'hls' || kind === 'dash') {
       // 元素直链一般是浏览器正在播的（原生 HLS），最可信；
       // 但若它在候选表里被判死、而另有明确可用的候选，则改用可用的那条
       if (stateOfUrl(src) === 'dead') {
-        var b = bestOf(kind);
-        if (b && b.url && b.state === 'ok') { src = b.url; kind = kindOf(b.url); }
+        var b = (window.__vdlSniff && window.__vdlSniff.best) ? window.__vdlSniff.best(kind) : null;
+        if (b && b.url && b.state === 'ok') { src = b.url; kind = kindOf(b.url); cap = b; }
       }
     }
     var t = (video.getAttribute && (video.getAttribute('title') || video.getAttribute('aria-label'))) || '';
@@ -229,6 +227,10 @@
       dur: fmtDur(video.duration),
       title: String(t || pageTitle()).slice(0, 80),
       state: stateOfUrl(src),
+      // 签名 URL 的时效：expired 表示本地已判定过期（服务端仍可能放行，但基本 403）
+      why: (cap && cap.why) || '',
+      soon: !!(cap && cap.soon),
+      expired: !!(cap && cap.why === 'expired'),
       lines: lines
     };
   }
@@ -305,6 +307,8 @@
   var currentCard = null;
   var currentCardAnchor = null;
   var cardDismissBound = false;
+  // 手势是否「起手在卡片内」：卡片内滑动被带动页面时不应该关掉卡片
+  var cardGesture = 0;
 
   // 点卡片外部 / 页面滚动 → 关闭操作卡（否则弹层只能靠再次点角标或选中某项关掉）
   function onDocClick(e) {
@@ -316,8 +320,16 @@
     closeCard();
   }
 
-  function onScrollClose() {
-    if (currentCard) closeCard();
+  function onScrollClose(e) {
+    if (!currentCard) return;
+    // 滚动事件在 window 上以捕获方式监听，卡片自身、卡片里的候选列表滚动同样会经过这里。
+    // 这两种都不是「页面在滚」，一律放过 —— 否则用户想翻候选列表，一滑就把卡片关掉了。
+    var t = e && (e.target || e.srcElement);
+    if (t && t.nodeType === 1 && (t === currentCard || currentCard.contains(t))) return;
+    // 旧版 iOS 不支持 overscroll-behavior：卡片内起手的滑动仍可能链式带动页面，
+    // 手势期间（touchend 后短暂保留）不算离开
+    if (cardGesture) return;
+    closeCard();
   }
 
   function closeCard() {
@@ -326,6 +338,7 @@
     }
     currentCard = null;
     currentCardAnchor = null;
+    cardGesture = 0;
     if (cardDismissBound) {
       cardDismissBound = false;
       document.removeEventListener('click', onDocClick, true);
@@ -410,6 +423,77 @@
     } catch (e) { return String(u).slice(0, 46); }
   }
 
+  // ── 候选可用性：打开卡片时对「页面从没请求过」的线路补一次实测 ──────────
+  // 候选表里的 guess 是「脚本/属性里抄出来的地址」，页面自己一次都没请求过，
+  // 所以永远停在「?」—— 用户只能点下去才知道是 404。这里让嗅探器现场探一次。
+  function markLine(card, url, state, code) {
+    var btns = card.querySelectorAll('.vdl-line');
+    for (var i = 0; i < btns.length; i++) {
+      var b = btns[i];
+      if (b.getAttribute('data-line') !== url) continue;
+      var m = b.querySelector('.vdl-lm');
+      if (m) m.textContent = state === 'ok' ? '✓' : (state === 'dead' ? '✗' : '?');
+      // className 不整体重写：'.on' 是当前选中项，重建会丢
+      if (state === 'dead') b.classList.add('dead');
+      else b.classList.remove('dead');
+      if (code) {
+        b.title = 'HTTP ' + code;
+        var tail = b.querySelector('.vdl-lu');
+        if (tail && state === 'dead' && tail.textContent.indexOf(String(code)) < 0) {
+          tail.textContent = tail.textContent + ' · ' + code;
+        }
+      }
+      return;
+    }
+  }
+
+  function verifyCardLines(card, video, badge, info) {
+    try {
+      var s = window.__vdlSniff;
+      if (!s || !s.verify || info.kind === 'mse') return;
+      var need = [];
+      function push(u) {
+        if (!u || need.indexOf(u) >= 0) return;
+        need.push(u);
+      }
+      // 当前这条也要进去：它同样可能只是「脚本里抄来的」，页面一次都没请求过
+      if (info.state !== 'ok' && info.state !== 'dead') push(info.url);
+      for (var i = 0; i < (info.lines || []).length; i++) {
+        var it = info.lines[i];
+        if (it.state === 'ok' || it.state === 'dead') continue; // 已有实测结论，不必再探
+        push(it.url);
+      }
+      if (!need.length) return;
+      var head = card.querySelector('.vdl-lines-h');
+      var multi = !!(info.lines && info.lines.length > 1);
+      var headText = multi ? '共 ' + info.lines.length + ' 条候选 · ' : '';
+      if (head) head.textContent = headText + '校验中…';
+      s.verify(need, function (res) {
+        var alive = !!(card.parentNode && currentCard === card);
+        if (!res) {
+          // 整批探完（嗅探器的「收工」信号）：表头恢复，角标同步刷一次
+          if (alive) {
+            if (head) head.textContent = headText + '点选切换';
+            refreshBadge(badge, video);
+          }
+          return;
+        }
+        if (!alive) return;
+        markLine(card, res.url, res.state, res.code);
+        refreshBadge(badge, video); // 角标上的 ? 同步翻成 ✓ / ✗
+        // 当前这条被判死、而别处有实测可用的 → 自动切过去。
+        // 这是「嗅探到的恰好是打不开那条」的兜底：用户不必自己一条条试。
+        if (res.state === 'dead' && res.url === info.url) {
+          var b = s.best ? s.best(info.kind) : null;
+          if (b && b.url && b.url !== info.url && b.state === 'ok') {
+            video.__vdlLine = b.url;
+            toggleCard(video, badge);
+          }
+        }
+      });
+    } catch (e) {}
+  }
+
   function toggleCard(video, badge) {
     closeCard();
     var info = infoOf(video);
@@ -430,6 +514,13 @@
     } else {
       html += '<div class="vdl-card-u">' + esc(info.url) + '</div>';
     }
+    // 签名 URL 有时效（本例 auth_key 就是半小时级的）：过期后再下必然 403，
+    // 与其让用户下到一半失败，不如提前说清「刷新页面重新嗅探」这条唯一出路
+    if (info.expired) {
+      html += '<div class="vdl-card-n vdl-warn">链接签名已过期 · 刷新页面并重新点一次播放，嗅探会拿到新地址</div>';
+    } else if (info.soon) {
+      html += '<div class="vdl-card-n vdl-warn">链接即将过期 · 请尽快开始下载</div>';
+    }
     html += '</div>';
     // 多候选（多线路）时列出全部，标明可用/失效，允许手动切换：
     // 这一栏就是为了解决「嗅探到的恰好是打不开的那条」
@@ -438,13 +529,16 @@
         info.lines.length + ' 条候选 · 点选切换</div>';
       for (var li = 0; li < info.lines.length; li++) {
         var it = info.lines[li];
-        var mk = it.state === 'ok' ? '✓' : (it.state === 'dead' ? '✗' : '?');
+        var bad = it.state === 'dead' || it.expired;
+        var mk = bad ? '✗' : (it.state === 'ok' ? '✓' : (it.soon ? '!' : '?'));
         var cls = 'vdl-line' +
           (it.url === info.url ? ' on' : '') +
-          (it.state === 'dead' ? ' dead' : '');
+          (bad ? ' dead' : '');
+        var tail = it.expired ? ' · 已过期' : (it.soon ? ' · 快过期' : '');
+        if (bad && it.code) tail = ' · ' + it.code;
         html += '<button class="' + cls + '" data-line="' + esc(it.url) + '">' +
           '<span class="vdl-lm">' + mk + '</span>' +
-          '<span class="vdl-lu">' + esc(shortUrl(it.url)) + '</span></button>';
+          '<span class="vdl-lu">' + esc(shortUrl(it.url) + tail) + '</span></button>';
       }
       html += '</div>';
     }
@@ -454,7 +548,7 @@
       //  package → 自己下 .ts 分片包存 Downloads，可离线、可随时「本地转 MP4」
       //  convert → 下分片后直接 ffmpeg 转封装成单个 mp4（中间分片用完即删）
       //  hls     → 系统 AVAssetDownloadTask 的 .movpkg，只能 AVFoundation 播，不能导出
-      html += '<button class="vdl-btn hl" data-a="bg">后台下载并转 MP4（锁屏可继续）</button>';
+      html += '<button class="vdl-btn hl" data-a="bg">后台下载并转 MP4</button>';
       html += '<button class="vdl-btn" data-a="package">下载 m3u8 分片（可转 MP4）</button>';
       html += '<button class="vdl-btn hl" data-a="convert">直接转 MP4（单文件）</button>';
       html += '<button class="vdl-btn" data-a="hls">系统离线缓存（仅播放，不可导出）</button>';
@@ -488,7 +582,20 @@
       if (!a) return;
       e.preventDefault();
       e.stopPropagation();
-      postAction({ action: a, url: info.url, title: info.title });
+      postAction({
+        action: a,
+        url: info.url,
+        title: info.title,
+        // 当前帧地址：本例这种「页面在 A 域、清单在 B 域」的站点很常见，
+        // 跨域 iframe 播放器用主框架地址做 Referer 会被 CDN 判 403
+        referer: location.href,
+        // 页面视频的真实时长（秒）。这是「这条 m3u8 到底是不是页面上正在播的那个
+        // 视频」唯一可靠的外部标尺：候选池里多条清单都能 200、都是合法清单、
+        // 分数打平，靠请求时间决胜就会选到预加载的下一集 / 广告片。
+        // Dart 侧拉到清单后算 Σ#EXTINF 与它比对，对不上就不下、并说明原因。
+        duration: (video && video.duration && isFinite(video.duration))
+          ? Math.round(video.duration * 10) / 10 : 0
+      });
       closeCard();
       if (a === 'ignore') {
         unmark(video);
@@ -514,12 +621,38 @@
     currentCard = card;
     currentCardAnchor = badge;
     bindDismiss();
+
+    // 卡片内起手的手势：内部没有可滚动的容器时直接吃掉（不带动页面滚），
+    // 有可滚动的（候选列表）交给浏览器滚，靠 overscroll-behavior 阻断链式滚动。
+    // 原生弹层的体感就是这样：在弹层上滑，弹层不动、底下的页面也不动。
+    card.addEventListener('touchstart', function () {
+      cardGesture = 1;
+    }, { passive: true });
+    card.addEventListener('touchend', function () {
+      setTimeout(function () { cardGesture = 0; }, 300);
+    }, { passive: true });
+    card.addEventListener('touchmove', function (e) {
+      var t = e.target;
+      while (t && t !== card.parentNode) {
+        if (t.nodeType === 1) {
+          var oy = '';
+          try { oy = getComputedStyle(t).overflowY; } catch (er) {}
+          if ((oy === 'auto' || oy === 'scroll') && t.scrollHeight > t.clientHeight + 1) return;
+        }
+        t = t.parentNode;
+      }
+      if (e.cancelable) e.preventDefault();
+    }, { passive: false });
+
+    // 打开即校验：把「? 未验证」的候选探成 ✓ / ✗（详见 verifyCardLines）
+    verifyCardLines(card, video, badge, info);
   }
 
   function update() {
     // 清理后（开关关闭）不再重建角标：click/play/观察器等残留监听可能仍会触发
     if (!window.__vdlMarkerInstalled) return;
-    if (!document.body) return;
+    // iframe 导航中 / 文档卸载后 document 可能已经不可用（定时器还在跑）
+    if (typeof document === 'undefined' || !document || !document.body) return;
     // 先摘掉已从 DOM 移除的角标（它们不会出现在下面的 querySelectorAll 结果里）
     sweepDetached();
     var videos = document.querySelectorAll('video');

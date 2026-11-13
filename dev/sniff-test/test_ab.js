@@ -5,7 +5,20 @@
 //   L3 /hls/c/index.m3u8  → 200 + text/html 错误页 ❌（假可用，最阴的一种）
 //   L4 /hls/d/index.m3u8  → 网络错误 reject       ❌
 const fs = require('fs');
-const { JSDOM } = require('jsdom');
+const { JSDOM, VirtualConsole } = require('jsdom');
+
+// 窗口 close() 后残留的定时器 / MutationObserver 仍会回调一次，
+// jsdom 把这些统一报成「Uncaught TypeError: ... undefined」。生产环境里 document
+// 一直存在，这类噪音与用例无关 —— 单独屏蔽，其他脚本错误照常打印。
+function quietVC() {
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', (e) => {
+    const m = String((e && (e.detail || e.message)) || e);
+    if (/Cannot read properties of undefined \(reading '(querySelectorAll|body)'\)/.test(m)) return;
+    console.error('jsdomError:', m);
+  });
+  return vc;
+}
 
 // v1 的 fetch 钩子只挂了成功回调，网络失败的 rejected promise 没人接（它自己的毛病，
 // 在 WKWebView 里表现为一条 unhandled rejection）。测试里忽略它，别让它杀掉进程。
@@ -45,6 +58,7 @@ function makeDom() {
     url: 'https://www.moviesite.example.com/play/12345.html',
     runScripts: 'outside-only',
     pretendToBeVisual: true,
+    virtualConsole: quietVC(),
   });
   const w = dom.window;
   // 隔离环境：资源时间线不参与（用 fetch 钩子这条主路径验证）
@@ -198,6 +212,123 @@ async function runNative() {
 }
 
 
+// 场景 D：DPlayer 式「MSE + 容器 data-url」
+// 复刻桌面真实样本：video.src 是 blob:，真地址在父级 .dplayer[data-url]，
+// 全程没有任何可观测的网络请求（清单在 Worker 里拉 / 请求发生在注入之前）。
+// 旧版本在这种页面上只能给「未捕获到可下载直链」，v2.1 应能从属性拿到并推荐。
+const PAGE_D = (dataUrl, extraScript) => `<!doctype html><html><head><title>DPlayer 站</title>
+${extraScript || ''}
+</head><body>
+<div class="player-container">
+  <div class="dplayer" data-video="0000000003484ff9" data-url="${dataUrl}">
+    <div class="dplayer-video-wrap">
+      <video class="dplayer-video" preload="auto" src="blob:https://asd.example.cc/b9aaf0bf-71c0"></video>
+    </div>
+  </div>
+</div>
+</body></html>`;
+
+// 真实样本的签名形态：auth_key=<过期unix>-<随机>-<uid>-<md5>
+// 时间戳只算一次，D1 与 D5 必须比对同一个串（否则跨秒就假失败）
+const LIVE_D = 'https://hls.example.cn/videos5/1e4f/1e4f.m3u8?auth_key=' +
+  (Math.floor(Date.now() / 1000) + 3600) + '-1016784267ba7-0-eafaf252&v=2';
+
+function makeDomD(html) {
+  const dom = new JSDOM(html, {
+    url: 'https://asd.example.cc/watch/3484',
+    runScripts: 'outside-only',
+    pretendToBeVisual: true,
+    virtualConsole: quietVC(),
+  });
+  const w = dom.window;
+  w.performance.getEntriesByType = () => [];
+  w.fetch = () => Promise.reject(new TypeError('Load failed'));
+  return dom;
+}
+
+function runSnifferOn(dom) {
+  const w = dom.window;
+  w.eval(fs.readFileSync(__dirname + '/../../assets/sniffer.js', 'utf8'));
+  return w;
+}
+
+async function runAttrFuture() {
+  const live = LIVE_D;
+  const dom = makeDomD(PAGE_D(live.replace(/&/g, '&amp;')));
+  const w = runSnifferOn(dom);
+  await new Promise((r) => setTimeout(r, 60));
+  const best = w.__vdlSniff.best('hls');
+  const dump = w.__vdlSniff.dump();
+  w.close();
+  return { best, dump, live };
+}
+
+async function runAttrExpired() {
+  const dead = 'https://hls.example.cn/videos5/1e4f/1e4f.m3u8?auth_key=' +
+    (Math.floor(Date.now() / 1000) - 1000) + '-1016784267ba7-0-eafaf252&v=2';
+  const dom = makeDomD(PAGE_D(dead.replace(/&/g, '&amp;')));
+  const w = runSnifferOn(dom);
+  await new Promise((r) => setTimeout(r, 60));
+  const best = w.__vdlSniff.best('hls');
+  const dump = w.__vdlSniff.dump();
+  w.close();
+  return { best, dump, dead };
+}
+
+// 属性旁没有 blob 播放器（备用线路/广告位）→ 只给 S_ATTR，不该压过任何实测证据
+async function runAttrLoose() {
+  const live = 'https://cdn.example.cn/backup/index.m3u8';
+  const html = '<!doctype html><html><body>' +
+    '<div class="spare" data-url="' + live + '"></div></body></html>';
+  const dom = makeDomD(html);
+  const w = runSnifferOn(dom);
+  await new Promise((r) => setTimeout(r, 60));
+  const best = w.__vdlSniff.best('hls');
+  w.close();
+  return { best, live };
+}
+
+// 相对路径 + 脚本里 \u0026 转义（真实站点两种都常见）
+async function runAttrRelative() {
+  const html = '<!doctype html><html><body>' +
+    '<div class="dplayer" data-url="/hls/rel/index.m3u8?a=1&amp;b=2">' +
+    '<video src="blob:https://asd.example.cc/aa11"></video></div>' +
+    '<script>var cfg={"u":"https://cdn.example.cn/x/index.m3u8?a=1\\u0026auth_key=' +
+    (Math.floor(Date.now() / 1000) + 600) + '-9-0-ff"};</script>' +
+    '</body></html>';
+  const dom = makeDomD(html);
+  const w = runSnifferOn(dom);
+  await new Promise((r) => setTimeout(r, 60));
+  const dump = w.__vdlSniff.dump();
+  w.close();
+  return { dump };
+}
+
+// 标记层：blob 播放器 + data-url → 角标应给 HLS，卡片应出下载动作而不是「不支持」
+async function runAttrMarker() {
+  const live = LIVE_D;
+  const dom = makeDomD(PAGE_D(live.replace(/&/g, '&amp;')));
+  const w = runSnifferOn(dom);
+  w.eval(fs.readFileSync(__dirname + '/../../assets/video_marker.js', 'utf8'));
+  await new Promise((r) => setTimeout(r, 120));
+  const badge = w.document.querySelector('.vdl-badge');
+  const label = badge ? badge.querySelector('.vdl-tx').textContent : '(无角标)';
+  let actions = [];
+  let cardUrl = '';
+  let notice = '';
+  if (badge) {
+    badge.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 30));
+    actions = [...w.document.querySelectorAll('.vdl-btn')].map((b) => b.getAttribute('data-a'));
+    cardUrl = (w.document.querySelector('.vdl-card-u') || {}).textContent || '';
+    const warn = w.document.querySelector('.vdl-warn');
+    notice = warn ? warn.textContent : '';
+  }
+  w.close();
+  return { label, actions, cardUrl, notice };
+}
+
+
 (async () => {
   const v1 = await runV1();
   const { best, dump } = await runV2();
@@ -241,8 +372,53 @@ async function runNative() {
   console.log('v2 getBest("hls") =', nat.best && nat.best.url.replace('https://', ''),
     nat.best && nat.best.url === nat.live ? '✅' : '❌');
 
+  // ── 场景 D：MSE + 容器 data-url（复刻桌面 DPlayer 样本）──
+  const d1 = await runAttrFuture();
+  const d2 = await runAttrExpired();
+  const d3 = await runAttrLoose();
+  const d4 = await runAttrRelative();
+  const d5 = await runAttrMarker();
+
+  const d1ok = d1.best && d1.best.url === d1.live && d1.best.score === 550 && d1.best.src === 'attr';
+  console.log('===== 场景 D1：blob 播放器 + 父级 data-url（无任何网络请求）=====');
+  console.log('v2 getBest("hls") =', short(d1.best && d1.best.url),
+    'score=' + (d1.best && d1.best.score), 'src=' + (d1.best && d1.best.src),
+    d1ok ? '✅ 从属性拿到真地址（旧版这里是空的）' : '❌');
+  for (const d of d1.dump) {
+    console.log('   ', short(d.url).padEnd(30), 'score=' + String(d.score).padStart(4),
+      'state=' + d.state.padEnd(5), 'src=' + d.src, 'exp=' + (d.exp || '-'));
+  }
+
+  const d2ok = d2.best && d2.best.why === 'expired';
+  console.log('===== 场景 D2：同上但 auth_key 已过期 =====');
+  console.log('v2 best() why =', d2.best && (d2.best.why || '(无)'),
+    d2ok ? '✅ 不推荐已过期链接' : '❌ 仍把过期链接当可用');
+
+  const d3ok = d3.best && d3.best.url === d3.live && d3.best.score === 350;
+  console.log('===== 场景 D3：只有 data-url，旁边没有 blob 播放器 =====');
+  console.log('score =', d3.best && d3.best.score,
+    d3ok ? '✅ 350（低档，让位于任何实测证据）' : '❌');
+
+  const d4rel = d4.dump.find((d) => d.url.indexOf('/hls/rel/index.m3u8') >= 0);
+  const d4esc = d4.dump.find((d) => d.url.indexOf('auth_key') >= 0);
+  const d4ok = !!d4rel && d4rel.url === 'https://asd.example.cc/hls/rel/index.m3u8?a=1&b=2' &&
+    !!d4esc && d4esc.url.indexOf('\\u0026') < 0 && d4esc.url.indexOf('&amp;') < 0;
+  console.log('===== 场景 D4：相对路径 / 脚本内 \\u0026 转义 =====');
+  console.log('相对路径归一 =', d4rel ? d4rel.url : '(未找到)',
+    d4rel && d4rel.url.indexOf('https://asd.example.cc/') === 0 ? '✅' : '❌');
+  console.log('转义还原   =', d4esc ? d4esc.url : '(未找到)',
+    d4esc && d4ok ? '✅' : '❌');
+
+  const d5ok = d5.label.indexOf('HLS') === 0 && d5.actions.indexOf('bg') >= 0 &&
+    d5.cardUrl === d1.live;
+  console.log('===== 场景 D5：标记层（角标 + 卡片）=====');
+  console.log('角标文案 :', d5.label, '| 动作 :', d5.actions.join(', '));
+  console.log('卡片地址 :', d5.cardUrl ? d5.cardUrl.slice(0, 52) + '…' : '(空)',
+    d5ok ? '✅ 不再是「未捕获到直链」' : '❌');
+
   const okAll = v1 !== A && best && best.url === A && marker.onLine === A &&
-    seg.best && seg.best.url === C && nat.best && nat.best.url === nat.live;
-  console.log('\n结论：' + (okAll ? '三项全部通过 —— 修复成立' : '存在未通过项，需复查'));
+    seg.best && seg.best.url === C && nat.best && nat.best.url === nat.live &&
+    d1ok && d2ok && d3ok && d4ok && d5ok;
+  console.log('\n结论：' + (okAll ? '全部场景通过 —— 修复成立' : '存在未通过项，需复查'));
   process.exit(okAll ? 0 : 1);
 })();

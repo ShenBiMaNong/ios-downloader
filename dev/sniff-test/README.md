@@ -1,16 +1,18 @@
 # 嗅探判定 / 播放接管 回归测试（jsdom）
 
-两个测试，都跑在 jsdom 里，不参与 App 构建：
+四个测试，都跑在 jsdom 里，不参与 App 构建：
 
 - `test_ab.js`：验证 `assets/sniffer.js` 在「站点多线路试探」场景下能否挑出**真正能用**的那条 m3u8，并与 `baseline/sniffer_v1.js`（冻结的 v1）做 A-B 对照。
 - `test_hijack.js`：验证 `assets/no_autoplay.js` 的「点播放即接管」——该接管时接管，该放行时必须放行（不能出现「点了没反应」）。
+- `test_verify_card.js`：验证标记层的两件事——① 页面从没请求过的线路能否在打开操作卡时被现场校验（`?` → `✓/✗`）；② 弹层关闭规则（卡片内滚动不关、页面滚动才关）。
+- `test_pick_dur.js`：验证「多条 m3u8 都能通、下载出来却是别的视频」——播放锚定必须同时满足 `Σ#EXTINF ≈ video.duration`，同分的预加载下一集/预卷广告不得被认成正在播的那条。
 
 ## 跑法
 
 ```bash
 cd dev/sniff-test
 npm install        # 只装 jsdom
-npm test           # 两个都跑；也可单独 node test_ab.js / node test_hijack.js
+npm test           # 四个都跑；也可单独 node test_ab.js 等
 ```
 
 退出码 0 = 全部通过。
@@ -23,6 +25,19 @@ npm test           # 两个都跑；也可单独 node test_ab.js / node test_hij
 | A' 标记层 | 同上，注入 `video_marker.js` | 角标显示 `HLS ✓`，线路列表 4 条且 `✓/✗` 标注正确，选中项可手动切换并重绘 |
 | B 清单走 Worker | 清单请求不经主线程（拿不到），只有播放后的分片 URL 出现在资源时间线 | 靠分片目录前缀匹配定位到 `/hls/c/` 那条 |
 | C 原生 HLS | `video.currentSrc` 直接是 m3u8（iOS WKWebView 路径） | 直接认元素 src，不被脚本里的其他候选干扰 |
+| D1 MSE + `data-url` | `video.src` 是 `blob:`，真地址只在父级 `.dplayer[data-url]`，**全程没有任何网络请求**（复刻 DPlayer 系站点） | 从属性拿到 m3u8，score 550 / `src=attr`；旧版这里是空的 |
+| D2 签名过期 | 同上，但 `auth_key` 时间戳已过 | `best()` 不推荐它，`why=expired`（UI 提示刷新页面重新嗅探） |
+| D3 属性旁没有播放器 | 只有一个孤立的 `data-url`（备用线路/广告位） | 只给 350，让位于任何实测证据 |
+| D4 相对路径 / 转义 | `data-url="/hls/x.m3u8"`、脚本里 `\u0026` | 归一成绝对地址、转义还原成 `&`（否则 query 错位必 403） |
+| D5 标记层（blob） | D1 页面 + `video_marker.js` | 角标变 `HLS ?`，卡片出下载动作，不再是「未捕获到可下载直链」 |
+| E 主动校验 | 3 条线路只写在 `<script>` 里、页面从不请求；卡片打开后 `verify()` 现场探 | 200+`#EXTM3U` → ✓、404 → ✗（带状态码）、200+HTML → ✗；`best()` 落到可用那条 |
+| G 探测被拒 | 候选 URL 的 fetch 直接 reject（无 CORS 头 / 断连） | 保持 `guess`，**不得判死**（探测失败 ≠ 链接坏） |
+| F 弹层关闭 | 卡片内滚动 / 卡片内点击 / 页面滚动 / 点页面空白 | 前两者保持打开，后两者关闭 |
+| H 时长锚定 | 预卷广告(30s)、下一集(2410s)、主视频(2712s) 三条都 200+合法清单，按「广告→下一集→主视频」顺序请求 | 只锚定主视频（2712s ≈ 页面 duration）；页面时长与三者都不符时不锚定任何一条 |
+
+H 场景做过 A-B 对照：把时长比对去掉（等价改前逻辑）后，锚定对象变成**广告**、
+`best('hls')` 返回广告 URL —— 这就是「列表里好几条都能通，下载出来却是别的视频」
+的复现路径。
 
 另外 A 里对同一页面连续注入两次 `sniffer.js`，验证幂等（Dart 在
 `onPageStarted` + `onPageFinished` 各注入一次，不会重复包装 fetch/XHR）。
@@ -39,6 +54,22 @@ npm test           # 两个都跑；也可单独 node test_ab.js / node test_hij
 | 接管开 + 160×90 小窗广告 + 点击 | 不接管，页面自己播 |
 
 最后两类是防误伤的关键：没有手势判据和尺寸判据，接管的就不只是用户想看的那个视频了。
+
+## 开关热切换（test_autoplay_toggle.js / test_autoplay_rootcause.js）
+
+针对「浏览器菜单里开关点了没反应、要再点一次才生效」的排查脚本，两个都只读
+`assets/no_autoplay.js`，并精确复刻 `BrowserPage._injectNoAutoplay()` 的调用序列：
+
+- `test_autoplay_toggle.js`：**行为基线** —— 同一文档内反复开关、开关与「点播放即接管」
+  组合、`<video autoplay>` 属性回归，期望全部即时生效（当前通过）。
+- `test_autoplay_rootcause.js`：**根因取证** —— 证明跨文档 / 跨域 iframe / 并发注入
+  三种情况下开关会失真：
+  | 编号 | 现象 |
+  |---|---|
+  | T1 | 关一次再开，`sessionStorage.__vdlNoAutoplay` 仍是 `"0"`（开值从不落盘） |
+  | T2 | 新文档 atDocumentStart 按 `"0"` 执行 → 开关显示「开」但初期不拦 |
+  | T3 | 跨域 iframe 有独立会话 → 关掉开关后 iframe 里的播放器仍被拦 |
+  | T4 | 页面加载注入（旧值）与菜单点击（新值）并发时，晚到的旧值覆盖新值 |
 
 ## 改动嗅探逻辑时
 

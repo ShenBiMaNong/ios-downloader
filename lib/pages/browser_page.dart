@@ -347,6 +347,8 @@ class BrowserPageState extends State<BrowserPage> {
       // 页内标记卡不带 referer → 用主框架地址；「点播放即接管」会带当前帧地址，
       // 跨域 iframe 播放器必须用它，否则 CDN 拿主框架 Referer 直接 403
       final referer = (j['referer'] as String?) ?? '';
+      // 页面播放器报告的时长：下载前用来核对「这条清单是不是同一个视频」
+      final pageDur = (j['duration'] as num?)?.toDouble() ?? 0;
       // 自动播放拦截脚本的一次性上报（每个文档最多一条）：不弹 toast，只进系统日志，
       // 便于排查「为什么这个页面的视频不自动播了」
       if (action == 'autoplayBlocked') {
@@ -357,7 +359,16 @@ class BrowserPageState extends State<BrowserPage> {
         return;
       }
       if (url.isEmpty) return;
-      final v = VideoInfo(url: url, frameUrl: _currentUrl, pageTitle: title);
+      // referer/duration 必须一路传到下载器：嗅探是在 WKWebView 里做的（自带
+      // 站点 Cookie 和正确 origin），而下载在原生 URLSession / Dio 里发 ——
+      // 不带这两个就必然出现「页面能播、探测也 ok，一下载就 403/网络问题」。
+      final v = VideoInfo(
+        url: url,
+        frameUrl: _currentUrl,
+        pageTitle: title,
+        referer: referer,
+        duration: pageDur,
+      );
       switch (action) {
         case 'play':
           // 立即播放（边播边缓存）：先停掉页内播放，避免双音源
@@ -365,7 +376,7 @@ class BrowserPageState extends State<BrowserPage> {
           final item = await PlaybackCacher.instance.start(
             url: url,
             title: title.isNotEmpty ? title : '网页视频',
-            referer: referer.isNotEmpty ? referer : _currentUrl,
+            referer: v.effectiveReferer,
           );
           if (item == null) {
             _toast('无法播放该视频');
@@ -381,13 +392,13 @@ class BrowserPageState extends State<BrowserPage> {
           break;
         case 'mp4':
           if (!_isDirectMedia(v)) {
-            _toast('该链接不是可直接下载的视频文件');
+            _toast('不是可下载的视频文件');
             return;
           }
           // 页内播放器继续播着会让系统一直挂「正在播放」媒体通知，且白耗流量
           await _pausePageVideos();
           DownloadManager.instance.download(v);
-          _toast('已加入下载队列，进度见「资源库」');
+          _toast('已加入下载');
           break;
         case 'bg':
           // 原生 background URLSession 是 iOS 专有；Android 无对应桥接，
@@ -395,29 +406,30 @@ class BrowserPageState extends State<BrowserPage> {
           await _pausePageVideos();
           if (!Platform.isIOS) {
             ConvertManager.instance.downloadM3u8(v);
-            _toast('当前平台不支持系统级后台下载，已改为下载 m3u8 分片包');
+            _toast('不支持后台下载，已改为分片包');
             break;
           }
           // 锁屏/切 App 后由系统继续下分片，齐备后回前台 ffmpeg -c copy 合成 mp4。
           ConvertManager.instance.nativeDownload(v);
-          _toast('已提交后台下载；分片下完后回到 App 会自动合成 MP4（可锁屏）');
+          _toast('已提交后台下载');
           break;
         case 'package':
           // 自己下 .ts 分片包（产物可离线、可随时「本地转 MP4」），
           // 与 case 'hls' 的系统 .movpkg 离线缓存是两条完全不同的链路
           await _pausePageVideos();
           ConvertManager.instance.downloadM3u8(v);
-          _toast('已开始下载 m3u8 分片包，完成后可在资源库「本地转 MP4」');
+          _toast('已开始下载分片包');
           break;
         case 'hls':
           await _pausePageVideos();
-          HlsManager.instance.start(url, title.isNotEmpty ? title : 'HLS视频');
-          _toast('已开始 HLS 离线下载（系统私有格式，仅可播放），进度见「资源库」');
+          HlsManager.instance.start(url, title.isNotEmpty ? title : 'HLS视频',
+              referer: v.effectiveReferer);
+          _toast('已开始离线下载');
           break;
         case 'convert':
           await _pausePageVideos();
           ConvertManager.instance.convert(v);
-          _toast('已开始 m3u8 → mp4 转换，进度见「资源库」');
+          _toast('已开始转换');
           break;
         case 'copy':
           Clipboard.setData(ClipboardData(text: url));
@@ -595,7 +607,7 @@ class BrowserPageState extends State<BrowserPage> {
                 AppData.instance.setPlayHijack(on);
                 setState(() {});
                 if (on) {
-                  _toast('点播放即接管：已开启（仅对能拿到直链的播放器生效）');
+                  _toast('点播放即接管：已开启');
                 }
               }
             },

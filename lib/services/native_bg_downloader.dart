@@ -108,6 +108,14 @@ class NativeJobStatus {
   final String workDir;
   final int done;
   final int total;
+
+  /// 已下字节 = 已落盘分片 + 在途 task 已写字节（原生成交时统计）
+  final int bytes;
+
+  /// 总字节。HLS 清单本身不带分片大小，原生按已知分片的 Content-Length
+  /// 外推未知分片，因此 [bytesEstimated] 为 true 时这是估算值。
+  final int bytesTotal;
+  final bool bytesEstimated;
   final String? error;
 
   const NativeJobStatus({
@@ -116,6 +124,9 @@ class NativeJobStatus {
     required this.workDir,
     required this.done,
     required this.total,
+    this.bytes = 0,
+    this.bytesTotal = 0,
+    this.bytesEstimated = false,
     this.error,
   });
 
@@ -125,6 +136,9 @@ class NativeJobStatus {
         workDir: (j['workDir'] as String?) ?? '',
         done: (j['done'] as num?)?.toInt() ?? 0,
         total: (j['total'] as num?)?.toInt() ?? 0,
+        bytes: (j['bytes'] as num?)?.toInt() ?? 0,
+        bytesTotal: (j['bytesTotal'] as num?)?.toInt() ?? 0,
+        bytesEstimated: (j['bytesEstimated'] as bool?) ?? false,
         error: j['error'] as String?,
       );
 

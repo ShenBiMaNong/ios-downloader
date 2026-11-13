@@ -218,13 +218,14 @@ class _HomeShellState extends State<HomeShell> {
             title: const Text('HLS 离线缓存'),
             onTap: () {
               Navigator.pop(ctx);
-              HlsManager.instance.start(v.url, v.pageTitle);
+              HlsManager.instance.start(v.url, v.pageTitle,
+                  referer: v.effectiveReferer);
               _toast('已开始 HLS 离线下载');
             },
           ),
           ListTile(
             leading: const Icon(Icons.download_for_offline),
-            title: const Text('后台下载并转 MP4（锁屏可继续）'),
+            title: const Text('后台下载并转 MP4'),
             onTap: () {
               Navigator.pop(ctx);
               if (!Platform.isIOS) {

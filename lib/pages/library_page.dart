@@ -76,7 +76,7 @@ class _LibraryPageState extends State<LibraryPage> {
       return;
     }
     ConvertManager.instance.convertLocal(path);
-    _toast('已开始本地 m3u8 → mp4 转换，进度见列表');
+    _toast('已开始转换');
   }
 
   void _toast(String msg) {
@@ -108,8 +108,10 @@ class _LibraryPageState extends State<LibraryPage> {
         active: active,
         failed: failed,
         progress: t.progress,
-        speedText: active ? formatSpeed(t.speed) : null,
-        etaText: active ? formatEta(t.eta) : null,
+        speed: active ? t.speed : 0,
+        eta: active ? t.eta : null,
+        bytesDone: active ? t.bytesDone : 0,
+        bytesTotal: active ? t.bytesTotal : 0,
         localPath: t.localPath,
         url: t.url,
         error: t.error,
@@ -129,6 +131,12 @@ class _LibraryPageState extends State<LibraryPage> {
         active: active,
         failed: t.failed,
         progress: t.progress,
+        speed: active ? t.speed : 0,
+        eta: active ? t.eta : null,
+        bytesDone: active ? t.bytesDone : 0,
+        bytesTotal: active ? t.bytesTotal : 0,
+        // http_cache_stream 只给比例，总量由「已缓存字节 / 比例」反推 → 估算值
+        bytesEstimated: true,
         localPath: t.localPath,
         url: t.url,
         error: t.error,
@@ -145,7 +153,7 @@ class _LibraryPageState extends State<LibraryPage> {
         active: !t.done && !t.failed,
         failed: t.failed,
         progress: t.progress,
-        etaText: t.done || t.failed ? null : formatEta(t.eta),
+        eta: t.done || t.failed ? null : t.eta,
         hlsTaskId: t.taskId,
         url: t.url,
         error: t.error,
@@ -164,13 +172,16 @@ class _LibraryPageState extends State<LibraryPage> {
         active: active,
         failed: t.failed,
         progress: t.progress,
-        speedText: active && t.progress < 1 ? formatSpeed(t.speed) : null,
-        etaText: active && t.progress < 1 ? formatEta(t.eta) : null,
+        speed: active && t.progress < 1 ? t.speed : 0,
+        eta: active && t.progress < 1 ? t.eta : null,
         localPath: t.localPath,
         url: t.url,
         error: t.error,
         doneSegments: t.doneSegments,
         totalSegments: t.totalSegments,
+        bytesDone: t.bytes,
+        bytesTotal: t.bytesTotal,
+        bytesEstimated: t.bytesEstimated,
         resumable: t.resumable,
         folder: folderById[t.id] ?? '',
         stage: t.stage.isEmpty ? null : t.stage,
@@ -315,13 +326,13 @@ class _LibraryPageState extends State<LibraryPage> {
                     ? const Center(child: CircularProgressIndicator())
                     : items.isEmpty
                         ? const Center(
-                            child: Text('暂无内容，去浏览器里找找视频吧'),
+                            child: Text('暂无视频'),
                           )
                         : sections.every((s) => s.items.isEmpty)
                             ? Center(
                                 child: Text(_folder == LibraryFolders.reservedName
-                                    ? '还没有分享进来的视频'
-                                    : '此文件夹暂无视频'),
+                                    ? '暂无分享'
+                                    : '此文件夹为空'),
                               )
                             : RefreshIndicator(
                                 onRefresh: _refresh,
@@ -517,7 +528,7 @@ class _LibraryPageState extends State<LibraryPage> {
         _playHlsCaching(it);
       case 'convert':
         ConvertManager.instance.convertLocal(it.localPath!);
-        _toast('已开始本地 m3u8 → mp4 转换');
+        _toast('已开始转换');
       case 'move':
         _moveSheet(it);
       case 'rename':
@@ -557,7 +568,7 @@ class _LibraryPageState extends State<LibraryPage> {
   void _reconvertHls(LibraryItem it) {
     final url = it.url ?? '';
     if (!url.startsWith('http')) {
-      _toast('该条目没有可用的原始 m3u8 地址，无法重新转换');
+      _toast('缺少原始 m3u8 地址');
       return;
     }
     ConvertManager.instance.convert(VideoInfo(
@@ -565,7 +576,7 @@ class _LibraryPageState extends State<LibraryPage> {
       frameUrl: '',
       pageTitle: it.sortName,
     ));
-    _toast('已开始重新下载并转 MP4（需重新下载一次分片），进度见「资源库」');
+    _toast('已开始重新下载');
   }
 
   /// 完整错误详情（列表里只显示收敛后的单行摘要）
@@ -574,10 +585,10 @@ class _LibraryPageState extends State<LibraryPage> {
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('「${it.sortName}」失败原因'),
+        title: Text('失败原因'),
         content: SingleChildScrollView(
           child: SelectableText(
-            raw.isEmpty ? '未知错误（可查看设置页的日志）' : raw,
+            raw.isEmpty ? '未知错误' : raw,
             style: const TextStyle(fontSize: 13),
           ),
         ),
@@ -765,7 +776,7 @@ class _LibraryPageState extends State<LibraryPage> {
         it.localPath!.isNotEmpty) {
       return _smallFab(Icons.transform, '本地转 MP4', () {
         ConvertManager.instance.convertLocal(it.localPath!);
-        _toast('已开始本地 m3u8 → mp4 转换');
+        _toast('已开始转换');
       });
     }
     // 已完成条目：点按卡片即播放，无需播放按钮
@@ -1195,7 +1206,7 @@ class _LibraryPageState extends State<LibraryPage> {
     final it = all[index];
     if (it.kind == 'm3u8') {
       if (it.hlsTaskId == null) {
-        _toast('m3u8 分片包请先「本地转 MP4」');
+        _toast('请先转 MP4');
         return;
       }
       _playHls(it);
@@ -1254,8 +1265,8 @@ class _LibraryPageState extends State<LibraryPage> {
     if (!mounted) return;
     if (!ok) {
       _toast(whileDownloading
-          ? '无法边下边看：原生下载任务不存在，可取消后重新下载'
-          : '播放失败：本地缓存不存在或已被系统清理');
+          ? '任务不存在，请重新下载'
+          : '缓存已失效');
     }
   }
 
@@ -1347,72 +1358,46 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   String _subtitle(LibraryItem it) {
-    if (it.failed) {
-      final s = _shortError(it.error);
-      return (s.startsWith('失败') || s.startsWith('已')) ? s : '失败：$s';
-    }
+    if (it.failed) return _shortError(it.error);
     if (it.active) {
-      final pct = it.progress > 0
-          ? '${(it.progress * 100).toStringAsFixed(0)}%'
-          : '';
-      if (it.kind == 'convert') {
-        // 原生后台链没有字节级速度/ETA（后台期间系统不给回调），
-        // 用阶段字段明确区分「锁屏继续下」和「分片齐了等合成」。
-        switch (it.stage) {
-          case 'ready':
-            return '分片齐备 · 等待合成 MP4（回前台自动完成）';
-          case 'remuxing':
-            return '转封装中…';
-          case 'failed':
-            return '后台下载失败';
-          case 'downloading':
-            return '后台下载分片 ${it.doneSegments ?? 0}/${it.totalSegments ?? 0} · 锁屏可继续';
-        }
-        final seg = it.progress >= 1
-            ? '转封装中…'
-            : '分片 ${it.doneSegments}/${it.totalSegments}';
-        return [seg, it.speedText, it.etaText]
-            .whereType<String>()
-            .where((s) => s.isNotEmpty)
-            .join(' · ');
+      // 合成阶段没有下行量，单独文案（否则会显示上一阶段的残留字节）
+      switch (it.stage) {
+        case 'ready':
+          return '待合成';
+        case 'remuxing':
+          return '合成中';
       }
-      // 系统 HLS 缓存：进度按媒体时长上报（AVAssetDownloadTask 不提供字节数），
-      // 且默认 isDiscretionary=true 会择机启动，长时间停在 0% 属正常，不要显示成 0%。
+      // 系统 HLS 缓存在起步前不报进度，显示成 0% 会让人以为卡住
       if (it.kind == 'm3u8' && it.hlsTaskId != null && it.progress <= 0) {
-        return '系统后台下载中 · 进度由系统提供';
+        return '系统下载中';
       }
-      return [pct, it.speedText, it.etaText]
-          .whereType<String>()
-          .where((s) => s.isNotEmpty)
-          .join(' · ');
+      // 所有下载链路统一口径：速度 → 已下/总量 → 剩余时长 → 已下分片/总分片
+      final line = it.progressLine;
+      return line.isEmpty ? '准备中' : line;
     }
     final date = it.created.toLocal().toString().substring(0, 10);
-    // 分享导入的条目也只显示大小 + 日期，不再标来源
     if (it.kind == 'share') {
       final size = formatBytes(it.size);
       return size.isEmpty ? date : '$size · $date';
     }
     if (it.kind == 'm3u8') {
-      // 系统 .movpkg：私有 bundle 不能遍历算大小，明确标注「仅可播放」。
-      if (it.hlsTaskId != null) return '系统离线缓存 · 仅可播放 · $date';
-      // 自下载分片包是普通目录，显示真实占用，不再被误标成系统缓存。
+      // 系统 .movpkg 是私有 bundle，遍历不出大小
+      if (it.hlsTaskId != null) return '系统缓存 · $date';
       final size = formatBytes(it.size);
-      return size.isEmpty
-          ? 'm3u8 分片包 · $date'
-          : '$size · m3u8 分片包 · $date';
+      return size.isEmpty ? '分片包 · $date' : '$size · 分片包 · $date';
     }
     return '${formatBytes(it.size)} · $date';
   }
 
-  /// 把异常文本收敛成一行短摘要（压掉换行/去异常前缀/截断），
-  /// 保证列表行高稳定；完整内容走「查看错误详情」弹窗。
+  /// 把异常文本收敛成一行短摘要：只留可读部分，完整内容走「查看错误详情」
   static String _shortError(String? raw) {
     if (raw == null || raw.trim().isEmpty) return '失败';
     var s = raw.replaceAll(RegExp(r'\s+'), ' ').trim();
     s = s.replaceFirst(RegExp(r'^(Exception|DioException|Error)[:\s]+'), '');
-    const max = 48;
+    // 服务层文案常把「怎么处理」也写进去，列表行只留原因
+    s = s.replaceFirst(RegExp(r'[，,]\s*(请|可)[^，,。]*$'), '');
+    const max = 32;
     if (s.length > max) s = '${s.substring(0, max)}…';
-    if (s.isEmpty) return '失败';
-    return s;
+    return s.isEmpty ? '失败' : s;
   }
 }
