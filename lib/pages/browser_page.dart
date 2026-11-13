@@ -6,6 +6,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import '../models/video_info.dart';
 import '../services/download_manager.dart';
+import '../services/hls_manager.dart';
 
 /// 内置浏览器 + 视频嗅探页
 class BrowserPage extends StatefulWidget {
@@ -219,8 +220,9 @@ class _BrowserPageState extends State<BrowserPage> {
 
   void _startDownload(VideoInfo v) {
     if (v.isHls) {
+      HlsManager.instance.start(v.url, v.pageTitle.isNotEmpty ? v.pageTitle : 'HLS视频');
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('HLS(m3u8) 离线下载将在下一版本支持，当前仅支持 mp4 直链')),
+        const SnackBar(content: Text('已开始 HLS 离线下载，进度见「下载」页')),
       );
       return;
     }

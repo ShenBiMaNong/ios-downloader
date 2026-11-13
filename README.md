@@ -8,7 +8,7 @@
 |---|---|---|
 | MVP-0 | GitHub Actions 云端 macOS 出未签名 IPA + 签名装机链路 | 进行中 |
 | MVP-1 | 内置浏览器（webview_flutter）+ JS 视频嗅探 + mp4 直链下载 + 本地库播放 | 进行中（当前代码） |
-| MVP-2 | HLS(m3u8) 离线缓存（AVAssetDownloadTask 原生桥接） | 待做 |
+| MVP-2 | HLS(m3u8) 离线缓存（AVAssetDownloadTask 原生桥接） | 已实现（待真机验证） |
 | MVP-3 | m3u8 转 mp4（ffmpeg，先评估 ffmpeg_kit_flutter_new） | 待做 |
 | MVP-4 | 分享扩展（免费账号降级：剪贴板交接） | 待做 |
 | M4.5 | 广告过滤（WKContentRuleList 桥接） | 可选 |

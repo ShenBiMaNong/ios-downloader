@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:material_ui/material_ui.dart';
 
 import '../services/download_manager.dart';
+import '../services/hls_manager.dart';
 import 'player_page.dart';
 
 /// 本地视频库
@@ -58,7 +59,9 @@ class _LibraryPageState extends State<LibraryPage> {
                       final path = (m['localPath'] as String?) ?? '';
                       final title = (m['title'] as String?) ?? '未命名';
                       final kind = (m['kind'] as String?) ?? 'other';
+                      final isHls = (m['hls'] as bool?) ?? false;
                       final saved = (m['savedAt'] as String?) ?? '';
+                      final date = saved.isEmpty ? '' : saved.substring(0, 10);
                       return ListTile(
                         leading: Icon(
                           kind == 'm3u8' ? Icons.stream : Icons.movie,
@@ -66,7 +69,7 @@ class _LibraryPageState extends State<LibraryPage> {
                         ),
                         title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
                         subtitle: Text(
-                          '${_size(path)} · ${saved.isEmpty ? '' : saved.substring(0, 10)}',
+                          isHls ? 'HLS 离线缓存 · $date' : '${_size(path)} · $date',
                           style: const TextStyle(fontSize: 12),
                         ),
                         trailing: IconButton(
@@ -78,6 +81,10 @@ class _LibraryPageState extends State<LibraryPage> {
                           },
                         ),
                         onTap: () {
+                          if (isHls) {
+                            HlsManager.instance.play((m['id'] as String?) ?? '');
+                            return;
+                          }
                           if (path.isEmpty) return;
                           Navigator.push(
                             context,
