@@ -140,12 +140,7 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
       }
       let asset = AVURLAsset(url: urlObj)
       let downloadConfig = AVAssetDownloadConfiguration(asset: asset, title: title)
-      guard
-        let task = session.makeAssetDownloadTask(downloadConfiguration: downloadConfig)
-      else {
-        result(FlutterError(code: "create_failed", message: "创建 HLS 下载任务失败", details: nil))
-        return
-      }
+      let task = session.makeAssetDownloadTask(downloadConfiguration: downloadConfig)
       let taskId = UUID().uuidString
       taskIds[taskId] = task
       pendingResults[taskId] = result
@@ -216,8 +211,7 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
         for t in tasks {
           guard
             let assetTask = t as? AVAssetDownloadTask,
-            let url = assetTask.urlAsset.url.absoluteString,
-            let taskId = urlToTaskId[url]
+            let taskId = urlToTaskId[assetTask.urlAsset.url.absoluteString]
           else { continue }
           self.taskIds[taskId] = assetTask
           if !matched.contains(taskId) { matched.append(taskId) }
@@ -241,12 +235,7 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
       }
       let asset = AVURLAsset(url: urlObj)
       let downloadConfig = AVAssetDownloadConfiguration(asset: asset, title: title)
-      guard
-        let task = session.makeAssetDownloadTask(downloadConfiguration: downloadConfig)
-      else {
-        result(FlutterError(code: "create_failed", message: "重建 HLS 下载任务失败", details: nil))
-        return
-      }
+      let task = session.makeAssetDownloadTask(downloadConfiguration: downloadConfig)
       taskIds[taskId] = task
       task.resume()
       result(true)
@@ -416,7 +405,7 @@ class BackgroundBridge: NSObject {
     case "begin":
       let id = nextId
       nextId += 1
-      let identifier = UIApplication.shared.beginBackgroundTask(withExpirationHandler: {
+      let identifier = UIApplication.shared.beginBackgroundTask(expirationHandler: {
         [weak self] in
         guard let self, let stored = self.tasks[id] else { return }
         if stored != .invalid {
