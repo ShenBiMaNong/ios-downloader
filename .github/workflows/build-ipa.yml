@@ -20,10 +20,7 @@ jobs:
           channel: stable
           cache: true
 
-      # 幂等补全平台工程（若仓库缺 ios/ 等目录时生成；已有文件不会被覆盖）
-      - name: Ensure platform projects
-        run: flutter create --org com.example --project-name video_downloader .
-
+      # 平台工程（ios/ android/）已提交，勿再跑 flutter create（会重新生成模板测试文件）
       - name: Dependencies
         run: flutter pub get
 
