@@ -130,9 +130,15 @@ class DownloadManager extends ChangeNotifier {
   /// 这里在 Downloads 元数据区写 `<id>.json` 并通知资源库刷新；
   /// 默认归入内置「分享」文件夹）
   Future<String> addSharedItem(String localPath, String title) async {
-    final id = DateTime.now().millisecondsSinceEpoch.toString();
     try {
       final dir = await downloadsDir();
+      // 批量分享时同一毫秒会连开多条：id 撞了就会互相覆盖 `<id>.json`，
+      // 资源库里只看得到最后一条（磁盘上文件都在）→ 顺延到未占用的 id
+      var stamp = DateTime.now().millisecondsSinceEpoch;
+      while (File(p.join(dir.path, '$stamp.json')).existsSync()) {
+        stamp++;
+      }
+      final id = stamp.toString();
       final meta = {
         'id': id,
         'url': '',
@@ -144,8 +150,10 @@ class DownloadManager extends ChangeNotifier {
       };
       await File(p.join(dir.path, '$id.json')).writeAsString(jsonEncode(meta));
       notifyListeners();
-    } catch (_) {}
-    return id;
+      return id;
+    } catch (_) {
+      return '';
+    }
   }
 
   /// 启动时恢复未完成的断点任务

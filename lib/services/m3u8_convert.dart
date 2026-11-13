@@ -605,8 +605,12 @@ class ConvertManager extends ChangeNotifier {
   }
 
   Future<void> _remux(String playlist, String out) async {
+    // -allowed_extensions ALL：本地清单把 AES-128 密钥写成 key_0.bin，
+    // 而 ffmpeg HLS 解复用器默认白名单不含 bin（只有 ts/m3u8/mp4…），
+    // 会直接报「Filename extension of ... not recognized / set allowed_extensions to 'ALL'」。
+    // 该选项是 demuxer 私有选项，必须放在 -i 之前。
     final session = await FFmpegKit.execute(
-      '-y -i "$playlist" -c copy -movflags +faststart "$out"',
+      '-y -allowed_extensions ALL -i "$playlist" -c copy -movflags +faststart "$out"',
     );
     final rc = await session.getReturnCode();
     if (!ReturnCode.isSuccess(rc)) {

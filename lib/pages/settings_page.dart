@@ -87,6 +87,16 @@ class SettingsPage extends StatelessWidget {
                   onChanged: (v) => data.setRedirectGuard(v),
                 ),
               ),
+              _section(
+                context,
+                '禁止视频自动播放',
+                '页面自己开始播放的音视频一律拦下，需要你点一下播放器才会播，避免打开网页就出声、白跑流量；'
+                '个别站点点了播放没反应时，可在这里或浏览器菜单临时关闭',
+                Switch(
+                  value: data.blockAutoplayEnabled,
+                  onChanged: (v) => data.setBlockAutoplay(v),
+                ),
+              ),
               const _GroupHeader('播放'),
               _section(
                 context,
@@ -153,6 +163,19 @@ class SettingsPage extends StatelessWidget {
                   ],
                   selected: {s.onComplete},
                   onSelectionChanged: (v) => s.setOnComplete(v.first),
+                ),
+              ),
+              const _GroupHeader('下载'),
+              _section(
+                context,
+                '锁屏 / 灵动岛下载进度',
+                'HLS 视频下载时，iOS 会自动在锁屏和灵动岛挂一条「正在下载」的实时活动'
+                '（系统行为，不是应用发的通知）。保持关闭即不再出现；'
+                '但关闭后下载会改为「酌情下载」，系统可能推迟到网络、电量更合适时才启动。'
+                '若发现点了下载迟迟不动，把它打开即可立即开始（代价是锁屏重新出现进度卡片）',
+                Switch(
+                  value: app.showHlsProgressOnLockScreen,
+                  onChanged: (v) => app.setShowHlsProgressOnLockScreen(v),
                 ),
               ),
               const _GroupHeader('日志与排查'),

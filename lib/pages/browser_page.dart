@@ -1,7 +1,14 @@
 import 'dart:convert';
 
 import 'package:material_ui/material_ui.dart';
-import 'package:flutter/services.dart' show Clipboard, ClipboardData, rootBundle;
+import 'package:flutter/services.dart'
+    show
+        Clipboard,
+        ClipboardData,
+        MethodChannel,
+        MissingPluginException,
+        PlatformException,
+        rootBundle;
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../models/video_info.dart';
@@ -31,12 +38,15 @@ class BrowserPageState extends State<BrowserPage> {
   static const _defaultUrl = 'https://www.bilibili.com';
 
   final _urlController = TextEditingController();
+
+  /// 地址栏焦点：用户正在输入时不覆盖他写的内容
+  final _urlFocus = FocusNode();
   late final WebViewController _controller;
-  final List<VideoInfo> _found = [];
   String? _sniffer;
   String? _adblock;
   String? _marker;
   String? _redirectGuard;
+  String? _noAutoplay;
   String _currentUrl = '';
   String _pageTitle = '';
 
@@ -50,6 +60,9 @@ class BrowserPageState extends State<BrowserPage> {
   /// 上次注入的页面视频标记开关状态（供 AppData 变更监听去重）
   bool? _lastMarkerApplied;
 
+  /// 上次应用的自动播放拦截开关状态（供 AppData 变更监听去重）
+  bool? _lastNoAutoplayApplied;
+
   @override
   void initState() {
     super.initState();
@@ -57,20 +70,30 @@ class BrowserPageState extends State<BrowserPage> {
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (url) {
-          _currentUrl = url;
+          // 地址栏跟随：之前只更新 _currentUrl 且不 setState ——
+          // 页内点击链接跳转后，地址栏还停在用户上次输入的地址（看起来「卡住不动」）
+          _syncAddress(url);
           _handledRedirects.clear();
-          // 页面切换时重置底部视频列表：只保留当前页嗅探到的视频
-          if (mounted) setState(() => _found.clear());
           AppData.instance.setLastUrl(url);
           _injectSniffer();
+          _installEarlyScripts(); // 已装则秒回；未装（如 WebView 重建）再试一次
           _injectMarker();
           _injectRedirectGuard();
+          _injectNoAutoplay();
           if (AppData.instance.adBlockEnabled) _injectAdBlock();
         },
+        // SPA 路由变化（history.pushState / 页内锚点）不会触发 onPageStarted，
+        // 只有 onUrlChange 能拿到 —— 否则单页应用里地址栏永远停在首屏地址
+        onUrlChange: (change) {
+          final url = change.url;
+          if (url != null && url.isNotEmpty) _syncAddress(url);
+        },
         onPageFinished: (url) async {
+          _syncAddress(url);
           await _injectSniffer();
           await _injectMarker();
           await _injectRedirectGuard();
+          await _injectNoAutoplay();
           if (AppData.instance.adBlockEnabled) await _injectAdBlock();
           final t = await _controller.getTitle();
           if (mounted) setState(() => _pageTitle = t ?? '');
@@ -85,9 +108,6 @@ class BrowserPageState extends State<BrowserPage> {
           );
         },
       ))
-      ..addJavaScriptChannel('videoFound', onMessageReceived: (msg) {
-        _handleFound(msg.message);
-      })
       ..addJavaScriptChannel('videoAction', onMessageReceived: (msg) {
         _handleVideoAction(msg.message);
       })
@@ -95,6 +115,9 @@ class BrowserPageState extends State<BrowserPage> {
         _handleRedirectAttempt(msg.message);
       });
     AppData.instance.addListener(_onAppDataChanged);
+    // iOS：把自动播放拦截 + 嗅探脚本注册为 WKUserScript（atDocumentStart + 全帧含跨域 iframe），
+    // 必须在页面脚本之前执行；失败由 onPageStarted/onPageFinished 注入兜底
+    _installEarlyScripts();
     _initStartPage();
   }
 
@@ -119,6 +142,7 @@ class BrowserPageState extends State<BrowserPage> {
   @override
   void dispose() {
     AppData.instance.removeListener(_onAppDataChanged);
+    _urlFocus.dispose();
     _urlController.dispose();
     super.dispose();
   }
@@ -135,6 +159,9 @@ class BrowserPageState extends State<BrowserPage> {
   Future<String> _redirectGuardJs() async =>
       _redirectGuard ??= await rootBundle.loadString('assets/redirect_guard.js');
 
+  Future<String> _noAutoplayJs() async =>
+      _noAutoplay ??= await rootBundle.loadString('assets/no_autoplay.js');
+
   Future<void> _injectSniffer() async {
     try {
       final js = await _snifferJs();
@@ -144,6 +171,85 @@ class BrowserPageState extends State<BrowserPage> {
       await _controller.runJavaScript(js + boot);
     } catch (e, st) {
       AppLog.instance.warn('browser', '注入嗅探脚本失败', e, st);
+    }
+  }
+
+  /// iOS 早期注入：把脚本注册为 WKUserScript（atDocumentStart + 全帧含跨域）。
+  /// 相比 onPageFinished 注入的两个优势：
+  /// 1) 先于页面脚本执行 —— 嗅探器因此在站点缓存原始 fetch 引用前挂钩，自动播放拦截
+  ///    也必须在页面脚本之前覆盖 play()，否则站点已拿到原生引用就绕过去了；
+  /// 2) 跨域 iframe 播放器帧同样注入 —— 跨域播放器的请求/自动播放也能管住。
+  /// 非 iOS（无此原生通道）或 WebView 尚未创建时静默跳过/重试，不影响 Android。
+  static const _sniffBridge = MethodChannel('video_downloader/sniffer');
+  bool _earlySnifferInstalled = false;
+  int _earlySnifferTries = 0;
+
+  Future<void> _installEarlyScripts() async {
+    if (_earlySnifferInstalled || _earlySnifferTries > 12) return;
+    _earlySnifferTries++;
+    try {
+      // 顺序：自动播放拦截在嗅探器之前（先拿到 play() 的原生引用）
+      final scripts = [await _noAutoplayJs(), await _snifferJs()];
+      final ok = await _sniffBridge
+              .invokeMethod<bool>('installUserScripts', scripts) ??
+          false;
+      if (ok) {
+        _earlySnifferInstalled = true;
+        AppLog.instance
+            .info('browser', 'iOS 早期注入成功（WKUserScript 全帧：自动播放拦截 + 嗅探）');
+        return;
+      }
+    } on MissingPluginException {
+      return; // Android / 桌面：无此通道，走 onPageStarted/onPageFinished 注入
+    } on PlatformException {
+      return;
+    } catch (e, st) {
+      AppLog.instance.warn('browser', 'iOS 早期注入异常', e, st);
+      return;
+    }
+    // WebView 平台视图尚未创建 → 稍后重试
+    if (mounted) {
+      Future<void>.delayed(const Duration(milliseconds: 500), _installEarlyScripts);
+    }
+  }
+
+  /// 自动播放拦截：脚本自身幂等（已装则立即返回），开关值另行注入。
+  /// 关掉开关时走 `__vdlNoAutoplaySetEnabled(false)` 把原型方法还原，无需刷新页面。
+  Future<void> _injectNoAutoplay() async {
+    try {
+      final on = AppData.instance.blockAutoplayEnabled;
+      if (on) {
+        // 先设标志再注入：脚本只在该值不是 bool 时才用 sessionStorage 里的历史值兜底，
+        // 否则「关过开关 → 再打开」会被历史值覆盖成关闭
+        await _controller.runJavaScript('window.__vdlNoAutoplayEnabled=true;');
+        await _controller.runJavaScript(await _noAutoplayJs());
+      } else {
+        await _controller
+            .runJavaScript('if (window.__vdlNoAutoplaySetEnabled) '
+                'window.__vdlNoAutoplaySetEnabled(false);');
+      }
+      _lastNoAutoplayApplied = on;
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '注入自动播放拦截脚本失败', e, st);
+    }
+  }
+
+  /// 地址栏 / 当前地址跟随页面变化。
+  /// ref: onPageStarted（整页导航）、onUrlChange（SPA pushState、页内锚点）、onPageFinished（兜底）。
+  /// 用户正在地址栏输入时不覆盖（否则打字打到一半被导航结果冲掉）。
+  void _syncAddress(String url) {
+    if (url.isEmpty) return;
+    final changed = url != _currentUrl;
+    _currentUrl = url;
+    if (!_urlFocus.hasFocus && _urlController.text != url) {
+      _urlController.value = TextEditingValue(
+        text: url,
+        selection: const TextSelection.collapsed(offset: 0),
+      );
+    }
+    if (changed && mounted) {
+      // 书签星标等依赖 _currentUrl 的 UI 必须跟着刷
+      setState(() {});
     }
   }
 
@@ -199,6 +305,9 @@ class BrowserPageState extends State<BrowserPage> {
     if (AppData.instance.videoMarkEnabled != _lastMarkerApplied) {
       _injectMarker();
     }
+    if (AppData.instance.blockAutoplayEnabled != _lastNoAutoplayApplied) {
+      _injectNoAutoplay();
+    }
   }
 
   /// 供外部（剪贴板导入等）加载 URL
@@ -216,22 +325,6 @@ class BrowserPageState extends State<BrowserPage> {
     _controller.loadRequest(Uri.parse(url));
   }
 
-  void _handleFound(String raw) {
-    try {
-      final j = jsonDecode(raw) as Map<String, dynamic>;
-      final v = VideoInfo(
-        url: j['url'] as String,
-        frameUrl: (j['frame'] as String?) ?? '',
-        pageTitle: (j['page'] as String?) ?? '',
-      );
-      if (_found.any((e) => e.url == v.url)) return;
-      setState(() => _found.insert(0, v));
-    } catch (e) {
-      AppLog.instance
-          .warn('browser', '解析 videoFound 消息失败: ${_truncate(raw)}', e);
-    }
-  }
-
   /// 页面视频标记（方案A）：页内操作卡回传的动作
   Future<void> _handleVideoAction(String raw) async {
     try {
@@ -239,13 +332,21 @@ class BrowserPageState extends State<BrowserPage> {
       final action = (j['action'] as String?) ?? '';
       final url = (j['url'] as String?) ?? '';
       final title = (j['title'] as String?) ?? '';
+      // 自动播放拦截脚本的一次性上报（每个文档最多一条）：不弹 toast，只进系统日志，
+      // 便于排查「为什么这个页面的视频不自动播了」
+      if (action == 'autoplayBlocked') {
+        AppLog.instance.info(
+          'browser',
+          '已拦截页面自动播放（${j['count'] ?? 1} 次）: ${url.isEmpty ? _currentUrl : url}',
+        );
+        return;
+      }
       if (url.isEmpty) return;
       final v = VideoInfo(url: url, frameUrl: _currentUrl, pageTitle: title);
       switch (action) {
         case 'play':
-          // 立即播放（边播边缓存）：先暂停页内正在播放的视频，避免双音源
-          await _controller.runJavaScript(
-              'document.querySelectorAll("video").forEach(function(v){ if(!v.paused) v.pause(); });');
+          // 立即播放（边播边缓存）：先停掉页内播放，避免双音源
+          await _pausePageVideos();
           final item = await PlaybackCacher.instance.start(
             url: url,
             title: title.isNotEmpty ? title : '网页视频',
@@ -264,18 +365,22 @@ class BrowserPageState extends State<BrowserPage> {
           );
           break;
         case 'mp4':
-          if (!v.isMp4) {
+          if (!_isDirectMedia(v)) {
             _toast('该链接不是可直接下载的视频文件');
             return;
           }
+          // 页内播放器继续播着会让系统一直挂「正在播放」媒体通知，且白耗流量
+          await _pausePageVideos();
           DownloadManager.instance.download(v);
-          _toast('已加入下载队列');
+          _toast('已加入下载队列，进度见「资源库」');
           break;
         case 'hls':
+          await _pausePageVideos();
           HlsManager.instance.start(url, title.isNotEmpty ? title : 'HLS视频');
           _toast('已开始 HLS 离线下载，进度见「资源库」');
           break;
         case 'convert':
+          await _pausePageVideos();
           ConvertManager.instance.convert(v);
           _toast('已开始 m3u8 → mp4 转换，进度见「资源库」');
           break;
@@ -284,13 +389,28 @@ class BrowserPageState extends State<BrowserPage> {
           _toast('链接已复制');
           break;
         case 'ignore':
-          setState(() => _found.removeWhere((e) => e.url == url));
+          // 页内角标由 video_marker.js 自行移除，这里只给个反馈
           _toast('已忽略该视频');
           break;
       }
     } catch (e) {
       AppLog.instance
           .warn('browser', '解析 videoAction 消息失败: ${_truncate(raw)}', e);
+    }
+  }
+
+  /// 暂停页内所有 <video>/<audio>，并清掉页面设置的 Media Session：
+  /// 一来避免下载/本地播放时页内继续出声、白耗流量，
+  /// 二来避免浏览器/系统一直挂着「正在播放」的媒体通知（下载期间尤其明显）。
+  Future<void> _pausePageVideos() async {
+    try {
+      await _controller.runJavaScript(
+        '(function(){try{document.querySelectorAll("video,audio").forEach('
+        'function(v){if(!v.paused)v.pause();});}catch(e){}'
+        'try{if(navigator.mediaSession){navigator.mediaSession.metadata=null;}}catch(e){}})();',
+      );
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '暂停页内播放失败', e, st);
     }
   }
 
@@ -431,6 +551,10 @@ class BrowserPageState extends State<BrowserPage> {
               } else if (v == 'videomark') {
                 AppData.instance.setVideoMark(!AppData.instance.videoMarkEnabled);
                 setState(() {});
+              } else if (v == 'noautoplay') {
+                AppData.instance
+                    .setBlockAutoplay(!AppData.instance.blockAutoplayEnabled);
+                setState(() {});
               }
             },
             itemBuilder: (ctx) => [
@@ -483,6 +607,25 @@ class BrowserPageState extends State<BrowserPage> {
                   ],
                 ),
               ),
+              PopupMenuItem(
+                value: 'noautoplay',
+                child: Row(
+                  children: [
+                    Icon(
+                      AppData.instance.blockAutoplayEnabled
+                          ? Icons.check_box
+                          : Icons.check_box_outline_blank,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      AppData.instance.blockAutoplayEnabled
+                          ? '禁止自动播放：开'
+                          : '禁止自动播放：关',
+                    ),
+                  ],
+                ),
+              ),
             ],
           ),
           IconButton(
@@ -508,174 +651,45 @@ class BrowserPageState extends State<BrowserPage> {
                 Expanded(
                   child: TextField(
                     controller: _urlController,
+                    focusNode: _urlFocus,
                     decoration: const InputDecoration(
                       hintText: '输入网址',
                       isDense: true,
                       border: OutlineInputBorder(),
                     ),
                     textInputAction: TextInputAction.go,
-                    onSubmitted: _load,
+                    // 回车后收起键盘并失焦，这样后续导航能把地址栏覆盖成真实地址
+                    onSubmitted: (v) {
+                      _urlFocus.unfocus();
+                      _load(v);
+                    },
                   ),
                 ),
                 IconButton(
                   icon: const Icon(Icons.search),
-                  onPressed: () => _load(_urlController.text),
+                  onPressed: () {
+                    // 同上：提交后失焦，否则地址栏会一直保留用户输入的简写地址
+                    _urlFocus.unfocus();
+                    _load(_urlController.text);
+                  },
                 ),
               ],
             ),
           ),
-          Expanded(
-            child: Stack(
-              children: [
-                WebViewWidget(controller: _controller),
-                if (_found.isNotEmpty) _foundBanner(),
-              ],
-            ),
-          ),
+          // 页内角标（video_marker.js）是唯一的视频入口，不再额外挂底部列表
+          Expanded(child: WebViewWidget(controller: _controller)),
         ],
       ),
     );
   }
 
-  Widget _foundBanner() {
-    return Positioned(
-      left: 0,
-      right: 0,
-      bottom: 12,
-      child: Center(
-        child: Material(
-          color: Theme.of(context).colorScheme.inverseSurface,
-          borderRadius: BorderRadius.circular(24),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(24),
-            onTap: () => _showFoundSheet(),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.play_circle_outline, color: Colors.white, size: 20),
-                  const SizedBox(width: 8),
-                  Text(
-                    '发现 ${_found.length} 个视频',
-                    style: const TextStyle(color: Colors.white),
-                  ),
-                  const SizedBox(width: 4),
-                  const Icon(Icons.expand_more, color: Colors.white, size: 18),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  void _showFoundSheet() {
-    showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      builder: (ctx) {
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                child: Text('发现视频', style: Theme.of(ctx).textTheme.titleMedium),
-              ),
-              Flexible(
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: _found.length,
-                  itemBuilder: (ctx, i) {
-                    final v = _found[i];
-                    return ListTile(
-                      leading: Icon(
-                        v.isHls ? Icons.stream : Icons.movie_outlined,
-                        color: v.isHls ? Colors.orange : Colors.blue,
-                      ),
-                      title: Text(v.url, maxLines: 1, overflow: TextOverflow.ellipsis),
-                      subtitle: Text(
-                        v.kind.toUpperCase(),
-                        style: const TextStyle(fontSize: 12),
-                      ),
-                      trailing: v.isHls
-                          ? Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                IconButton(
-                                  icon: const Icon(Icons.download),
-                                  tooltip: 'HLS 离线缓存',
-                                  onPressed: () {
-                                    Navigator.pop(ctx);
-                                    _startDownload(v);
-                                  },
-                                ),
-                                IconButton(
-                                  icon: const Icon(Icons.download_for_offline),
-                                  tooltip: '下载 m3u8（含分片）',
-                                  onPressed: () {
-                                    Navigator.pop(ctx);
-                                    ConvertManager.instance.downloadM3u8(v);
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                          content: Text('已开始下载 m3u8 分片包')),
-                                    );
-                                  },
-                                ),
-                                IconButton(
-                                  icon: const Icon(Icons.transform),
-                                  tooltip: '转 MP4',
-                                  onPressed: () {
-                                    Navigator.pop(ctx);
-                                    ConvertManager.instance.convert(v);
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(content: Text('已开始 m3u8 → mp4 转换，进度见「资源库」')),
-                                    );
-                                  },
-                                ),
-                              ],
-                            )
-                          : IconButton(
-                              icon: const Icon(Icons.download),
-                              tooltip: '下载',
-                              onPressed: () {
-                                Navigator.pop(ctx);
-                                _startDownload(v);
-                              },
-                            ),
-                    );
-                  },
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  void _startDownload(VideoInfo v) {
-    if (v.isHls) {
-      HlsManager.instance.start(v.url, v.pageTitle.isNotEmpty ? v.pageTitle : 'HLS视频');
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('已开始 HLS 离线下载，进度见「资源库」')),
-      );
-      return;
-    }
-    if (!v.isMp4) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('该链接不是可直接下载的 mp4')),
-      );
-      return;
-    }
-    DownloadManager.instance.download(v);
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('已加入下载队列')),
-    );
-  }
+  /// 是否可直接按文件下载：非清单的 http(s) 直链。
+  /// 嗅探器会用响应 Content-Type 兜底上报**没有扩展名**的直链
+  /// （如 /video/abc?sign=…，VideoInfo.kind 判为 other）。旧逻辑只认扩展名，
+  /// 这类链接被直接拒绝 → 用户点了下载，资源库里既没有条目也没有进度。
+  /// 放宽后仍由真实下载结果兜底：下不动会在资源库留下带 HTTP 状态的失败条目。
+  bool _isDirectMedia(VideoInfo v) =>
+      v.url.startsWith('http') && !v.isHls && v.kind != 'mpd';
 
   void _showBookmarksSheet() {
     showModalBottomSheet<void>(

@@ -12,6 +12,7 @@ import '../services/library_folders.dart';
 import '../services/m3u8_convert.dart';
 import '../services/playback_cacher.dart';
 import '../services/share_import.dart';
+import '../services/thumbnailer.dart';
 import 'player_page.dart';
 import 'settings_page.dart';
 
@@ -51,12 +52,18 @@ class _LibraryPageState extends State<LibraryPage> {
 
   Future<void> _refresh() async {
     setState(() => _loading = true);
-    final saved = await DownloadManager.instance.scanSaved();
-    if (!mounted) return;
-    setState(() {
-      _saved = saved;
-      _loading = false;
-    });
+    try {
+      final saved = await DownloadManager.instance.scanSaved();
+      if (!mounted) return;
+      setState(() {
+        _saved = saved;
+        _loading = false;
+      });
+    } catch (_) {
+      // 扫描失败也要退出 loading，否则资源库会永久停在转圈上（列表中什么都看不到）
+      if (!mounted) return;
+      setState(() => _loading = false);
+    }
   }
 
   /// 导入本地 m3u8（iOS 系统文件夹选择器）→ 直接转 mp4
@@ -347,33 +354,52 @@ class _LibraryPageState extends State<LibraryPage> {
     );
   }
 
+  /// 卡片文字区高度：上下 padding 14 + 两行标题 40 + 间距 2 + 一行摘要 16
+  /// 留 4px 余量，避免系统字体放大时 Column 溢出
+  static const double _gridTextHeight = 76;
+
   /// 宫格视图：分组标题 + 每组的卡片网格
+  ///
+  /// 卡片高度按「16:9 封面 + 固定文字区」算（mainAxisExtent），
+  /// 不再用 childAspectRatio —— 那个比例是按卡片宽度换算的，
+  /// 窄屏两列时封面只占一半，卡片底部会留出一大片空白。
   Widget _gridList(BuildContext context, List<LibrarySection> sections) {
-    return CustomScrollView(
-      physics: const AlwaysScrollableScrollPhysics(),
-      slivers: [
-        for (final s in sections) ...[
-          if (_folder.isEmpty)
-            SliverToBoxAdapter(child: _sectionHeader(s.name, s.items.length)),
-          SliverPadding(
-            padding: const EdgeInsets.fromLTRB(12, 4, 12, 16),
-            sliver: SliverGrid(
-              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                maxCrossAxisExtent: 280,
-                mainAxisSpacing: 12,
-                crossAxisSpacing: 12,
-                // 0.82 → 卡片略高：16:9 封面 + 两行标题/摘要的留白更充足，
-                // 长标题换行到第二行不会被底部裁剪遮挡
-                childAspectRatio: 0.82,
+    const spacing = 12.0;
+    const padH = 12.0;
+    return LayoutBuilder(
+      builder: (ctx, box) {
+        final avail = box.maxWidth - padH * 2;
+        var cols = (avail / 170).round();
+        if (cols < 2) cols = 2;
+        final itemW = (avail - spacing * (cols - 1)) / cols;
+        // clamp 返回 num，必须显式转 double，否则 mainAxisExtent 类型不匹配
+        final coverH = (itemW * 9 / 16).clamp(80.0, 320.0).toDouble();
+        final extent = coverH + _gridTextHeight;
+        return CustomScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          slivers: [
+            for (final s in sections) ...[
+              if (_folder.isEmpty)
+                SliverToBoxAdapter(child: _sectionHeader(s.name, s.items.length)),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(padH, 4, padH, 16),
+                sliver: SliverGrid(
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: cols,
+                    mainAxisSpacing: spacing,
+                    crossAxisSpacing: spacing,
+                    mainAxisExtent: extent,
+                  ),
+                  delegate: SliverChildBuilderDelegate(
+                    (c, i) => _gridCard(context, s.items[i], i, s.items),
+                    childCount: s.items.length,
+                  ),
+                ),
               ),
-              delegate: SliverChildBuilderDelegate(
-                (c, i) => _gridCard(context, s.items[i], i, s.items),
-                childCount: s.items.length,
-              ),
-            ),
-          ),
-        ],
-      ],
+            ],
+          ],
+        );
+      },
     );
   }
 
@@ -481,7 +507,32 @@ class _LibraryPageState extends State<LibraryPage> {
         } else {
           DownloadManager.instance.resume(it.id);
         }
+      case 'detail':
+        _showError(it);
     }
+  }
+
+  /// 完整错误详情（列表里只显示收敛后的单行摘要）
+  void _showError(LibraryItem it) {
+    final raw = (it.error ?? '').trim();
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('「${it.sortName}」失败原因'),
+        content: SingleChildScrollView(
+          child: SelectableText(
+            raw.isEmpty ? '未知错误（可查看设置页的日志）' : raw,
+            style: const TextStyle(fontSize: 13),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
   }
 
   /// 更多操作菜单项（宫格/列表共用，按条目状态取）
@@ -505,6 +556,8 @@ class _LibraryPageState extends State<LibraryPage> {
         const PopupMenuItem(value: 'cancel', child: Text('取消')),
       if (it.failed && it.resumable)
         const PopupMenuItem(value: 'resume', child: Text('继续下载')),
+      if (it.failed)
+        const PopupMenuItem(value: 'detail', child: Text('查看错误详情')),
       if (playable) const PopupMenuItem(value: 'rename', child: Text('重命名')),
       if (playable)
         const PopupMenuItem(value: 'move', child: Text('移动到文件夹')),
@@ -570,15 +623,41 @@ class _LibraryPageState extends State<LibraryPage> {
       }
     }
     final action = _coverAction(it, index, all);
-    return Container(
-      color: bg,
-      child: Stack(
-        children: [
-          Positioned.fill(child: Center(child: content)),
-          if (action != null)
-            Positioned(right: 6, bottom: 6, child: action),
-        ],
-      ),
+    // 已完成条目（非进行中/失败）优先用真实画面抽帧作封面；
+    // 抽帧失败或还在生成时，保持原来的纯色 + 图标封面，不出现白块。
+    Widget base = Container(color: bg, child: Center(child: content));
+    final src = _thumbSource(it);
+    if (src != null) {
+      base = FutureBuilder<String?>(
+        future: Thumbnailer.get(
+          key: it.id,
+          path: src.path,
+          taskId: src.taskId,
+          url: src.url,
+        ),
+        builder: (ctx, snap) {
+          final p = snap.data;
+          if (p == null) {
+            return Container(color: bg, child: Center(child: content));
+          }
+          return Image.file(
+            File(p),
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.low,
+            errorBuilder: (_, __, ___) =>
+                Container(color: bg, child: Center(child: content)),
+          );
+        },
+      );
+    }
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        base,
+        if (action != null)
+          Positioned(right: 6, bottom: 6, child: action),
+      ],
     );
   }
 
@@ -958,9 +1037,16 @@ class _LibraryPageState extends State<LibraryPage> {
       List<LibraryItem> all) {
     final more = _moreMenuItems(it);
     return ListTile(
-      leading: _leadingIcon(it),
+      leading: _leading(it),
       title: Text(it.sortName, maxLines: 1, overflow: TextOverflow.ellipsis),
-      subtitle: Text(_subtitle(it), style: const TextStyle(fontSize: 12)),
+      subtitle: Text(
+        _subtitle(it),
+        style: const TextStyle(fontSize: 12),
+        // 错误信息必须限死单行：原始异常（DioException / ffmpeg 输出尾部）
+        // 带换行且超长，直接渲染会把列表行高撑坏
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
       // 点按即播放，不留播放按钮；所有操作统一收进「更多」菜单
       trailing: more.isEmpty
           ? null
@@ -1018,6 +1104,8 @@ class _LibraryPageState extends State<LibraryPage> {
 
   /// 删除条目：按类型清理（convert / m3u8 离线任务 + 分片包 / mp4）
   Future<void> _deleteItem(LibraryItem it) async {
+    // 缩略图缓存随之失效（同 id 重新下载时不该复用旧画面）
+    Thumbnailer.evict(it.id);
     // 边播边缓存完成项仍驻留 PlaybackCacher 内存列表：走 cancel 才能连同记录一起清理
     if (PlaybackCacher.instance.tasks.any((t) => t.id == it.id)) {
       await PlaybackCacher.instance.cancel(it.id);
@@ -1043,7 +1131,7 @@ class _LibraryPageState extends State<LibraryPage> {
         _toast('m3u8 分片包请先「本地转 MP4」');
         return;
       }
-      HlsManager.instance.play(it.hlsTaskId!);
+      _playHls(it);
       return;
     }
     if (it.localPath == null || it.localPath!.isEmpty) return;
@@ -1083,12 +1171,90 @@ class _LibraryPageState extends State<LibraryPage> {
 
   /// 下载中的 HLS：边下边看（复用同一 AVURLAsset，读已缓存分段）
   void _playHlsCaching(LibraryItem it) {
+    _playHls(it, whileDownloading: true);
+  }
+
+  /// HLS 播放（离线 / 边下边看）：原生返回 false 时明确提示，
+  /// 避免出现「点了按钮毫无反应」的情况
+  Future<void> _playHls(LibraryItem it, {bool whileDownloading = false}) async {
     final taskId = it.hlsTaskId ?? it.id;
     if (taskId.isEmpty) {
-      _toast('该任务暂不支持边下边看');
+      _toast('该任务暂不支持播放');
       return;
     }
-    HlsManager.instance.play(taskId, whileDownloading: true);
+    final ok = await HlsManager.instance
+        .play(taskId, whileDownloading: whileDownloading);
+    if (!mounted) return;
+    if (!ok) {
+      _toast(whileDownloading
+          ? '无法边下边看：原生下载任务不存在，可取消后重新下载'
+          : '播放失败：本地缓存不存在或已被系统清理');
+    }
+  }
+
+  /// 列表左侧：能出图就用缩略图（56×40 圆角），否则回退到原来的状态图标
+  Widget _leading(LibraryItem it) {
+    final icon = _leadingIcon(it);
+    final src = _thumbSource(it);
+    if (src == null) return icon;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: SizedBox(
+        width: 56,
+        height: 40,
+        child: FutureBuilder<String?>(
+          future: Thumbnailer.get(
+            key: it.id,
+            path: src.path,
+            taskId: src.taskId,
+            url: src.url,
+          ),
+          builder: (ctx, snap) {
+            final p = snap.data;
+            if (p == null) {
+              // 还在抽帧 / 抽帧失败：保持原图标，不闪白块
+              return ColoredBox(
+                color: Colors.black.withValues(alpha: 0.04),
+                child: Center(child: icon),
+              );
+            }
+            return Image.file(
+              File(p),
+              fit: BoxFit.cover,
+              gaplessPlayback: true,
+              filterQuality: FilterQuality.low,
+              errorBuilder: (_, __, ___) => ColoredBox(
+                color: Colors.black.withValues(alpha: 0.04),
+                child: Center(child: icon),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  /// 缩略图源：本地文件 / HLS 离线任务 id / 原始地址（老条目兜底）。
+  /// 进行中、失败条目不出图（保留原来的进度/错误封面）。
+  ({String? path, String? taskId, String? url})? _thumbSource(LibraryItem it) {
+    if (it.active || it.failed) return null;
+    final raw = it.url ?? '';
+    final remote = raw.startsWith('http') ? raw : null;
+    final remoteOnly = remote == null ? null : (path: null, taskId: null, url: remote);
+    if (it.kind == 'm3u8') {
+      final tid = it.hlsTaskId;
+      // 脏记录：旧桥接曾把本地路径当 taskId，这类原生查不到
+      if (tid == null ||
+          tid.isEmpty ||
+          tid.contains('/') ||
+          tid.contains(r'\')) {
+        return remoteOnly;
+      }
+      return (path: null, taskId: tid, url: remote);
+    }
+    final p = it.localPath ?? '';
+    if (p.isEmpty) return remoteOnly;
+    return (path: p, taskId: null, url: null);
   }
 
   Widget _leadingIcon(LibraryItem it) {
@@ -1114,7 +1280,10 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   String _subtitle(LibraryItem it) {
-    if (it.failed) return it.error ?? '失败';
+    if (it.failed) {
+      final s = _shortError(it.error);
+      return (s.startsWith('失败') || s.startsWith('已')) ? s : '失败：$s';
+    }
     if (it.active) {
       final pct = '${(it.progress * 100).toStringAsFixed(0)}%';
       if (it.kind == 'convert') {
@@ -1126,8 +1295,24 @@ class _LibraryPageState extends State<LibraryPage> {
       return [pct, it.speedText, it.etaText].whereType<String>().join(' · ');
     }
     final date = it.created.toLocal().toString().substring(0, 10);
-    if (it.kind == 'share') return '分享导入 · $date';
+    // 分享导入的条目也只显示大小 + 日期，不再标来源
+    if (it.kind == 'share') {
+      final size = formatBytes(it.size);
+      return size.isEmpty ? date : '$size · $date';
+    }
     if (it.kind == 'm3u8') return 'HLS 离线缓存 · $date';
     return '${formatBytes(it.size)} · $date';
+  }
+
+  /// 把异常文本收敛成一行短摘要（压掉换行/去异常前缀/截断），
+  /// 保证列表行高稳定；完整内容走「查看错误详情」弹窗。
+  static String _shortError(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return '失败';
+    var s = raw.replaceAll(RegExp(r'\s+'), ' ').trim();
+    s = s.replaceFirst(RegExp(r'^(Exception|DioException|Error)[:\s]+'), '');
+    const max = 48;
+    if (s.length > max) s = '${s.substring(0, max)}…';
+    if (s.isEmpty) return '失败';
+    return s;
   }
 }

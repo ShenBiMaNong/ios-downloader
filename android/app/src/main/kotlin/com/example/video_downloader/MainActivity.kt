@@ -1,5 +1,6 @@
 package com.example.video_downloader
 
+import android.content.ClipData
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -51,16 +52,64 @@ class MainActivity : FlutterActivity() {
 
   private fun enqueueSend(intent: Intent?) {
     if (intent == null) return
-    when (intent.action) {
-      Intent.ACTION_SEND -> {
-        val uri = streamExtra(intent, Intent.EXTRA_STREAM) ?: return
-        val name = intent.getStringExtra(Intent.EXTRA_TITLE) ?: guessName(uri)
-        pending.add(uri.toString() to safeName(name))
+    if (intent.action != Intent.ACTION_SEND && intent.action != Intent.ACTION_SEND_MULTIPLE) {
+      return
+    }
+    val uris = collectUris(intent)
+    if (uris.isEmpty()) return
+    val title = intent.getStringExtra(Intent.EXTRA_TITLE)
+    // 队列里已有的 URI 不再重复入队：Activity 重建时 configureFlutterEngine
+    // 会拿同一个 intent 再跑一遍，不去重会导入重复文件
+    val known = pending.mapTo(HashSet<String>()) { it.first }
+    var added = 0
+    for (uri in uris) {
+      val s = uri.toString()
+      if (!known.add(s)) continue
+      // 只有一个文件时优先用分享方给的标题；批量时按各自的显示名
+      val name = if (uris.size == 1 && !title.isNullOrBlank()) title else guessName(uri)
+      pending.add(s to safeName(name))
+      added++
+    }
+    if (added > 0) notifyPending()
+  }
+
+  /**
+   * 收集本次分享的全部 URI。批量分享有两个来源，必须合并：
+   * - EXTRA_STREAM：标准位置（ACTION_SEND_MULTIPLE 为列表）；
+   * - ClipData：相册 / 微信 / QQ 等批量分享方把**全部**文件放在这里，
+   *   EXTRA_STREAM 往往只带第一条 —— 只读 EXTRA_STREAM 就会「批量分享只收到 1 个」。
+   *
+   * EXTRA_STREAM 的实际类型不统一（单个 Uri / ArrayList<Uri> 都有分享方在用），
+   * 两次读取各自 try 一下：泛型擦除下取错类型要到使用时才抛 ClassCastException。
+   */
+  private fun collectUris(intent: Intent): List<Uri> {
+    val out = LinkedHashSet<Uri>()
+    try {
+      streamListExtra(intent, Intent.EXTRA_STREAM)?.let { out.addAll(it) }
+    } catch (e: Exception) {
+      // 不是列表 → 下面按单个 Uri 再取一次
+    }
+    try {
+      streamExtra(intent, Intent.EXTRA_STREAM)?.let { out.add(it) }
+    } catch (e: Exception) {
+      // 实为列表 → 上面已收集
+    }
+    val clip: ClipData? = intent.clipData
+    if (clip != null) {
+      for (i in 0 until clip.itemCount) {
+        val u = clip.getItemAt(i)?.uri
+        if (u != null && u.scheme != null) out.add(u)
       }
-      Intent.ACTION_SEND_MULTIPLE -> {
-        val uris = streamListExtra(intent, Intent.EXTRA_STREAM) ?: return
-        for (uri in uris) pending.add(uri.toString() to safeName(guessName(uri)))
-      }
+    }
+    return out.toList()
+  }
+
+  /** 有新分享入队 → 立即通知 Dart 侧导入（不必等 onResume） */
+  private fun notifyPending() {
+    try {
+      channel?.invokeMethod("pendingAdded", null)
+    } catch (e: Exception) {
+      // Flutter 侧尚未挂接 handler（冷启动首帧前）→ 走启动时的 takePending
     }
   }
 

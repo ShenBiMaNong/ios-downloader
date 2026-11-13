@@ -31,6 +31,23 @@ class LibraryRefresh extends ChangeNotifier {
 class ShareBridge {
   static const _channel = MethodChannel('video_downloader/share');
 
+  /// 原生侧「有新分享入队」回调（通知到达即导入，不必等 App 走一次 resume）
+  static void Function()? onPendingAdded;
+  static bool _listenerInstalled = false;
+
+  /// 挂接原生推送（只在同一通道上用反向调用，不影响 Dart→原生 invokeMethod）
+  static void installListener() {
+    if (_listenerInstalled) return;
+    _listenerInstalled = true;
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'pendingAdded') {
+        AppLog.instance.info('share', '收到原生推送：有新分享待导入');
+        onPendingAdded?.call();
+      }
+      return null;
+    });
+  }
+
   /// 取回待导入的分享条目（取后清空原生队列）
   static Future<List<Map<String, dynamic>>> takePending() async {
     try {
@@ -88,7 +105,31 @@ class ShareImport {
       VideoInfo(url: url, frameUrl: '', pageTitle: '剪贴板导入');
 
   /// 处理原生队列里的分享文件：拷贝到 Documents/Share 并登记，返回成功数
+  /// 并发调用（启动时 / onResume / 原生推送可能同时来）只跑一份，
+  /// 否则两次 takePending 会互相抢队列，后一次拿空、前一次被丢掉。
+  /// 并发期间来的请求标记成「再扫一轮」，本轮结束后补跑，条目不会滞留。
   static Future<int> importPending() async {
+    if (_importing) {
+      _again = true;
+      return 0;
+    }
+    _importing = true;
+    var total = 0;
+    try {
+      do {
+        _again = false;
+        total += await _importPending();
+      } while (_again);
+      return total;
+    } finally {
+      _importing = false;
+    }
+  }
+
+  static bool _importing = false;
+  static bool _again = false;
+
+  static Future<int> _importPending() async {
     final items = await ShareBridge.takePending();
     if (items.isEmpty) return 0;
     AppLog.instance.info('share', '开始导入 ${items.length} 个分享文件');

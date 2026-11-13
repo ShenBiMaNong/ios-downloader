@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:material_ui/material_ui.dart';
 import 'package:video_player/video_player.dart';
@@ -10,7 +11,10 @@ import '../services/playback_progress.dart';
 import '../services/player_settings.dart';
 import 'settings_page.dart';
 
-/// 本地视频播放页：播放列表 + 手势控制（点按暂停、双击快进快退、按住加速）
+/// 本地视频播放页：播放列表 + 手势控制
+/// 点按暂停 / 双击左右半边快退快进 / 按住左半边快退、右半边加速
+/// 左右拖动：跟手快退快进（拖动中实时预览目标时间）
+/// 上下拖动：上一个 / 下一个（带滑动入场动画）
 /// 支持本地文件 / 网络源（边播边缓存本地代理 URL、直连 URL），
 /// 网络源自动记忆播放进度，下次打开时从上次位置恢复。
 class PlayerPage extends StatefulWidget {
@@ -23,7 +27,8 @@ class PlayerPage extends StatefulWidget {
   State<PlayerPage> createState() => _PlayerPageState();
 }
 
-class _PlayerPageState extends State<PlayerPage> {
+class _PlayerPageState extends State<PlayerPage>
+    with SingleTickerProviderStateMixin {
   late VideoPlayerController _controller;
   late int _index;
   bool _initFailed = false;
@@ -41,9 +46,30 @@ class _PlayerPageState extends State<PlayerPage> {
   bool _holdWasPlaying = false;
   double? _doubleTapDx;
 
+  // 左右拖动：快退 / 快进
+  bool _hDragging = false;
+  double _hDragDx = 0;
+  Duration _hDragOrigin = Duration.zero;
+  Duration _hDragTarget = Duration.zero;
+  DateTime _lastLiveSeek = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // 上下拖动：上一个 / 下一个
+  bool _vDragging = false;
+  double _vDragDy = 0;
+  static const double _vSwipeThreshold = 72;
+
+  // 切换视频的滑动入场动画（1 = 下一个从右侧滑入，-1 = 上一个从左侧滑入）
+  late final AnimationController _slideCtrl;
+  double _slideDir = 1;
+
   @override
   void initState() {
     super.initState();
+    _slideCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 260),
+      value: 1, // 初始无动画（位移 0）
+    );
     PlayerSettings.instance.ensureLoaded();
     if (widget.playlist.isEmpty) {
       // 空列表兜底（正常流程不会发生）
@@ -59,6 +85,7 @@ class _PlayerPageState extends State<PlayerPage> {
   void dispose() {
     _holdTimer?.cancel();
     _saveTimer?.cancel();
+    _slideCtrl.dispose();
     _saveProgressNow();
     _controller.dispose();
     super.dispose();
@@ -179,13 +206,19 @@ class _PlayerPageState extends State<PlayerPage> {
       _completionHandled = false;
       return;
     }
-    _goTo(nextPlaylistIndex(_index, widget.playlist.length, s.order));
+    _goTo(nextPlaylistIndex(_index, widget.playlist.length, s.order),
+        slideDir: 1);
   }
 
-  void _goTo(int i) {
+  /// 切换到指定条目；[slideDir] 非空时播放滑动入场动画
+  /// （1 = 下一个，从右侧滑入；-1 = 上一个，从左侧滑入）
+  void _goTo(int i, {double? slideDir}) {
     _holdTimer?.cancel();
     _holdTimer = null;
     _holdLeft = null;
+    _hDragging = false;
+    _vDragging = false;
+    _vDragDy = 0;
     _saveProgressNow();
     _controller.removeListener(_onValueChanged);
     _controller.dispose();
@@ -194,6 +227,106 @@ class _PlayerPageState extends State<PlayerPage> {
       _initFailed = false;
     });
     _load();
+    if (slideDir != null) {
+      _slideDir = slideDir;
+      _slideCtrl.forward(from: 0);
+    }
+  }
+
+  /// 上下滑动切歌：方向决定动画入场侧
+  void _switchByGesture({required bool next}) {
+    if (widget.playlist.length <= 1) return;
+    final s = PlayerSettings.instance;
+    final i = next
+        ? nextPlaylistIndex(_index, widget.playlist.length, s.order)
+        : previousPlaylistIndex(_index, widget.playlist.length, s.order);
+    _goTo(i, slideDir: next ? 1 : -1);
+  }
+
+  bool get _canSwitch => widget.playlist.length > 1;
+
+  // ---- 左右拖动：快退 / 快进 ----
+
+  void _hDragStart() {
+    final v = _controller.value;
+    if (!v.isInitialized) return;
+    _hDragging = true;
+    _hDragDx = 0;
+    _hDragOrigin = v.position;
+    _hDragTarget = v.position;
+    setState(() {});
+  }
+
+  void _hDragUpdate(double dx, double width) {
+    if (!_hDragging) return;
+    final v = _controller.value;
+    if (!v.isInitialized || v.duration <= Duration.zero) return;
+    _hDragDx += dx;
+    // 横向滑满一屏 ≈ 视频总时长的 1/4（上限 180 秒）：既跟手又不会一划到底
+    final spanMs = math.min(v.duration.inMilliseconds / 4, 180000).toDouble();
+    final deltaMs = (_hDragDx / (width <= 0 ? 1 : width) * spanMs).round();
+    var target = _hDragOrigin + Duration(milliseconds: deltaMs);
+    if (target < Duration.zero) target = Duration.zero;
+    if (target > v.duration) target = v.duration;
+    _hDragTarget = target;
+    setState(() {});
+    // 跟手 seek：节流 120ms，太密集解码器来不及出帧（画面会卡住不更新）
+    final now = DateTime.now();
+    if (now.difference(_lastLiveSeek).inMilliseconds >= 120) {
+      _lastLiveSeek = now;
+      _controller.seekTo(target);
+    }
+  }
+
+  void _hDragEnd() {
+    if (!_hDragging) return;
+    _hDragging = false;
+    _controller.seekTo(_hDragTarget);
+    setState(() {});
+  }
+
+  void _hDragCancel() {
+    if (!_hDragging) return;
+    _hDragging = false;
+    _controller.seekTo(_hDragTarget);
+    setState(() {});
+  }
+
+  // ---- 上下拖动：上一个 / 下一个 ----
+
+  void _vDragStart() {
+    _vDragging = true;
+    _vDragDy = 0;
+    setState(() {});
+  }
+
+  void _vDragUpdate(double dy) {
+    if (!_vDragging) return;
+    // 到头了（只有一个视频 / 上拉却没有下一个）→ 位移衰减，给出「拉不动」的手感
+    final atEdge = !_canSwitch;
+    _vDragDy += atEdge ? dy * 0.3 : dy;
+    _vDragDy = _vDragDy.clamp(-120.0, 120.0).toDouble();
+    setState(() {});
+  }
+
+  void _vDragEnd() {
+    if (!_vDragging) return;
+    final dy = _vDragDy;
+    _vDragging = false;
+    _vDragDy = 0;
+    setState(() {});
+    if (dy <= -_vSwipeThreshold) {
+      _switchByGesture(next: true); // 上划 = 下一个
+    } else if (dy >= _vSwipeThreshold) {
+      _switchByGesture(next: false); // 下划 = 上一个
+    }
+  }
+
+  void _vDragCancel() {
+    if (!_vDragging) return;
+    _vDragging = false;
+    _vDragDy = 0;
+    setState(() {});
   }
 
   void _togglePlay() {
@@ -270,14 +403,34 @@ class _PlayerPageState extends State<PlayerPage> {
         ),
       ),
       backgroundColor: Colors.black,
-      body: _initFailed
-          ? const Center(
-              child: Text('播放失败（文件可能损坏或格式不支持）',
-                  style: TextStyle(color: Colors.white)))
-          : !_controller.value.isInitialized
-              ? const Center(child: CircularProgressIndicator(color: Colors.white))
-              : _player(),
+      // 切歌滑动入场：整块内容（含加载中）从滑动方向滑入并淡入，
+      // 让「上/下切歌」有明确的位移反馈，而不是硬切
+      body: AnimatedBuilder(
+        animation: _slideCtrl,
+        builder: (context, child) {
+          final t =
+              Curves.easeOutCubic.transform(_slideCtrl.value.clamp(0.0, 1.0).toDouble());
+          return Transform.translate(
+            offset: Offset(_slideDir * (1 - t) * 44, 0),
+            child: Opacity(opacity: 0.35 + 0.65 * t, child: child),
+          );
+        },
+        child: _body(),
+      ),
     );
+  }
+
+  Widget _body() {
+    if (_initFailed) {
+      return const Center(
+        child: Text('播放失败（文件可能损坏或格式不支持）',
+            style: TextStyle(color: Colors.white)),
+      );
+    }
+    if (!_controller.value.isInitialized) {
+      return const Center(child: CircularProgressIndicator(color: Colors.white));
+    }
+    return _player();
   }
 
   String _currentTitle() =>
@@ -302,17 +455,35 @@ class _PlayerPageState extends State<PlayerPage> {
                     _startHold(d.localPosition.dx < width / 2),
                 onLongPressEnd: (_) => _endHold(),
                 onLongPressCancel: _endHold,
-                child: Stack(
-                  alignment: Alignment.center,
-                  children: [
-                    Center(
-                      child: AspectRatio(
-                        aspectRatio: _controller.value.aspectRatio,
-                        child: VideoPlayer(_controller),
+                // 左右拖动：跟手快退 / 快进
+                onHorizontalDragStart: (_) => _hDragStart(),
+                onHorizontalDragUpdate: (d) => _hDragUpdate(d.delta.dx, width),
+                onHorizontalDragEnd: (_) => _hDragEnd(),
+                onHorizontalDragCancel: _hDragCancel,
+                // 上下拖动：上一个 / 下一个
+                onVerticalDragStart: (_) => _vDragStart(),
+                onVerticalDragUpdate: (d) => _vDragUpdate(d.delta.dy),
+                onVerticalDragEnd: (_) => _vDragEnd(),
+                onVerticalDragCancel: _vDragCancel,
+                child: ClipRect(
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      // 上下拖动时画面跟手位移（切歌的横向滑入在页面级统一做）
+                      Transform.translate(
+                        offset: Offset(0, _vDragDy * 0.35),
+                        child: Center(
+                          child: AspectRatio(
+                            aspectRatio: _controller.value.aspectRatio,
+                            child: VideoPlayer(_controller),
+                          ),
+                        ),
                       ),
-                    ),
-                    if (_holdLeft != null) _holdIndicator(),
-                  ],
+                      if (_hDragging) _seekIndicator(),
+                      if (_vDragging) _switchIndicator(),
+                      if (_holdLeft != null) _holdIndicator(),
+                    ],
+                  ),
                 ),
               );
             },
@@ -321,6 +492,79 @@ class _PlayerPageState extends State<PlayerPage> {
         _controls(),
         const SizedBox(height: 8),
       ],
+    );
+  }
+
+  /// 左右拖动时的目标时间预览（拖动中实时跟随）
+  Widget _seekIndicator() {
+    final total = _controller.value.duration;
+    final target = _hDragTarget;
+    final delta = target - _hDragOrigin;
+    final forward = delta.inMilliseconds >= 0;
+    final arrow = forward ? Icons.fast_forward : Icons.fast_rewind;
+    final sign = forward ? '+' : '-';
+    return _overlayPill(
+      children: [
+        Icon(arrow, color: Colors.white, size: 20),
+        const SizedBox(width: 8),
+        Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '$sign${delta.inSeconds.abs()}s',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            Text(
+              '${_fmt(target)} / ${_fmt(total)}',
+              style: const TextStyle(color: Colors.white70, fontSize: 11),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// 上下拖动时的切换提示（上划=下一个，下划=上一个）
+  Widget _switchIndicator() {
+    final up = _vDragDy <= 0;
+    final label = !_canSwitch
+        ? '仅一个视频'
+        : up
+            ? '下一个'
+            : '上一个';
+    return _overlayPill(
+      children: [
+        Icon(
+          up ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+          color: Colors.white,
+          size: 22,
+        ),
+        const SizedBox(width: 6),
+        Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _overlayPill({required List<Widget> children}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.black54,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Row(mainAxisSize: MainAxisSize.min, children: children),
     );
   }
 
@@ -363,8 +607,11 @@ class _PlayerPageState extends State<PlayerPage> {
                   icon: const Icon(Icons.skip_previous, color: Colors.white),
                   tooltip: '上一个',
                   onPressed: canNavigate
-                      ? () => _goTo(previousPlaylistIndex(
-                          _index, widget.playlist.length, s.order))
+                      ? () => _goTo(
+                            previousPlaylistIndex(
+                                _index, widget.playlist.length, s.order),
+                            slideDir: -1,
+                          )
                       : null,
                 ),
                 _seekButton(
@@ -392,8 +639,11 @@ class _PlayerPageState extends State<PlayerPage> {
                   icon: const Icon(Icons.skip_next, color: Colors.white),
                   tooltip: '下一个',
                   onPressed: canNavigate
-                      ? () => _goTo(nextPlaylistIndex(
-                          _index, widget.playlist.length, s.order))
+                      ? () => _goTo(
+                            nextPlaylistIndex(
+                                _index, widget.playlist.length, s.order),
+                            slideDir: 1,
+                          )
                       : null,
                 ),
               ],

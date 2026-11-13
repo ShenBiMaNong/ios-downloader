@@ -57,6 +57,9 @@ class AppData extends ChangeNotifier {
   /// 页面视频标记开关：嗅探到的 <video> 直接描边 + 角标展示（默认开）
   bool videoMarkEnabled = true;
 
+  /// 禁止视频自动播放：页面自己开始的播放一律拦下（默认开）
+  bool blockAutoplayEnabled = true;
+
   /// 上次打开的页面（供「浏览器启动页 = 上次打开页」恢复）
   String lastUrl = '';
   bool _loaded = false;
@@ -78,6 +81,7 @@ class AppData extends ChangeNotifier {
           adBlockEnabled = (j['adBlock'] as bool?) ?? false;
           redirectGuardEnabled = (j['redirectGuard'] as bool?) ?? true;
           videoMarkEnabled = (j['videoMark'] as bool?) ?? true;
+          blockAutoplayEnabled = (j['blockAutoplay'] as bool?) ?? true;
           lastUrl = (j['lastUrl'] as String?) ?? '';
           notifyListeners();
         }
@@ -103,6 +107,7 @@ class AppData extends ChangeNotifier {
         'adBlock': adBlockEnabled,
         'redirectGuard': redirectGuardEnabled,
         'videoMark': videoMarkEnabled,
+        'blockAutoplay': blockAutoplayEnabled,
         'lastUrl': lastUrl,
       }));
     } catch (e, st) {
@@ -165,6 +170,13 @@ class AppData extends ChangeNotifier {
   Future<void> setVideoMark(bool v) async {
     if (v == videoMarkEnabled) return;
     videoMarkEnabled = v;
+    notifyListeners();
+    await _save();
+  }
+
+  Future<void> setBlockAutoplay(bool v) async {
+    if (v == blockAutoplayEnabled) return;
+    blockAutoplayEnabled = v;
     notifyListeners();
     await _save();
   }

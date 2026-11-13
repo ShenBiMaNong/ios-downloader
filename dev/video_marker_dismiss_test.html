@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>角标弹层关闭测试</title>
+<style>
+  body { font-family: sans-serif; margin: 12px; }
+  video { width: 200px; background: #000; }
+  #blank { margin-top: 40px; height: 60px; background: #eef; }
+  #result { white-space: pre-wrap; font: 12px monospace; background: #0f172a; color: #a5f3fc; padding: 8px; }
+</style>
+</head>
+<body>
+<video src="https://example.com/a_1080p.mp4?sign=xyz" preload="none"></video>
+<div id="blank">空白区域（点这里应关闭弹层）</div>
+<pre id="result">(running…)</pre>
+
+<script>
+  var out = [];
+  function log(s) {
+    out.push(s);
+    document.getElementById('result').textContent = out.join('\n');
+  }
+  function cardCount() { return document.querySelectorAll('.vdl-card').length; }
+  window.videoAction = { postMessage: function (s) { log('ACTION: ' + s); } };
+</script>
+<script src="../assets/video_marker.js"></script>
+<script>
+  // 每步之间留出一个宏任务，让 bindDismiss 里的 setTimeout(0) 真正生效
+  function step(fn) {
+    return new Promise(function (resolve) {
+      setTimeout(function () { fn(); setTimeout(resolve, 30); }, 30);
+    });
+  }
+
+  (async function () {
+    await step(function () {});
+    var v = document.querySelector('video');
+    var b = v.__vdlBadge;
+    log('T0 badge=' + (b ? 'Y' : 'N') + '  expect Y');
+
+    await step(function () { b.click(); });
+    log('T1 点角标打开: card=' + cardCount() + '  expect 1');
+
+    await step(function () { document.getElementById('blank').click(); });
+    log('T2 点页面空白: card=' + cardCount() + '  expect 0');
+
+    await step(function () { b.click(); });
+    await step(function () { document.querySelector('.vdl-card .vdl-card-h').click(); });
+    log('T3 点弹层内部标题区: card=' + cardCount() + '  expect 1');
+
+    await step(function () { b.click(); });
+    log('T4 再点同一角标: card=' + cardCount() + '  expect 0');
+
+    await step(function () { b.click(); });
+    await step(function () { window.dispatchEvent(new Event('scroll')); });
+    log('T5 页面滚动: card=' + cardCount() + '  expect 0');
+
+    await step(function () { b.click(); });
+    await step(function () { document.querySelector('.vdl-card [data-a="copy"]').click(); });
+    log('T6 点操作项: card=' + cardCount() + '  expect 0');
+
+    await step(function () { b.click(); });
+    log('T7 操作后仍能再次打开: card=' + cardCount() + '  expect 1');
+
+    log('DONE');
+  })();
+</script>
+</body>
+</html>

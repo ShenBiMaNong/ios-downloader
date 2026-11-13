@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'app_log.dart';
+import 'hls_manager.dart' show HlsDownloader;
 
 /// 主题模式：浅色 / 深色 / 跟随系统
 enum AppThemeMode { light, dark, system }
@@ -45,6 +46,14 @@ class AppSettings extends ChangeNotifier {
   /// 资源库展示方式，默认宫格
   LibraryViewMode libraryViewMode = LibraryViewMode.grid;
 
+  /// HLS 下载时是否显示系统「正在下载」实时活动（锁屏 / 灵动岛）。
+  ///
+  /// 默认 **关**：那条「正在下载 + 转圈」是 iOS 为 AVAssetDownloadTask 的非酌情下载
+  /// 自动挂的实时活动（不是 App 发的通知），关掉它的唯一办法是把下载改成酌情
+  /// （isDiscretionary = true）——系统可能因此推迟到网络/电量合适时才开始下载。
+  /// 打开则立即下载，但锁屏会重新出现进度卡片。
+  bool showHlsProgressOnLockScreen = false;
+
   bool _loaded = false;
 
   Future<void> ensureLoaded() async {
@@ -62,12 +71,22 @@ class AppSettings extends ChangeNotifier {
           libraryViewMode =
               _viewFrom((j['libraryViewMode'] as String?) ?? '') ??
                   libraryViewMode;
+          showHlsProgressOnLockScreen =
+              (j['showHlsProgressOnLockScreen'] as bool?) ??
+                  showHlsProgressOnLockScreen;
           notifyListeners();
         }
       }
     } catch (e, st) {
       AppLog.instance.error('settings', '加载设置失败', e, st);
     }
+    // 不管读盘成功与否，都把偏好同步给原生（原生默认静音，这里保证一致）
+    await _applyHlsSilent();
+  }
+
+  /// 把「锁屏下载进度」偏好下发给原生 HLS 桥接
+  Future<void> _applyHlsSilent() async {
+    await HlsDownloader.setSilent(!showHlsProgressOnLockScreen);
   }
 
   static AppThemeMode? _themeFrom(String s) =>
@@ -93,6 +112,7 @@ class AppSettings extends ChangeNotifier {
         'themeMode': themeMode.name,
         'browserStartPage': browserStartPage.name,
         'libraryViewMode': libraryViewMode.name,
+        'showHlsProgressOnLockScreen': showHlsProgressOnLockScreen,
       }));
     } catch (e, st) {
       AppLog.instance.error('settings', '保存设置失败', e, st);
@@ -118,5 +138,14 @@ class AppSettings extends ChangeNotifier {
     libraryViewMode = v;
     notifyListeners();
     await _save();
+  }
+
+  Future<void> setShowHlsProgressOnLockScreen(bool v) async {
+    if (v == showHlsProgressOnLockScreen) return;
+    showHlsProgressOnLockScreen = v;
+    notifyListeners();
+    await _save();
+    // 立刻生效：在途任务跑完时原生会重建 session
+    await _applyHlsSilent();
   }
 }

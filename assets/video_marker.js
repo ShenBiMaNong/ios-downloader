@@ -208,15 +208,33 @@
     b.addEventListener('click', function (e) {
       e.preventDefault();
       e.stopPropagation();
+      // 再点同一个角标 = 收起（原来 closeCard 后又立即重建，看起来「点不掉」）
+      if (currentCard && currentCardAnchor === b) {
+        closeCard();
+        return;
+      }
       toggleCard(video, b);
     });
     document.body.appendChild(b);
     return b;
   }
 
+  // 已标记视频登记表。必需：video 从 DOM 移除后 querySelectorAll 就查不到它了，
+  // 只遍历现存 <video> 会漏掉这类元素 —— 预览视频关掉后角标会永久留在页面上，
+  // 而且再没有任何代码更新它的坐标（表现为「视频没了角标还在、位置卡死不动」）。
+  var marked = [];
+
   function place(badge, video) {
     var r = video.getBoundingClientRect();
-    if (r.width < 10 || r.height < 10) { badge.style.display = 'none'; return; }
+    // 尺寸为 0 / 移出视口 / 被祖先 display:none 藏起来 → 不显示角标
+    if (
+      r.width < 10 || r.height < 10 ||
+      r.bottom <= 0 || r.top >= window.innerHeight ||
+      r.right <= 0 || r.left >= window.innerWidth
+    ) {
+      badge.style.display = 'none';
+      return;
+    }
     badge.style.display = '';
     var bw = badge.offsetWidth || 64;
     var left = r.left + r.width - bw - 6;
@@ -228,11 +246,99 @@
   }
 
   var currentCard = null;
+  var currentCardAnchor = null;
+  var cardDismissBound = false;
+
+  // 点卡片外部 / 页面滚动 → 关闭操作卡（否则弹层只能靠再次点角标或选中某项关掉）
+  function onDocClick(e) {
+    if (!currentCard) return;
+    var t = e.target;
+    if (currentCard === t || currentCard.contains(t)) return;
+    if (currentCardAnchor &&
+        (currentCardAnchor === t || currentCardAnchor.contains(t))) return;
+    closeCard();
+  }
+
+  function onScrollClose() {
+    if (currentCard) closeCard();
+  }
+
   function closeCard() {
     if (currentCard && currentCard.parentNode) {
       currentCard.parentNode.removeChild(currentCard);
     }
     currentCard = null;
+    currentCardAnchor = null;
+    if (cardDismissBound) {
+      cardDismissBound = false;
+      document.removeEventListener('click', onDocClick, true);
+      window.removeEventListener('scroll', onScrollClose, true);
+    }
+  }
+
+  // 打开卡片后再挂「点外部关闭」：此刻正在派发这次 click，
+  // 同步挂监听会在事件冒泡到 document 时立刻把卡片自己关掉 → 延到事件结束后
+  function bindDismiss() {
+    setTimeout(function () {
+      if (!currentCard || cardDismissBound) return;
+      cardDismissBound = true;
+      document.addEventListener('click', onDocClick, true);
+      window.addEventListener('scroll', onScrollClose, true);
+    }, 0);
+  }
+
+  // 清理「视频已从 DOM 移除」的角标（悬停预览、播放器销毁等场景）
+  function sweepDetached() {
+    for (var i = marked.length - 1; i >= 0; i--) {
+      var m = marked[i];
+      if (m.v && m.v.isConnected) continue;
+      if (m.b && m.b.parentNode) m.b.parentNode.removeChild(m.b);
+      if (m.v) m.v.__vdlBadge = null;
+      // 操作卡挂在被移除的角标上 → 一并关掉，否则弹层会浮在原地
+      if (currentCardAnchor && currentCardAnchor === m.b) closeCard();
+      marked.splice(i, 1);
+    }
+  }
+
+  // 主动注销某个视频的标记（「忽略此条」），并从登记表摘掉，
+  // 否则 rAF 会对一个已脱离文档的角标反复设样式、循环永不停
+  function unmark(video) {
+    for (var i = marked.length - 1; i >= 0; i--) {
+      if (marked[i].v !== video) continue;
+      var b = marked[i].b;
+      if (b && b.parentNode) b.parentNode.removeChild(b);
+      marked.splice(i, 1);
+    }
+    video.__vdlBadge = null;
+  }
+
+  function positionAll() {
+    for (var i = 0; i < marked.length; i++) {
+      var m = marked[i];
+      if (m.v && m.v.isConnected) place(m.b, m.v);
+    }
+  }
+
+  // 角标跟随：CSS 动画/浮层滑入不会触发 scroll/resize，单靠 1s 轮询会「卡住不跟」。
+  // 有标记时用 rAF 逐帧（节流到 ~15fps）对齐坐标；无标记时自动停下。
+  var rafId = 0;
+  var lastPosAt = 0;
+  function tick(ts) {
+    rafId = 0;
+    if (!window.__vdlMarkerInstalled) return;
+    if (!lastPosAt || ts - lastPosAt > 66) {
+      lastPosAt = ts;
+      sweepDetached();
+      positionAll();
+    }
+    if (marked.length && window.requestAnimationFrame) {
+      rafId = window.requestAnimationFrame(tick);
+    }
+  }
+  function kick() {
+    if (!rafId && window.requestAnimationFrame) {
+      rafId = window.requestAnimationFrame(tick);
+    }
   }
 
   function toggleCard(video, badge) {
@@ -283,10 +389,7 @@
       postAction({ action: a, url: info.url, title: info.title });
       closeCard();
       if (a === 'ignore') {
-        if (video.__vdlBadge) {
-          video.__vdlBadge.parentNode.removeChild(video.__vdlBadge);
-          video.__vdlBadge = null;
-        }
+        unmark(video);
         video.classList.remove('vdl-video');
         video.__vdlIgnored = true;
       } else {
@@ -307,12 +410,16 @@
     card.style.left = left + 'px';
     card.style.top = top + 'px';
     currentCard = card;
+    currentCardAnchor = badge;
+    bindDismiss();
   }
 
   function update() {
     // 清理后（开关关闭）不再重建角标：click/play/观察器等残留监听可能仍会触发
     if (!window.__vdlMarkerInstalled) return;
     if (!document.body) return;
+    // 先摘掉已从 DOM 移除的角标（它们不会出现在下面的 querySelectorAll 结果里）
+    sweepDetached();
     var videos = document.querySelectorAll('video');
     for (var i = 0; i < videos.length; i++) {
       var v = videos[i];
@@ -325,20 +432,18 @@
         badge = makeBadge(v);
         v.__vdlBadge = badge;
         v.classList.add('vdl-video');
+        marked.push({ v: v, b: badge });
         (function (el, b) {
           el.addEventListener('loadedmetadata', function () { refreshBadge(b, el); });
           el.addEventListener('durationchange', function () { refreshBadge(b, el); });
           el.addEventListener('resize', function () { refreshBadge(b, el); });
         })(v, badge);
       }
-      if (!v.isConnected) {
-        if (badge.parentNode) badge.parentNode.removeChild(badge);
-        v.__vdlBadge = null;
-        continue;
-      }
       refreshBadge(badge, v);
       place(badge, v);
     }
+    // 有待跟随的角标 → 开启逐帧对齐（脱离文档的会在 tick/sweep 里被摘掉）
+    if (marked.length) kick();
   }
 
   window.addEventListener('scroll', update, true);
@@ -390,13 +495,22 @@
     window.removeEventListener('resize', update);
     document.removeEventListener('click', onQuick, true);
     document.removeEventListener('play', onQuick, true);
+    // 操作卡若正开着，连它挂的「点外部关闭」监听一起摘掉
+    closeCard();
     if (srcObserver) { try { srcObserver.disconnect(); } catch (e) {} }
     var st = document.getElementById('vdl-style');
     if (st && st.parentNode) st.parentNode.removeChild(st);
+    if (rafId && window.cancelAnimationFrame) window.cancelAnimationFrame(rafId);
+    rafId = 0;
+    marked.length = 0;
     var el = document.querySelectorAll('.vdl-badge, .vdl-card');
     for (var i = 0; i < el.length; i++) if (el[i].parentNode) el[i].parentNode.removeChild(el[i]);
     var vs = document.querySelectorAll('video.vdl-video');
     for (var j = 0; j < vs.length; j++) vs[j].classList.remove('vdl-video');
+    // 元素上残留的 __vdlBadge 必须清掉：否则重新打开标记开关后，
+    // update() 会认为角标已存在而不再创建，页面就再也不出角标了
+    var all = document.querySelectorAll('video');
+    for (var k = 0; k < all.length; k++) all[k].__vdlBadge = null;
     window.__vdlMarkerInstalled = false;
     window.__vdlMarkerSource = null;
     // 通知子框架一起清理（开关关闭）

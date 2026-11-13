@@ -126,6 +126,9 @@ class _HomeShellState extends State<HomeShell> {
   late final List<Widget> _pages;
   late final AppLifecycleListener _lifecycle;
 
+  /// 进度数据源（导航角标监听）
+  late final Listenable _progressSources;
+
   @override
   void initState() {
     super.initState();
@@ -133,8 +136,17 @@ class _HomeShellState extends State<HomeShell> {
       BrowserPage(key: _browserKey),
       const LibraryPage(),
     ];
+    _progressSources = Listenable.merge([
+      DownloadManager.instance,
+      HlsManager.instance,
+      ConvertManager.instance,
+      PlaybackCacher.instance,
+    ]);
     // 回到前台：处理分享队列 + 恢复本地代理 socket（iOS 后台可能被回收）
     _lifecycle = AppLifecycleListener(onResume: _onResume);
+    // 原生推送：新分享入队即导入（含批量分享；不必等 onResume）
+    ShareBridge.installListener();
+    ShareBridge.onPendingAdded = _importPendingShares;
     WidgetsBinding.instance.addPostFrameCallback((_) => _checkClipboard());
   }
 
@@ -247,22 +259,53 @@ class _HomeShellState extends State<HomeShell> {
   Widget build(BuildContext context) {
     return Scaffold(
       body: IndexedStack(index: _index, children: _pages),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _index,
-        onDestinationSelected: (i) => setState(() => _index = i),
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.language),
-            selectedIcon: Icon(Icons.language),
-            label: '浏览器',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.video_library_outlined),
-            selectedIcon: Icon(Icons.video_library),
-            label: '资源库',
-          ),
-        ],
-      ),
+      bottomNavigationBar: _navBar(),
+    );
+  }
+
+  /// 进行中的任务数（mp4 下载 / HLS 离线 / m3u8 转换 / 边播边缓存）
+  int _activeCount() {
+    var n = 0;
+    for (final t in DownloadManager.instance.tasks) {
+      if (t.status == DownloadStatus.queued ||
+          t.status == DownloadStatus.downloading) {
+        n++;
+      }
+    }
+    n += HlsManager.instance.tasks.where((t) => !t.done && !t.failed).length;
+    n += ConvertManager.instance.tasks.where((t) => !t.done && !t.failed).length;
+    n += PlaybackCacher.instance.tasks.where((t) => !t.done && !t.failed).length;
+    return n;
+  }
+
+  /// 底部导航：「资源库」带在下载数量角标，让用户在浏览器页也能看到任务已开始
+  Widget _navBar() {
+    return ListenableBuilder(
+      listenable: _progressSources,
+      builder: (context, _) {
+        final active = _activeCount();
+        Widget badge(IconData icon) => Badge.count(
+              count: active,
+              isLabelVisible: active > 0,
+              child: Icon(icon),
+            );
+        return NavigationBar(
+          selectedIndex: _index,
+          onDestinationSelected: (i) => setState(() => _index = i),
+          destinations: [
+            const NavigationDestination(
+              icon: Icon(Icons.language),
+              selectedIcon: Icon(Icons.language),
+              label: '浏览器',
+            ),
+            NavigationDestination(
+              icon: badge(Icons.video_library_outlined),
+              selectedIcon: badge(Icons.video_library),
+              label: '资源库',
+            ),
+          ],
+        );
+      },
     );
   }
 }
