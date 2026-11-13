@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'app_log.dart';
+
 class Bookmark {
   final String title;
   final String url;
@@ -48,6 +50,15 @@ class AppData extends ChangeNotifier {
   final List<Bookmark> bookmarks = [];
   final List<HistoryEntry> history = [];
   bool adBlockEnabled = false;
+
+  /// 跳转拦截开关：网站自动跳转时先询问是否跳转（默认开）
+  bool redirectGuardEnabled = true;
+
+  /// 页面视频标记开关：嗅探到的 <video> 直接描边 + 角标展示（默认开）
+  bool videoMarkEnabled = true;
+
+  /// 上次打开的页面（供「浏览器启动页 = 上次打开页」恢复）
+  String lastUrl = '';
   bool _loaded = false;
 
   Future<void> ensureLoaded() async {
@@ -65,10 +76,15 @@ class AppData extends ChangeNotifier {
             history.add(HistoryEntry.fromJson(h as Map<String, dynamic>));
           }
           adBlockEnabled = (j['adBlock'] as bool?) ?? false;
+          redirectGuardEnabled = (j['redirectGuard'] as bool?) ?? true;
+          videoMarkEnabled = (j['videoMark'] as bool?) ?? true;
+          lastUrl = (j['lastUrl'] as String?) ?? '';
           notifyListeners();
         }
       }
-    } catch (_) {}
+    } catch (e, st) {
+      AppLog.instance.error('data', '加载书签/历史数据失败', e, st);
+    }
   }
 
   Future<File> _file() async {
@@ -85,8 +101,13 @@ class AppData extends ChangeNotifier {
         'bookmarks': bookmarks.map((e) => e.toJson()).toList(),
         'history': history.map((e) => e.toJson()).toList(),
         'adBlock': adBlockEnabled,
+        'redirectGuard': redirectGuardEnabled,
+        'videoMark': videoMarkEnabled,
+        'lastUrl': lastUrl,
       }));
-    } catch (_) {}
+    } catch (e, st) {
+      AppLog.instance.error('data', '保存书签/历史数据失败', e, st);
+    }
   }
 
   bool isBookmarked(String url) => bookmarks.any((b) => b.url == url);
@@ -130,6 +151,28 @@ class AppData extends ChangeNotifier {
 
   Future<void> setAdBlock(bool v) async {
     adBlockEnabled = v;
+    notifyListeners();
+    await _save();
+  }
+
+  Future<void> setRedirectGuard(bool v) async {
+    if (v == redirectGuardEnabled) return;
+    redirectGuardEnabled = v;
+    notifyListeners();
+    await _save();
+  }
+
+  Future<void> setVideoMark(bool v) async {
+    if (v == videoMarkEnabled) return;
+    videoMarkEnabled = v;
+    notifyListeners();
+    await _save();
+  }
+
+  /// 记录最近打开的页面（页面开始加载时调用）
+  Future<void> setLastUrl(String url) async {
+    if (url == lastUrl) return;
+    lastUrl = url;
     notifyListeners();
     await _save();
   }

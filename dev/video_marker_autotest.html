@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>视频标记自动测试</title>
+<style>
+  body { font-family: sans-serif; margin: 12px; }
+  video { width: 200px; background: #000; margin: 8px; }
+  #result { white-space: pre-wrap; font: 12px monospace; background: #0f172a; color: #a5f3fc; padding: 8px; }
+</style>
+</head>
+<body>
+<video src="https://example.com/a_1080p.mp4?sign=xyz" preload="none"></video>
+<video src="https://example.com/playlist/index.m3u8" preload="none"></video>
+<video src="https://example.com/clip.webm" preload="none"></video>
+<pre id="result">(running…)</pre>
+
+<script>
+  var results = [];
+  function log(s) {
+    results.push(s);
+    var d = document.getElementById('result');
+    d.textContent = results.join('\n');
+  }
+  window.videoAction = {
+    postMessage: function (s) { log('ACTION: ' + s); }
+  };
+</script>
+<script src="../assets/video_marker.js"></script>
+<script>
+  setTimeout(function () {
+    var vids = document.querySelectorAll('video');
+    log('videos: ' + vids.length);
+    var b0 = vids[0].__vdlBadge, b1 = vids[1].__vdlBadge, b2 = vids[2].__vdlBadge;
+    log('badges: ' + (b0 ? 'Y' : 'N') + '/' + (b1 ? 'Y' : 'N') + '/' + (b2 ? 'Y' : 'N'));
+    log('outline mp4: ' + (vids[0].classList.contains('vdl-video') ? 'Y' : 'N'));
+    log('badge labels: ' +
+        (b0 ? b0.querySelector('.vdl-tx').textContent : '-') + ' | ' +
+        (b1 ? b1.querySelector('.vdl-tx').textContent : '-') + ' | ' +
+        (b2 ? b2.querySelector('.vdl-tx').textContent : '-'));
+    if (b0) {
+      b0.click();
+      var card = document.querySelector('.vdl-card');
+      log('mp4 card buttons: ' + Array.prototype.map.call(
+        card.querySelectorAll('.vdl-btn'), function (b) { return b.textContent; }).join(' | '));
+      card.querySelector('[data-a="mp4"]').click();
+    }
+    if (b1) {
+      b1.click();
+      var card1 = document.querySelector('.vdl-card');
+      log('hls card buttons: ' + Array.prototype.map.call(
+        card1.querySelectorAll('.vdl-btn'), function (b) { return b.textContent; }).join(' | '));
+      card1.querySelector('[data-a="hls"]').click();
+      b1.click();
+      document.querySelector('.vdl-card').querySelector('[data-a="convert"]').click();
+      b1.click();
+      document.querySelector('.vdl-card').querySelector('[data-a="copy"]').click();
+      b1.click();
+      document.querySelector('.vdl-card').querySelector('[data-a="ignore"]').click();
+      log('after ignore badge1: ' + (vids[1].__vdlBadge ? 'Y' : 'N') +
+          ', outline: ' + (vids[1].classList.contains('vdl-video') ? 'Y' : 'N'));
+    }
+    log('DONE');
+  }, 300);
+</script>
+</body>
+</html>

@@ -1,5 +1,11 @@
 # MVP-4 分享扩展（待激活）
 
+> 更新：主 App 已实现另一条免费可行的**文件接收**路线（不依赖本扩展）：
+> Android 直接收系统分享（ACTION_SEND video/*）；iOS 声明 CFBundleDocumentTypes，
+> 经系统「用 App 打开 / 分享」收视频文件。两者都落盘 `Documents/Share/` 并入库
+> （见 lib/services/share_import.dart + 原生 ShareBridge）。本扩展的价值收窄为
+> 「在分享菜单里直接接管网页链接 → 剪贴板」的快捷入口，可继续暂缓。
+
 本目录是 **Share Extension 的完整代码与配置，但尚未接入 Xcode 工程**（在 Windows 上无法用
 Xcode GUI 加 target；手工改 `project.pbxproj` 风险高，等 MVP-0 流水线跑通后再激活，
 避免把两个高风险改动叠进同一次 CI 构建）。

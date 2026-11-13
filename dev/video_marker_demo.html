@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>视频标记功能验证</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 16px; background: #f8fafc; color: #0f172a; }
+  h1 { font-size: 18px; }
+  video { width: 100%; max-width: 420px; background: #000; margin: 12px 0; border-radius: 8px; }
+  #log { margin-top: 16px; background: #0f172a; color: #a5f3fc; font: 12px/1.5 monospace;
+    padding: 10px; border-radius: 8px; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<h1>video_marker.js 功能验证</h1>
+<p>预期：两个视频出现蓝色虚线描边 + 右上角角标（MP4 蓝 / HLS 紫）。点击角标展开操作卡，点击操作按钮，动作 JSON 出现在下方日志。</p>
+
+<video src="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4" controls></video>
+<video src="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8" controls></video>
+
+<div id="log">（等待操作…）</div>
+
+<script>
+  // 模拟原生 JS 通道（App 内由 WKWebView messageHandlers / Android WebView 提供）
+  window.videoAction = {
+    postMessage: function (s) {
+      var d = document.getElementById('log');
+      d.textContent = '[videoAction] ' + s + '\n' + d.textContent;
+    }
+  };
+  window.videoFound = {
+    postMessage: function (s) {
+      var d = document.getElementById('log');
+      d.textContent = '[videoFound] ' + s + '\n' + d.textContent;
+    }
+  };
+</script>
+<script src="../assets/video_marker.js"></script>
+</body>
+</html>

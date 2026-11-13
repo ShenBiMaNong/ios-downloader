@@ -10,14 +10,19 @@
 | MVP-1 | 内置浏览器（webview_flutter）+ JS 视频嗅探 + mp4 直链下载 + 本地库播放 | ✅ 真机验收通过（可下载视频） |
 | MVP-2 | HLS(m3u8) 离线缓存（AVAssetDownloadTask 原生桥接） | 已实现（待真机验证） |
 | MVP-3 | m3u8 转 mp4（ffmpeg_kit_flutter_new_min 预编译库，本地分片下载 + `-c copy` 无损转封装） | 已实现（待真机验证） |
-| MVP-4 | 分享扩展（免费账号降级：剪贴板交接） | 剪贴板链路✅；扩展 target 待激活（staged/） |
+| MVP-4 | 分享导入：剪贴板链接交接（iOS 免费账号）+ 视频文件接收（Android 直收系统分享；iOS 经「用 App 打开」收文件）→ 落盘 Documents/Share 并入库 | 剪贴板链路✅；Android 分享接收✅；iOS 文件接收✅（待真机验证）；分享扩展 target 待激活（staged/） |
 | M4.5 | 广告过滤（JS 层拦截广告域名 + 隐藏广告元素，浏览器菜单开关） | ✅ 已实现 |
+| M4.6 | 跳转拦截（非用户点击的自动跳转先询问，广告跳转识别 + 禁用开关，浏览器菜单/设置页） | ✅ 已实现 |
 | MVP-5 | 浏览器扩展：书签（星标收藏/管理）+ 历史记录（自动记录/管理） | ✅ 已实现 |
 | MVP-6 | 资源库：下载与视频库合并，按名称/大小/创建时间×正/倒序（默认创建倒序），下载显示进度/网速/预计剩余 | ✅ 已实现 |
+| M6.5 | 资源库文件夹：新建/重命名/删除文件夹，视频可移动到文件夹（虚拟分组，改元数据不搬文件）；内置「分享」文件夹收纳分享导入的视频；「全部」视图按文件夹分组，组内按所选排序 | ✅ 已实现 |
+| M6.6 | 资源库宫格/列表切换：宫格卡片显示封面状态（下载进度环/失败/类型图标）、标题与摘要，卡片点按播放、封面快捷按钮（取消/继续/本地转 MP4）、更多菜单（播放/移动/删除）；切换偏好持久化 | ✅ 已实现 |
+| M6.7 | 视频重命名：列表/宫格「更多」菜单统一入口（点按条目即播放、无独立播放按钮，所有操作收进菜单），同步改名磁盘文件与元数据（原生 HLS 缓存仅改标题） | ✅ 已实现 |
+| M6.8 | 下载重名自动避让：mp4 直链 / m3u8 转 mp4 / m3u8 分片包 / 分享导入，同名时自动追加 ` (2)` 序号，不再覆盖旧文件 | ✅ 已实现 |
 
 ## 架构
 
-- 内置浏览器：`webview_flutter`（iOS 底层 WKWebView），页面加载时注入 [assets/sniffer.js](assets/sniffer.js)（钩住 fetch/XHR + 扫描 `<video>` + MutationObserver），嗅探到的视频 URL 经 JS Channel 回传 Dart。
+- 内置浏览器：`webview_flutter`（iOS 底层 WKWebView），页面加载时注入 [assets/sniffer.js](assets/sniffer.js)（钩住 fetch/XHR + 扫描 `<video>` + MutationObserver），嗅探到的视频 URL 经 JS Channel 回传 Dart；再注入 [assets/video_marker.js](assets/video_marker.js) 把可下载视频**直接标在页面上**（蓝色虚线描边 + 右上角角标，蓝=直链 / 紫=HLS），点角标展开页内操作卡（下载 / HLS 缓存 m3u8 / 转 MP4 / 复制链接 / 忽略），动作经 `videoAction` 通道回传 Dart。
 - 下载：mp4 直链走 Dio（带移动端 UA），存到 `Documents/Downloads/`，元数据存 `<id>.json`。
 - 本地库：path_provider 扫描元数据 + video_player 播放。
 

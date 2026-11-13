@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>视频嗅探 · 页面标记样式方案预览</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    margin: 0; padding: 24px; background: #f1f5f9; color: #0f172a;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #64748b; font-size: 13px; margin: 0 0 20px; }
+  .card {
+    background: #fff; border: 1px solid #e2e8f0; border-radius: 12px;
+    padding: 16px; margin-bottom: 20px;
+  }
+  .card h2 { font-size: 15px; margin: 0 0 2px; }
+  .card .desc { font-size: 12px; color: #64748b; margin: 0 0 12px; }
+  .video-mock {
+    position: relative; width: 100%; max-width: 460px; aspect-ratio: 16/9;
+    background: #0b1220 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Crect width='16' height='16' fill='%230b1220'/%3E%3Cpath d='M0 0h8v8H0zM8 8h8v8H8z' fill='%2310192b'/%3E%3C/svg%3E");
+    border-radius: 10px; overflow: visible; margin: 8px 0;
+  }
+  .play-tri {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    width: 0; height: 0; border-left: 22px solid rgba(255,255,255,.85); border-top: 14px solid transparent; border-bottom: 14px solid transparent;
+  }
+  .bar {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 4px; background: rgba(255,255,255,.18);
+  }
+  .bar > i { display: block; height: 4px; width: 42%; background: #3b82f6; }
+
+  /* 方案 A：虚线描边 + 右上角胶囊角标 */
+  .plan-a .video-mock { outline: 2px dashed #3b82f6; outline-offset: 3px; }
+  .badge-a {
+    position: absolute; top: -12px; right: -8px;
+    display: flex; align-items: center; gap: 5px;
+    background: rgba(15,23,42,.94); color: #fff;
+    font-size: 12px; padding: 5px 9px; border-radius: 13px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.4); cursor: pointer;
+  }
+  .badge-a .ic {
+    width: 15px; height: 15px; border-radius: 50%; background: #3b82f6; color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700;
+  }
+  .badge-a.hls { background: rgba(124,58,237,.95); }
+  .badge-a.hls .ic { background: #7c3aed; }
+
+  /* 方案 B：右下角浮动下载钮（无描边） */
+  .fab-b {
+    position: absolute; right: 10px; bottom: 14px;
+    width: 38px; height: 38px; border-radius: 50%;
+    background: #2563eb; color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; box-shadow: 0 4px 12px rgba(0,0,0,.45); cursor: pointer;
+  }
+  .fab-b .n { position: absolute; top: -5px; right: -5px; background: #ef4444; color: #fff;
+    font-size: 10px; min-width: 16px; height: 16px; border-radius: 8px; display: flex;
+    align-items: center; justify-content: center; padding: 0 3px; font-weight: 700; }
+
+  /* 方案 C：顶部信息条 */
+  .strip-c {
+    position: absolute; top: 0; left: 0; right: 0;
+    background: linear-gradient(180deg, rgba(0,0,0,.78), rgba(0,0,0,.35));
+    color: #fff; font-size: 12px; padding: 8px 10px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .strip-c .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .chip { background: rgba(255,255,255,.18); border-radius: 8px; padding: 2px 7px; font-size: 11px; white-space: nowrap; }
+  .strip-c .dl { background: #3b82f6; border-radius: 8px; padding: 4px 10px; font-weight: 600; cursor: pointer; }
+
+  /* 交互：点击角标后出现的页内卡片 */
+  .inpage-card {
+    width: 250px; background: #fff; color: #0f172a; border-radius: 12px;
+    box-shadow: 0 8px 28px rgba(0,0,0,.35); font-size: 13px; overflow: hidden;
+  }
+  .inpage-card .hd { padding: 10px 12px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; }
+  .inpage-card .hd .t { font-weight: 600; margin-bottom: 2px; }
+  .inpage-card .hd .m { color: #64748b; font-size: 12px; }
+  .inpage-card .hd .u { color: #94a3b8; font-size: 11px; word-break: break-all; margin-top: 3px; }
+  .inpage-card .btn { display: block; width: 100%; text-align: left; padding: 11px 12px;
+    border: 0; border-top: 1px solid #f1f5f9; background: #fff; color: #0f172a; font-size: 13px; cursor: pointer; }
+  .inpage-card .btn:hover { background: #eff6ff; }
+  .inpage-card .btn.hl { color: #1d4ed8; font-weight: 600; }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-start; }
+  .col { flex: 1 1 220px; min-width: 220px; }
+  .note { font-size: 12px; color: #64748b; margin-top: 6px; line-height: 1.5; }
+  .tag { display: inline-block; background: #dbeafe; color: #1e40af; font-size: 11px; border-radius: 6px; padding: 1px 6px; margin-right: 6px; }
+</style>
+</head>
+<body>
+
+<h1>视频嗅探 · 「页面内标记」样式方案预览</h1>
+<p class="sub">只展示候选样式，未写正式代码。每个方案都是「直接标在网页里的视频元素上」，不用 Flutter 弹层。</p>
+
+<!-- 方案 A -->
+<div class="card">
+  <h2>方案 A：虚线描边 + 右上角胶囊角标</h2>
+  <p class="desc">视频元素加蓝色虚线描边（可下载提示），右上角悬一个小胶囊显示清晰度/格式。不遮挡控制条，可同时看到页面上所有可下载视频。</p>
+  <div class="row">
+    <div class="col">
+      <div class="video-mock plan-a">
+        <span class="play-tri"></span>
+        <span class="bar"><i></i></span>
+        <span class="badge-a"><span class="ic">⬇</span>1080p</span>
+      </div>
+      <div class="note"><span class="tag">MP4</span>角标显示分辨率或「MP4」，蓝色系</div>
+    </div>
+    <div class="col">
+      <div class="video-mock plan-a">
+        <span class="play-tri"></span>
+        <span class="bar"><i></i></span>
+        <span class="badge-a hls"><span class="ic">⬇</span>HLS · 720p</span>
+      </div>
+      <div class="note"><span class="tag">HLS</span>HLS 用紫色系区分，可带时长</div>
+    </div>
+  </div>
+</div>
+
+<!-- 方案 B -->
+<div class="card">
+  <h2>方案 B：右下角浮动下载按钮（不描边）</h2>
+  <p class="desc">像播放器自带按钮一样，右下角一个圆形下载键，带数字角标表示可下载数量。最克制、不干扰页面，但「哪些视频能下」不够明显。</p>
+  <div class="row">
+    <div class="col">
+      <div class="video-mock">
+        <span class="play-tri"></span>
+        <span class="bar"><i></i></span>
+        <span class="fab-b">⬇<span class="n">3</span></span>
+      </div>
+      <div class="note"><span class="tag">克制</span>只有一个小圆钮，红点表示数量</div>
+    </div>
+  </div>
+</div>
+
+<!-- 方案 C -->
+<div class="card">
+  <h2>方案 C：视频顶部信息条（标题 + 信息 + 下载键）</h2>
+  <p class="desc">视频上方压一条半透明信息条：视频标题、格式/清晰度/时长 chips、下载按钮，信息最全、一眼可读；但会遮挡视频画面顶部。</p>
+  <div class="row">
+    <div class="col">
+      <div class="video-mock">
+        <span class="play-tri"></span>
+        <span class="bar"><i></i></span>
+        <span class="strip-c">
+          <span class="t">示例视频标题（来自 og:title）</span>
+          <span class="chip">MP4</span><span class="chip">1080p</span><span class="chip">03:20</span>
+          <span class="dl">下载</span>
+        </span>
+      </div>
+      <div class="note"><span class="tag">信息全</span>标题/格式/清晰度/时长一次看清，但占画面</div>
+    </div>
+  </div>
+</div>
+
+<!-- 交互 -->
+<div class="card">
+  <h2>交互：点角标 → 页内展开操作卡（非弹层）</h2>
+  <p class="desc">不管选 A/B/C 的哪个样式，点击标记后都在视频旁边展开一张页内小卡：标题、元信息、以及下载/缓存/转 MP4/复制链接操作。支持再次点击关闭、滚动跟随。</p>
+  <div class="row">
+    <div class="col">
+      <div class="video-mock plan-a" style="margin-bottom:14px;">
+        <span class="play-tri"></span>
+        <span class="bar"><i></i></span>
+        <span class="badge-a"><span class="ic">⬇</span>1080p</span>
+      </div>
+    </div>
+    <div class="col">
+      <div class="inpage-card">
+        <div class="hd">
+          <div class="t">示例视频标题（来自 og:title / 页面标题）</div>
+          <div class="m">MP4 · 1080p · 03:20 · 约 145 MB</div>
+          <div class="u">https://cdn.example.com/video/hw_1080p.mp4?sign=…</div>
+        </div>
+        <button class="btn hl">⬇ 下载 MP4</button>
+        <button class="btn">复制链接</button>
+        <button class="btn">忽略此条</button>
+      </div>
+      <div class="note">HLS 时操作变为：<b>HLS 离线缓存</b> / <b>m3u8 转 MP4</b> / 复制链接</div>
+    </div>
+  </div>
+</div>
+
+<p class="sub">补充说明：所有标记样式都跟随页面滚动、全屏播放时自动隐藏；fetch 抓到但没有可见 &lt;video&gt; 的流（如 blob:），仍由底部「发现 N 个视频」小胶囊兜底。</p>
+
+</body>
+</html>

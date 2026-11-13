@@ -1,5 +1,16 @@
+/// 内置「分享」文件夹名（分享导入的视频默认归入；用户不可新建同名文件夹）
+const String libraryShareFolderName = '分享';
+
 /// 资源库统一条目（合并下载任务与已保存视频，支持多字段排序）
 enum SortField { name, size, created }
+
+/// 资源库分组（文件夹视角的排序结果：未分组在前，其余按文件夹创建顺序）
+class LibrarySection {
+  final String name; // 文件夹名（'' = 未分组）
+  final List<LibraryItem> items;
+
+  const LibrarySection(this.name, this.items);
+}
 
 class LibraryItem {
   final String id;
@@ -18,6 +29,8 @@ class LibraryItem {
   final String? error;
   final int? doneSegments;
   final int? totalSegments;
+  final bool resumable; // 失败/中断后是否可续传（断点续传）
+  final String folder; // 归属文件夹（'' = 全部 / 未分组）
 
   const LibraryItem({
     required this.id,
@@ -36,9 +49,37 @@ class LibraryItem {
     this.error,
     this.doneSegments,
     this.totalSegments,
+    this.resumable = false,
+    this.folder = '',
   });
 
   String get sortName => title.isEmpty ? (url ?? '未命名') : title;
+
+  /// 按文件夹过滤（folder == '' 表示「全部」）
+  static List<LibraryItem> filterByFolder(
+      List<LibraryItem> items, String folder) {
+    if (folder.isEmpty) return items;
+    return items.where((i) => i.folder == folder).toList();
+  }
+
+  /// 分组排序：未分组在前，其余按 folderNames 顺序；组内按 field/desc 排序。
+  /// 空分组不输出。注意这里用严格匹配（未分组 = folder 为空），
+  /// 与 filterByFolder('') 的「不过滤」语义不同。
+  static List<LibrarySection> groupSections(List<LibraryItem> items,
+      List<String> folderNames, SortField field, bool desc) {
+    final result = <LibrarySection>[];
+    final root = items.where((i) => i.folder.isEmpty).toList();
+    if (root.isNotEmpty) {
+      result.add(LibrarySection('', sort(root, field, desc)));
+    }
+    for (final name in folderNames) {
+      final list = items.where((i) => i.folder == name).toList();
+      if (list.isNotEmpty) {
+        result.add(LibrarySection(name, sort(list, field, desc)));
+      }
+    }
+    return result;
+  }
 
   /// 排序（字段 + 方向），默认创建时间倒序由调用方传入
   static List<LibraryItem> sort(List<LibraryItem> items, SortField field, bool desc) {
