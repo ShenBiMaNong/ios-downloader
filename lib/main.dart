@@ -71,10 +71,46 @@ class VideoDownloaderApp extends StatelessWidget {
           ),
           themeMode: AppSettings.instance.themeMode.flutter,
           home: const HomeShell(),
+          // 系统深链（videodl:// 唤起、iOS「用 App 打开」文件 URL 等）会被框架
+          // 当作命名路由推送；本 App 没有对应的命名路由页面。兜底吞掉这类路由，
+          // 避免 release 模式下框架 onUnknownRoute 空检查崩溃（见 _onUnknownRoute）。
+          onUnknownRoute: _discardDeepLinkRoute,
         );
       },
     );
   }
+}
+
+/// 未知命名路由兜底：推一个零时长透明占位页并在首帧后立即退出，
+/// 不产生可见跳转，也不触发框架 onUnknownRoute 的空检查崩溃路径。
+Route<dynamic> _discardDeepLinkRoute(RouteSettings settings) {
+  return PageRouteBuilder<void>(
+    settings: settings,
+    opaque: false,
+    pageBuilder: (_, __, ___) => const _DiscardDeepLinkPage(),
+    transitionDuration: Duration.zero,
+    reverseTransitionDuration: Duration.zero,
+  );
+}
+
+class _DiscardDeepLinkPage extends StatefulWidget {
+  const _DiscardDeepLinkPage();
+
+  @override
+  State<_DiscardDeepLinkPage> createState() => _DiscardDeepLinkPageState();
+}
+
+class _DiscardDeepLinkPageState extends State<_DiscardDeepLinkPage> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) Navigator.of(context).pop();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => const SizedBox.shrink();
 }
 
 class HomeShell extends StatefulWidget {

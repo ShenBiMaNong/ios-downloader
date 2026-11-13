@@ -514,27 +514,41 @@ class DownloadManager extends ChangeNotifier {
   }
 
   /// 重命名已保存视频：更新元数据标题；磁盘文件/文件夹存在时同步改名并更新 localPath；
-  /// 原生 HLS 条目（无 localPath）仅更新标题。返回是否成功。
+  /// 原生 HLS 条目（无 localPath）仅更新标题。
+  /// 元数据 json 缺失（如删除后仍驻留内存列表的转换任务）时不报失败，仅更新内存标题。
+  /// 返回是否成功。
   Future<bool> rename(String id, String newTitle) async {
     final title = newTitle.trim();
     if (title.isEmpty) return false;
     try {
       final dir = await downloadsDir();
       final meta = File(p.join(dir.path, '$id.json'));
-      if (!await meta.exists()) return false;
-      final j = jsonDecode(await meta.readAsString());
-      if (j is! Map<String, dynamic>) return false;
-      final oldPath = (j['localPath'] as String?) ?? '';
+      final hasMeta = await meta.exists();
+      var j = <String, dynamic>{};
+      var oldPath = '';
+      if (hasMeta) {
+        final decoded = jsonDecode(await meta.readAsString());
+        if (decoded is! Map<String, dynamic>) return false;
+        j = decoded;
+        oldPath = (j['localPath'] as String?) ?? '';
+      }
+      // json 缺失（删除后仍驻留内存的转换任务）：从内存任务取磁盘路径继续改名
+      if (oldPath.isEmpty && !hasMeta) {
+        for (final t in ConvertManager.instance.tasks) {
+          if (t.id == id && t.localPath != null && t.localPath!.isNotEmpty) {
+            oldPath = t.localPath!;
+            break;
+          }
+        }
+      }
       var newPath = oldPath;
       if (oldPath.isNotEmpty) {
         final renamed = await _renameOnDisk(oldPath, title);
         if (renamed == null) return false; // 磁盘改名失败 → 元数据不动
         newPath = renamed;
       }
-      j['title'] = title;
-      j['localPath'] = newPath;
-      await meta.writeAsString(jsonEncode(j));
-      // 内存中驻留的完成/进行中任务同步（避免展示旧标题/旧路径）
+      // 内存中驻留的完成/进行中任务同步（避免展示旧标题/旧路径；
+      // ConvertManager 完成态任务可能在元数据 json 被删后仍驻留列表）
       for (final t in _tasks) {
         if (t.id == id) {
           t.title = title;
@@ -550,6 +564,11 @@ class DownloadManager extends ChangeNotifier {
           t.localPath = newPath;
         }
       }
+      if (hasMeta) {
+        j['title'] = title;
+        j['localPath'] = newPath;
+        await meta.writeAsString(jsonEncode(j));
+      }
       notifyListeners();
       return true;
     } catch (e, st) {
@@ -560,6 +579,7 @@ class DownloadManager extends ChangeNotifier {
 
   /// 磁盘改名：文件（mp4/分享导入）或文件夹（m3u8 分片包）。保留原扩展名；
   /// 新名与现存文件冲突时自动追加序号；磁盘文件已不存在时返回原路径（仅改标题）。
+  /// 新文件名与现文件名相同（含大小写差异）时不动磁盘文件，仅改标题。
   Future<String?> _renameOnDisk(String oldPath, String newTitle) async {
     try {
       final parent = p.dirname(oldPath);
@@ -575,6 +595,8 @@ class DownloadManager extends ChangeNotifier {
           !base.toLowerCase().endsWith(ext.toLowerCase())) {
         base = '$base$ext';
       }
+      // 目标文件名与现文件名相同 → 仅改标题，不搬磁盘文件（避免改出 " (2)" 副本）
+      if (base.toLowerCase() == oldName.toLowerCase()) return oldPath;
       final newName = uniqueFileName(dir, base);
       if (newName == oldName) return oldPath;
       final targetPath = p.join(parent, newName);

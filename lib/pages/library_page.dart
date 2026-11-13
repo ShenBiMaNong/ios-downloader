@@ -362,7 +362,9 @@ class _LibraryPageState extends State<LibraryPage> {
                 maxCrossAxisExtent: 280,
                 mainAxisSpacing: 12,
                 crossAxisSpacing: 12,
-                childAspectRatio: 1.0,
+                // 0.82 → 卡片略高：16:9 封面 + 两行标题/摘要的留白更充足，
+                // 长标题换行到第二行不会被底部裁剪遮挡
+                childAspectRatio: 0.82,
               ),
               delegate: SliverChildBuilderDelegate(
                 (c, i) => _gridCard(context, s.items[i], i, s.items),
@@ -707,6 +709,8 @@ class _LibraryPageState extends State<LibraryPage> {
                   avatar: const Icon(Icons.folder_open, size: 18),
                   label: const Text('全部'),
                   selected: _folder.isEmpty,
+                  // 保持文件夹图标可见：选中时不叠加对号（对号会盖住图标）
+                  showCheckmark: false,
                   onSelected: (_) => setState(() => _folder = ''),
                 ),
               ),
@@ -717,6 +721,7 @@ class _LibraryPageState extends State<LibraryPage> {
                   avatar: const Icon(Icons.ios_share, size: 18),
                   label: const Text('分享'),
                   selected: _folder == LibraryFolders.reservedName,
+                  showCheckmark: false,
                   onSelected: (_) =>
                       setState(() => _folder = LibraryFolders.reservedName),
                 ),
@@ -730,6 +735,7 @@ class _LibraryPageState extends State<LibraryPage> {
                       avatar: const Icon(Icons.folder, size: 18),
                       label: Text(f.name),
                       selected: _folder == f.name,
+                      showCheckmark: false,
                       onSelected: (_) => setState(() => _folder = f.name),
                     ),
                   ),
@@ -1012,13 +1018,18 @@ class _LibraryPageState extends State<LibraryPage> {
 
   /// 删除条目：按类型清理（convert / m3u8 离线任务 + 分片包 / mp4）
   Future<void> _deleteItem(LibraryItem it) async {
-    if (it.kind == 'convert') {
+    // 边播边缓存完成项仍驻留 PlaybackCacher 内存列表：走 cancel 才能连同记录一起清理
+    if (PlaybackCacher.instance.tasks.any((t) => t.id == it.id)) {
+      await PlaybackCacher.instance.cancel(it.id);
+    } else if (ConvertManager.instance.tasks.any((t) => t.id == it.id)) {
+      // 转换产物（mp4 / m3u8 分片包）完成态任务仍驻留 ConvertManager 内存列表，
+      // 只删磁盘文件会残留列表记录、点播放报「播放失败」
       await ConvertManager.instance.delete(it.id);
-    } else if (it.kind == 'm3u8') {
-      // HLS 离线任务清理其 pending 记录；分片包删除其文件夹
-      await HlsManager.instance.delete(it.hlsTaskId ?? it.id);
-      await DownloadManager.instance.delete(it.id, it.localPath ?? '');
     } else {
+      if (it.kind == 'm3u8' && it.hlsTaskId != null) {
+        // HLS 离线任务清理其 pending 记录与内存任务
+        await HlsManager.instance.delete(it.hlsTaskId!);
+      }
       await DownloadManager.instance.delete(it.id, it.localPath ?? '');
     }
     await _refresh();
