@@ -1,0 +1,40 @@
+name: Build unsigned IPA
+
+# 云端 macOS 构建，产出「未签名 IPA」
+# 注意：私有仓库免费额度 macOS 按 10 倍消耗（约 200 分钟/月），一次构建约 20-40 分钟
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test || true
+
+      - name: Build unsigned IPA
+        run: flutter build ipa --no-codesign --release
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-downloader-unsigned-ipa
+          path: build/ios/ipa/*.ipa
+          if-no-files-found: error

@@ -1,0 +1,30 @@
+name: video_downloader
+description: "内置浏览器视频下载器（个人自用，sideload 安装）"
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # 内置浏览器（iOS 底层 WKWebView）
+  webview_flutter: ^4.10.0
+  # mp4 直链下载
+  dio: ^5.7.0
+  # 沙盒路径
+  path_provider: ^2.1.5
+  path: ^1.9.0
+  # 本地播放
+  video_player: ^2.9.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/sniffer.js
