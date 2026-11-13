@@ -4,6 +4,7 @@ import 'package:material_ui/material_ui.dart';
 
 import '../models/library_item.dart';
 import '../models/playable_item.dart';
+import '../models/video_info.dart';
 import '../services/app_settings.dart';
 import '../services/download_manager.dart';
 import '../services/files_bridge.dart';
@@ -172,6 +173,7 @@ class _LibraryPageState extends State<LibraryPage> {
         totalSegments: t.totalSegments,
         resumable: t.resumable,
         folder: folderById[t.id] ?? '',
+        stage: t.stage.isEmpty ? null : t.stage,
       ));
     }
 
@@ -204,14 +206,45 @@ class _LibraryPageState extends State<LibraryPage> {
     return LibraryItem.sort(items, _field, _desc);
   }
 
+  /// 目录大小按路径缓存：m3u8 分片包可能有数百个分片，
+  /// 不该在列表每次刷新时都重新 stat 一遍。
+  final Map<String, int> _sizeCache = {};
+
+  /// 已完成产物大小：mp4 直接取文件长度；m3u8 分片包是目录，递归累加。
+  /// 系统 .movpkg 是 Apple 私有 bundle（元数据 hls=true），官方禁止遍历内部文件，
+  /// 这类条目在 _saved 映射里直接置 0，不会走到这里。
   int _fileSize(String? path) {
     if (path == null || path.isEmpty) return 0;
+    final cached = _sizeCache[path];
+    if (cached != null) return cached;
     try {
-      final f = File(path);
-      return f.existsSync() ? f.lengthSync() : 0;
+      int total;
+      final dir = Directory(path);
+      if (dir.existsSync()) {
+        total = _dirSize(dir);
+      } else {
+        final f = File(path);
+        total = f.existsSync() ? f.lengthSync() : 0;
+      }
+      _sizeCache[path] = total;
+      return total;
     } catch (_) {
       return 0;
     }
+  }
+
+  static int _dirSize(Directory dir) {
+    var total = 0;
+    try {
+      for (final e in dir.listSync(followLinks: false)) {
+        if (e is File) {
+          total += e.lengthSync();
+        } else if (e is Directory) {
+          total += _dirSize(e);
+        }
+      }
+    } catch (_) {}
+    return total;
   }
 
   @override
@@ -494,6 +527,10 @@ class _LibraryPageState extends State<LibraryPage> {
       case 'cancel':
         if (it.id.startsWith(PlaybackCacher.idPrefix)) {
           PlaybackCacher.instance.cancel(it.id);
+        } else if (it.kind == 'convert') {
+          // 原来 convert 类会误落到 HlsManager.cancel，点「取消」毫无反应；
+          // 原生后台作业还要一并取消系统代跑的 task。
+          ConvertManager.instance.cancel(it.id);
         } else if (it.kind == 'mp4') {
           DownloadManager.instance.cancel(it.id);
         } else {
@@ -509,7 +546,26 @@ class _LibraryPageState extends State<LibraryPage> {
         }
       case 'detail':
         _showError(it);
+      case 'reconvert':
+        _reconvertHls(it);
     }
+  }
+
+  /// 已完成的系统 HLS 离线缓存（.movpkg 私有格式）无法导出为 mp4：
+  /// 用元数据里保存的原始 m3u8 地址重新拉一遍分片并转封装。
+  /// 代价是会重新下载一次分片，但产物是可分享/可导出的通用 mp4。
+  void _reconvertHls(LibraryItem it) {
+    final url = it.url ?? '';
+    if (!url.startsWith('http')) {
+      _toast('该条目没有可用的原始 m3u8 地址，无法重新转换');
+      return;
+    }
+    ConvertManager.instance.convert(VideoInfo(
+      url: url,
+      frameUrl: '',
+      pageTitle: it.sortName,
+    ));
+    _toast('已开始重新下载并转 MP4（需重新下载一次分片），进度见「资源库」');
   }
 
   /// 完整错误详情（列表里只显示收敛后的单行摘要）
@@ -552,7 +608,17 @@ class _LibraryPageState extends State<LibraryPage> {
         const PopupMenuItem(value: 'hlsplay', child: Text('边下边看')),
       if (m3u8Pkg)
         const PopupMenuItem(value: 'convert', child: Text('本地转 MP4')),
-      if (it.active && it.kind != 'convert')
+      // 系统 HLS 离线缓存（.movpkg）不能导出：用条目里保存的原始 m3u8 重新拉一遍
+      if (it.kind == 'm3u8' &&
+          it.hlsTaskId != null &&
+          !it.active &&
+          !it.failed &&
+          (it.url ?? '').startsWith('http'))
+        const PopupMenuItem(
+            value: 'reconvert', child: Text('重新下载并转 MP4')),
+      // 普通 convert 任务在跑的是 Dart 侧 ffmpeg，取消会留下不一致状态，故不开放；
+      // 原生后台作业（stage != null）则由系统托管，必须能取消在途 task。
+      if (it.active && (it.kind != 'convert' || it.stage != null))
         const PopupMenuItem(value: 'cancel', child: Text('取消')),
       if (it.failed && it.resumable)
         const PopupMenuItem(value: 'resume', child: Text('继续下载')),
@@ -580,22 +646,24 @@ class _LibraryPageState extends State<LibraryPage> {
           Icon(Icons.error_outline, size: 40, color: scheme.onErrorContainer);
     } else if (it.active) {
       bg = scheme.primaryContainer;
-      if (it.kind == 'convert') {
-        content = Icon(Icons.transform, size: 36, color: scheme.onPrimaryContainer);
-      } else {
-        final pct = (it.progress * 100).clamp(0, 100);
-        content = Stack(
-          alignment: Alignment.center,
-          children: [
-            SizedBox(
-              width: 46,
-              height: 46,
-              child: CircularProgressIndicator(
-                value: it.progress.clamp(0.0, 1.0),
-                strokeWidth: 3.5,
-                color: scheme.primary,
-              ),
+      // 所有进行中条目统一显示进度环（原来 convert / 分片包只给一个静态图标，
+      // 宫格视图里看不到任何进度）。progress 还是 0 时用不确定态转圈，
+      // 避免系统 HLS 缓存（按媒体时长报进度、且酌情下载会择机启动）显示成卡住的 0%。
+      final hasProgress = it.progress > 0;
+      final pct = (it.progress * 100).clamp(0, 100);
+      content = Stack(
+        alignment: Alignment.center,
+        children: [
+          SizedBox(
+            width: 46,
+            height: 46,
+            child: CircularProgressIndicator(
+              value: hasProgress ? it.progress.clamp(0.0, 1.0) : null,
+              strokeWidth: 3.5,
+              color: scheme.primary,
             ),
+          ),
+          if (hasProgress)
             Text(
               '${pct.toStringAsFixed(0)}%',
               style: TextStyle(
@@ -604,9 +672,8 @@ class _LibraryPageState extends State<LibraryPage> {
                 color: scheme.primary,
               ),
             ),
-          ],
-        );
-      }
+        ],
+      );
     } else {
       switch (it.kind) {
         case 'm3u8':
@@ -1285,14 +1352,39 @@ class _LibraryPageState extends State<LibraryPage> {
       return (s.startsWith('失败') || s.startsWith('已')) ? s : '失败：$s';
     }
     if (it.active) {
-      final pct = '${(it.progress * 100).toStringAsFixed(0)}%';
+      final pct = it.progress > 0
+          ? '${(it.progress * 100).toStringAsFixed(0)}%'
+          : '';
       if (it.kind == 'convert') {
+        // 原生后台链没有字节级速度/ETA（后台期间系统不给回调），
+        // 用阶段字段明确区分「锁屏继续下」和「分片齐了等合成」。
+        switch (it.stage) {
+          case 'ready':
+            return '分片齐备 · 等待合成 MP4（回前台自动完成）';
+          case 'remuxing':
+            return '转封装中…';
+          case 'failed':
+            return '后台下载失败';
+          case 'downloading':
+            return '后台下载分片 ${it.doneSegments ?? 0}/${it.totalSegments ?? 0} · 锁屏可继续';
+        }
         final seg = it.progress >= 1
             ? '转封装中…'
             : '分片 ${it.doneSegments}/${it.totalSegments}';
-        return [seg, it.speedText, it.etaText].whereType<String>().join(' · ');
+        return [seg, it.speedText, it.etaText]
+            .whereType<String>()
+            .where((s) => s.isNotEmpty)
+            .join(' · ');
       }
-      return [pct, it.speedText, it.etaText].whereType<String>().join(' · ');
+      // 系统 HLS 缓存：进度按媒体时长上报（AVAssetDownloadTask 不提供字节数），
+      // 且默认 isDiscretionary=true 会择机启动，长时间停在 0% 属正常，不要显示成 0%。
+      if (it.kind == 'm3u8' && it.hlsTaskId != null && it.progress <= 0) {
+        return '系统后台下载中 · 进度由系统提供';
+      }
+      return [pct, it.speedText, it.etaText]
+          .whereType<String>()
+          .where((s) => s.isNotEmpty)
+          .join(' · ');
     }
     final date = it.created.toLocal().toString().substring(0, 10);
     // 分享导入的条目也只显示大小 + 日期，不再标来源
@@ -1300,7 +1392,15 @@ class _LibraryPageState extends State<LibraryPage> {
       final size = formatBytes(it.size);
       return size.isEmpty ? date : '$size · $date';
     }
-    if (it.kind == 'm3u8') return 'HLS 离线缓存 · $date';
+    if (it.kind == 'm3u8') {
+      // 系统 .movpkg：私有 bundle 不能遍历算大小，明确标注「仅可播放」。
+      if (it.hlsTaskId != null) return '系统离线缓存 · 仅可播放 · $date';
+      // 自下载分片包是普通目录，显示真实占用，不再被误标成系统缓存。
+      final size = formatBytes(it.size);
+      return size.isEmpty
+          ? 'm3u8 分片包 · $date'
+          : '$size · m3u8 分片包 · $date';
+    }
     return '${formatBytes(it.size)} · $date';
   }
 

@@ -76,7 +76,20 @@
     '.vdl-btn{display:block;width:100%;text-align:left;padding:11px 12px;border:0;' +
     'border-top:1px solid #f1f5f9;background:#fff;color:#0f172a;font-size:13px;cursor:pointer;}' +
     '.vdl-btn:hover{background:#eff6ff;}' +
-    '.vdl-btn.hl{color:#1d4ed8;font-weight:600;}';
+    '.vdl-btn.hl{color:#1d4ed8;font-weight:600;}' +
+    // 多线路候选列表：站点把多条 m3u8 一起下发时，让用户能自己挑一条能用的
+    '.vdl-lines{max-height:132px;overflow:auto;background:#f8fafc;border-top:1px solid #e2e8f0;}' +
+    '.vdl-lines-h{padding:6px 12px 4px;color:#64748b;font-size:11px;}' +
+    '.vdl-line{display:flex;align-items:center;gap:6px;width:100%;text-align:left;' +
+    'padding:6px 12px;border:0;border-top:1px solid #eef2f7;background:transparent;' +
+    'color:#0f172a;font-size:12px;cursor:pointer;}' +
+    '.vdl-line:hover{background:#eff6ff;}' +
+    '.vdl-line.on{background:#eff6ff;font-weight:600;}' +
+    '.vdl-line.dead{color:#94a3b8;}' +
+    '.vdl-lm{flex:none;font-weight:700;width:10px;}' +
+    '.vdl-line.on .vdl-lm{color:#16a34a;}' +
+    '.vdl-line.dead .vdl-lm{color:#dc2626;}' +
+    '.vdl-lu{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}';
   (document.head || document.documentElement).appendChild(style);
 
   function postAction(payload) {
@@ -147,16 +160,42 @@
     return '';
   }
 
-  // blob:/MSE 无直链时，从嗅探器（sniffer.js 的 window.__vdlSniff）最近捕获的 URL 兜底
+  // blob:/MSE 没有直链时，向嗅探器要「当前最可信」的候选（而不是「最近一条」）：
+  // 站点逐个试探多条 m3u8 时，最近一条往往是失败的那条。
+  function bestOf(kind) {
+    try {
+      var s = window.__vdlSniff;
+      if (!s || !s.best) return null;
+      return s.best(kind) || null;
+    } catch (e) { return null; }
+  }
+
+  function linesOf(kind) {
+    try {
+      var s = window.__vdlSniff;
+      if (!s || !s.list) return [];
+      return s.list(kind) || [];
+    } catch (e) { return []; }
+  }
+
+  function stateOfUrl(u) {
+    try {
+      var s = window.__vdlSniff;
+      if (!s || !s.stateOf) return '';
+      return s.stateOf(u) || '';
+    } catch (e) { return ''; }
+  }
+
   function capturedFor(video) {
     try {
       var s = window.__vdlSniff;
-      if (!s || !s.getLatest) return '';
+      if (!s) return '';
       if (kindOf(srcOf(video)) !== 'mse') return '';
-      var u = s.getLatest('hls');
-      if (u) return u;
-      u = s.getLatest('file');
-      return u;
+      var b = s.best ? s.best('hls') : null;
+      if (!b) b = s.best ? s.best('dash') : null;
+      if (!b) b = s.best ? s.best('file') : null;
+      if (b && b.url) return b.url;
+      return s.getLatest ? (s.getLatest('hls') || s.getLatest('file')) : '';
     } catch (e) { return ''; }
   }
 
@@ -164,23 +203,41 @@
     var src = srcOf(video);
     var kind = kindOf(src);
     var captured = '';
-    if (kind === 'mse') {
+    // 用户手动选了线路（多条候选里挑一条）→ 以他选的为准
+    var manual = video.__vdlLine || '';
+    if (manual) {
+      src = manual;
+      kind = kindOf(manual);
+      captured = 'manual';
+    } else if (kind === 'mse') {
       captured = capturedFor(video);
       if (captured) { src = captured; kind = kindOf(captured); }
+    } else if (kind === 'hls' || kind === 'dash') {
+      // 元素直链一般是浏览器正在播的（原生 HLS），最可信；
+      // 但若它在候选表里被判死、而另有明确可用的候选，则改用可用的那条
+      if (stateOfUrl(src) === 'dead') {
+        var b = bestOf(kind);
+        if (b && b.url && b.state === 'ok') { src = b.url; kind = kindOf(b.url); }
+      }
     }
     var t = (video.getAttribute && (video.getAttribute('title') || video.getAttribute('aria-label'))) || '';
+    var lines = (kind === 'hls' || kind === 'dash' || kind === 'file') ? linesOf(kind) : [];
     return {
       url: src,
       kind: kind,
       res: resOf(video),
       dur: fmtDur(video.duration),
-      title: String(t || pageTitle()).slice(0, 80)
+      title: String(t || pageTitle()).slice(0, 80),
+      state: stateOfUrl(src),
+      lines: lines
     };
   }
 
   function labelOf(info) {
-    if (info.kind === 'hls') return info.dur ? 'HLS · ' + info.dur : 'HLS';
-    if (info.kind === 'dash') return 'DASH';
+    // ✓ = 已确认可用（2xx + 内容校验 或 正在播放）；? = 未验证；✗ = 已确认失效
+    var mk = info.state === 'ok' ? ' ✓' : (info.state === 'dead' ? ' ✗' : ' ?');
+    if (info.kind === 'hls') return 'HLS' + mk + (info.dur ? ' · ' + info.dur : '');
+    if (info.kind === 'dash') return 'DASH' + mk;
     if (info.kind === 'mse') return '流';
     var f = fmtOf(info.url);
     if (info.res) return (f ? f + ' ' : '') + info.res;
@@ -341,6 +398,18 @@
     }
   }
 
+  // 候选 URL 的短显示：host / 末段文件名
+  function shortUrl(u) {
+    try {
+      var m = String(u).match(/^https?:\/\/([^\/?#]+)([^?#]*)/i);
+      if (!m) return String(u).slice(0, 46);
+      var seg = String(m[2] || '').split('/').filter(Boolean);
+      var tail = seg.length ? seg[seg.length - 1] : '';
+      var text = m[1] + (tail ? ' / ' + tail : '');
+      return text.length > 46 ? text.slice(0, 45) + '…' : text;
+    } catch (e) { return String(u).slice(0, 46); }
+  }
+
   function toggleCard(video, badge) {
     closeCard();
     var info = infoOf(video);
@@ -362,10 +431,33 @@
       html += '<div class="vdl-card-u">' + esc(info.url) + '</div>';
     }
     html += '</div>';
+    // 多候选（多线路）时列出全部，标明可用/失效，允许手动切换：
+    // 这一栏就是为了解决「嗅探到的恰好是打不开的那条」
+    if (info.lines && info.lines.length > 1) {
+      html += '<div class="vdl-lines"><div class="vdl-lines-h">共 ' +
+        info.lines.length + ' 条候选 · 点选切换</div>';
+      for (var li = 0; li < info.lines.length; li++) {
+        var it = info.lines[li];
+        var mk = it.state === 'ok' ? '✓' : (it.state === 'dead' ? '✗' : '?');
+        var cls = 'vdl-line' +
+          (it.url === info.url ? ' on' : '') +
+          (it.state === 'dead' ? ' dead' : '');
+        html += '<button class="' + cls + '" data-line="' + esc(it.url) + '">' +
+          '<span class="vdl-lm">' + mk + '</span>' +
+          '<span class="vdl-lu">' + esc(shortUrl(it.url)) + '</span></button>';
+      }
+      html += '</div>';
+    }
     if (info.kind === 'hls') {
-      // HLS：同时提供 m3u8 与 mp4 两种下载方式
-      html += '<button class="vdl-btn hl" data-a="hls">缓存 m3u8（离线播放）</button>';
-      html += '<button class="vdl-btn hl" data-a="convert">转 MP4</button>';
+      // HLS 四种产物，别混为一谈：
+      //  bg      → 原生 background URLSession 下分片（锁屏/切 App 继续），回前台自动转 mp4
+      //  package → 自己下 .ts 分片包存 Downloads，可离线、可随时「本地转 MP4」
+      //  convert → 下分片后直接 ffmpeg 转封装成单个 mp4（中间分片用完即删）
+      //  hls     → 系统 AVAssetDownloadTask 的 .movpkg，只能 AVFoundation 播，不能导出
+      html += '<button class="vdl-btn hl" data-a="bg">后台下载并转 MP4（锁屏可继续）</button>';
+      html += '<button class="vdl-btn" data-a="package">下载 m3u8 分片（可转 MP4）</button>';
+      html += '<button class="vdl-btn hl" data-a="convert">直接转 MP4（单文件）</button>';
+      html += '<button class="vdl-btn" data-a="hls">系统离线缓存（仅播放，不可导出）</button>';
     } else if (info.kind === 'dash') {
       html += '<div class="vdl-card-n" style="padding:10px 12px;">DASH 流（.mpd）暂不支持离线下载，可复制清单链接自行处理。</div>';
     } else if (info.kind === 'file') {
@@ -381,6 +473,16 @@
     card.innerHTML = html;
     card.addEventListener('click', function (e) {
       var t = e.target;
+      // 先看是不是「切线路」——它没有 data-a，别落到下面的动作分支里
+      var lt = t;
+      while (lt && lt !== card && !(lt.getAttribute && lt.getAttribute('data-line'))) lt = lt.parentNode;
+      if (lt && lt !== card && lt.getAttribute) {
+        e.preventDefault();
+        e.stopPropagation();
+        video.__vdlLine = lt.getAttribute('data-line') || '';
+        toggleCard(video, badge); // 重绘卡片，让下面的动作按钮作用于新选的线路
+        return;
+      }
       while (t && t !== card && !(t.getAttribute && t.getAttribute('data-a'))) t = t.parentNode;
       var a = t && t.getAttribute ? t.getAttribute('data-a') : null;
       if (!a) return;
@@ -424,6 +526,12 @@
     for (var i = 0; i < videos.length; i++) {
       var v = videos[i];
       if (v.__vdlIgnored) continue;
+      // 换集/换源：src 变了说明是新一条，之前手动选的线路作废
+      var curSrc = srcOf(v);
+      if (curSrc !== v.__vdlSeenSrc) {
+        v.__vdlSeenSrc = curSrc;
+        v.__vdlLine = '';
+      }
       var badge = v.__vdlBadge;
       if (!badge) {
         var src = srcOf(v);
@@ -437,6 +545,13 @@
           el.addEventListener('loadedmetadata', function () { refreshBadge(b, el); });
           el.addEventListener('durationchange', function () { refreshBadge(b, el); });
           el.addEventListener('resize', function () { refreshBadge(b, el); });
+          // 起播 = 嗅探器拿到最硬证据的时刻，角标要从「?」翻成「✓」
+          el.addEventListener('playing', function () {
+            refreshBadge(b, el);
+            // 清单/分片的判定可能比 playing 略晚到，补刷两次
+            setTimeout(function () { refreshBadge(b, el); }, 400);
+            setTimeout(function () { refreshBadge(b, el); }, 1500);
+          });
         })(v, badge);
       }
       refreshBadge(badge, v);
@@ -467,6 +582,7 @@
   }
   document.addEventListener('click', onQuick, true);
   document.addEventListener('play', onQuick, true);
+  document.addEventListener('playing', onQuick, true);
 
   // <video>/<source> 的 src 属性变化（点击播放后赋值）→ 即时出角标
   var srcObserver = null;
@@ -510,7 +626,11 @@
     // 元素上残留的 __vdlBadge 必须清掉：否则重新打开标记开关后，
     // update() 会认为角标已存在而不再创建，页面就再也不出角标了
     var all = document.querySelectorAll('video');
-    for (var k = 0; k < all.length; k++) all[k].__vdlBadge = null;
+    for (var k = 0; k < all.length; k++) {
+      all[k].__vdlBadge = null;
+      all[k].__vdlLine = '';
+      all[k].__vdlSeenSrc = undefined;
+    }
     window.__vdlMarkerInstalled = false;
     window.__vdlMarkerSource = null;
     // 通知子框架一起清理（开关关闭）

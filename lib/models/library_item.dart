@@ -31,6 +31,9 @@ class LibraryItem {
   final int? totalSegments;
   final bool resumable; // 失败/中断后是否可续传（断点续传）
   final String folder; // 归属文件夹（'' = 全部 / 未分组）
+  /// 原生后台分片下载阶段（仅 mode=='native' 的 convert 任务有值）：
+  /// downloading | ready | remuxing | failed
+  final String? stage;
 
   const LibraryItem({
     required this.id,
@@ -51,6 +54,7 @@ class LibraryItem {
     this.totalSegments,
     this.resumable = false,
     this.folder = '',
+    this.stage,
   });
 
   String get sortName => title.isEmpty ? (url ?? '未命名') : title;

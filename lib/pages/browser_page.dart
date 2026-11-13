@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' show Platform;
 
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart'
@@ -62,6 +63,9 @@ class BrowserPageState extends State<BrowserPage> {
 
   /// 上次应用的自动播放拦截开关状态（供 AppData 变更监听去重）
   bool? _lastNoAutoplayApplied;
+
+  /// 上次应用的「点播放即接管」开关状态（供 AppData 变更监听去重）
+  bool? _lastHijackApplied;
 
   @override
   void initState() {
@@ -215,20 +219,27 @@ class BrowserPageState extends State<BrowserPage> {
 
   /// 自动播放拦截：脚本自身幂等（已装则立即返回），开关值另行注入。
   /// 关掉开关时走 `__vdlNoAutoplaySetEnabled(false)` 把原型方法还原，无需刷新页面。
+  /// 「点播放即接管」也由同一脚本实现（共用 play() 钩子与手势判据），任一开关开启都要确保脚本已注入。
   Future<void> _injectNoAutoplay() async {
     try {
       final on = AppData.instance.blockAutoplayEnabled;
-      if (on) {
+      final hijack = AppData.instance.playHijackEnabled;
+      if (on || hijack) {
         // 先设标志再注入：脚本只在该值不是 bool 时才用 sessionStorage 里的历史值兜底，
         // 否则「关过开关 → 再打开」会被历史值覆盖成关闭
-        await _controller.runJavaScript('window.__vdlNoAutoplayEnabled=true;');
+        await _controller.runJavaScript('window.__vdlNoAutoplayEnabled=$on;');
         await _controller.runJavaScript(await _noAutoplayJs());
       } else {
         await _controller
             .runJavaScript('if (window.__vdlNoAutoplaySetEnabled) '
                 'window.__vdlNoAutoplaySetEnabled(false);');
       }
+      // 接管开关独立同步：脚本未装时只设窗口变量，装上后由 setter 一并写 sessionStorage
+      // （供下个页面 atDocumentStart 阶段读取，那时 Dart 还没机会注入）
+      await _controller.runJavaScript('window.__vdlHijackEnabled=$hijack;'
+          'if (window.__vdlNoAutoplaySetHijack) window.__vdlNoAutoplaySetHijack($hijack);');
       _lastNoAutoplayApplied = on;
+      _lastHijackApplied = hijack;
     } catch (e, st) {
       AppLog.instance.warn('browser', '注入自动播放拦截脚本失败', e, st);
     }
@@ -305,7 +316,8 @@ class BrowserPageState extends State<BrowserPage> {
     if (AppData.instance.videoMarkEnabled != _lastMarkerApplied) {
       _injectMarker();
     }
-    if (AppData.instance.blockAutoplayEnabled != _lastNoAutoplayApplied) {
+    if (AppData.instance.blockAutoplayEnabled != _lastNoAutoplayApplied ||
+        AppData.instance.playHijackEnabled != _lastHijackApplied) {
       _injectNoAutoplay();
     }
   }
@@ -332,6 +344,9 @@ class BrowserPageState extends State<BrowserPage> {
       final action = (j['action'] as String?) ?? '';
       final url = (j['url'] as String?) ?? '';
       final title = (j['title'] as String?) ?? '';
+      // 页内标记卡不带 referer → 用主框架地址；「点播放即接管」会带当前帧地址，
+      // 跨域 iframe 播放器必须用它，否则 CDN 拿主框架 Referer 直接 403
+      final referer = (j['referer'] as String?) ?? '';
       // 自动播放拦截脚本的一次性上报（每个文档最多一条）：不弹 toast，只进系统日志，
       // 便于排查「为什么这个页面的视频不自动播了」
       if (action == 'autoplayBlocked') {
@@ -350,7 +365,7 @@ class BrowserPageState extends State<BrowserPage> {
           final item = await PlaybackCacher.instance.start(
             url: url,
             title: title.isNotEmpty ? title : '网页视频',
-            referer: _currentUrl,
+            referer: referer.isNotEmpty ? referer : _currentUrl,
           );
           if (item == null) {
             _toast('无法播放该视频');
@@ -374,10 +389,30 @@ class BrowserPageState extends State<BrowserPage> {
           DownloadManager.instance.download(v);
           _toast('已加入下载队列，进度见「资源库」');
           break;
+        case 'bg':
+          // 原生 background URLSession 是 iOS 专有；Android 无对应桥接，
+          // 直接提交必然失败，降级为 Dart 侧分片包下载并明确告知用户。
+          await _pausePageVideos();
+          if (!Platform.isIOS) {
+            ConvertManager.instance.downloadM3u8(v);
+            _toast('当前平台不支持系统级后台下载，已改为下载 m3u8 分片包');
+            break;
+          }
+          // 锁屏/切 App 后由系统继续下分片，齐备后回前台 ffmpeg -c copy 合成 mp4。
+          ConvertManager.instance.nativeDownload(v);
+          _toast('已提交后台下载；分片下完后回到 App 会自动合成 MP4（可锁屏）');
+          break;
+        case 'package':
+          // 自己下 .ts 分片包（产物可离线、可随时「本地转 MP4」），
+          // 与 case 'hls' 的系统 .movpkg 离线缓存是两条完全不同的链路
+          await _pausePageVideos();
+          ConvertManager.instance.downloadM3u8(v);
+          _toast('已开始下载 m3u8 分片包，完成后可在资源库「本地转 MP4」');
+          break;
         case 'hls':
           await _pausePageVideos();
           HlsManager.instance.start(url, title.isNotEmpty ? title : 'HLS视频');
-          _toast('已开始 HLS 离线下载，进度见「资源库」');
+          _toast('已开始 HLS 离线下载（系统私有格式，仅可播放），进度见「资源库」');
           break;
         case 'convert':
           await _pausePageVideos();
@@ -555,6 +590,13 @@ class BrowserPageState extends State<BrowserPage> {
                 AppData.instance
                     .setBlockAutoplay(!AppData.instance.blockAutoplayEnabled);
                 setState(() {});
+              } else if (v == 'playhijack') {
+                final on = !AppData.instance.playHijackEnabled;
+                AppData.instance.setPlayHijack(on);
+                setState(() {});
+                if (on) {
+                  _toast('点播放即接管：已开启（仅对能拿到直链的播放器生效）');
+                }
               }
             },
             itemBuilder: (ctx) => [
@@ -622,6 +664,25 @@ class BrowserPageState extends State<BrowserPage> {
                       AppData.instance.blockAutoplayEnabled
                           ? '禁止自动播放：开'
                           : '禁止自动播放：关',
+                    ),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'playhijack',
+                child: Row(
+                  children: [
+                    Icon(
+                      AppData.instance.playHijackEnabled
+                          ? Icons.check_box
+                          : Icons.check_box_outline_blank,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      AppData.instance.playHijackEnabled
+                          ? '点播放即接管：开'
+                          : '点播放即接管：关',
                     ),
                   ],
                 ),

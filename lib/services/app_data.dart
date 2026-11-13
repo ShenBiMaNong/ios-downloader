@@ -60,6 +60,10 @@ class AppData extends ChangeNotifier {
   /// 禁止视频自动播放：页面自己开始的播放一律拦下（默认开）
   bool blockAutoplayEnabled = true;
 
+  /// 点播放即接管：用户点页面播放器时，若拿到 http(s) 直链就不让页面自己播，
+  /// 直接交给 App 播放器（默认关 —— 它会改变页面的播放行为，需要用户主动开）
+  bool playHijackEnabled = false;
+
   /// 上次打开的页面（供「浏览器启动页 = 上次打开页」恢复）
   String lastUrl = '';
   bool _loaded = false;
@@ -82,6 +86,7 @@ class AppData extends ChangeNotifier {
           redirectGuardEnabled = (j['redirectGuard'] as bool?) ?? true;
           videoMarkEnabled = (j['videoMark'] as bool?) ?? true;
           blockAutoplayEnabled = (j['blockAutoplay'] as bool?) ?? true;
+          playHijackEnabled = (j['playHijack'] as bool?) ?? false;
           lastUrl = (j['lastUrl'] as String?) ?? '';
           notifyListeners();
         }
@@ -108,6 +113,7 @@ class AppData extends ChangeNotifier {
         'redirectGuard': redirectGuardEnabled,
         'videoMark': videoMarkEnabled,
         'blockAutoplay': blockAutoplayEnabled,
+        'playHijack': playHijackEnabled,
         'lastUrl': lastUrl,
       }));
     } catch (e, st) {
@@ -177,6 +183,13 @@ class AppData extends ChangeNotifier {
   Future<void> setBlockAutoplay(bool v) async {
     if (v == blockAutoplayEnabled) return;
     blockAutoplayEnabled = v;
+    notifyListeners();
+    await _save();
+  }
+
+  Future<void> setPlayHijack(bool v) async {
+    if (v == playHijackEnabled) return;
+    playHijackEnabled = v;
     notifyListeners();
     await _save();
   }

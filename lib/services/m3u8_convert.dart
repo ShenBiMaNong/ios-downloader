@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -12,6 +13,7 @@ import '../models/video_info.dart';
 import 'app_log.dart';
 import 'background_task.dart';
 import 'file_names.dart';
+import 'native_bg_downloader.dart';
 
 class ConvertTask {
   final String id;
@@ -31,6 +33,11 @@ class ConvertTask {
   bool failed = false;
   String? error;
   String? localPath;
+
+  /// 原生后台链（mode == 'native'）的阶段：
+  /// downloading | ready | remuxing | failed。其它模式为空串。
+  /// 后台下载拿不到字节级速度/ETA，UI 靠这个字段区分「锁屏继续下」与「待合成」。
+  String stage = '';
 
   /// 工作目录；失败/中断时保留，供 retry() 续传
   String? workDir;
@@ -54,6 +61,9 @@ class ConvertTask {
         'workDir': workDir,
         'startedAt': startedAt.toIso8601String(),
         'error': error,
+        'stage': stage,
+        // 冷启动对账时按原生进度换算「已下 x/y」，没有总分片数会显示 0/0
+        'totalSegments': totalSegments,
       };
 
   factory ConvertTask.fromPendingJson(Map<String, dynamic> j) => ConvertTask(
@@ -64,6 +74,8 @@ class ConvertTask {
         startedAt: DateTime.tryParse((j['startedAt'] as String?) ?? ''),
       )
         ..workDir = j['workDir'] as String?
+        ..stage = (j['stage'] as String?) ?? ''
+        ..totalSegments = (j['totalSegments'] as num?)?.toInt() ?? 0
         ..failed = true
         ..error = (j['error'] as String?) ?? '已暂停，可继续下载';
 }
@@ -85,11 +97,15 @@ class ConvertManager extends ChangeNotifier {
       connectTimeout: const Duration(seconds: 15),
       receiveTimeout: const Duration(seconds: 60),
     ));
+    // 后台期间 EventChannel 可能根本没有订阅者（引擎未启动），
+    // 所以事件仅用于前台刷新；正确性由 onResume()/ensureLoaded() 对账保证。
+    NativeBgDownloader.events().listen(_onNativeEvent, onError: (_) {});
   }
 
   late final Dio _dio;
   final List<ConvertTask> tasks = [];
   final Set<String> _active = {};
+  final Set<String> _nativeFinishing = {};
   bool _loaded = false;
 
   /// 启动时恢复未完成的转换任务（复用保留的分片工作目录）
@@ -120,6 +136,8 @@ class ConvertManager extends ChangeNotifier {
         }
       }
       if (tasks.isNotEmpty) notifyListeners();
+      // 冷启动对账：后台分片可能已在系统进程里下完，但事件整段丢失。
+      await _resumeNativeJobs();
     } catch (e, st) {
       AppLog.instance.error('convert', '启动时恢复转换任务失败', e, st);
     }
@@ -142,6 +160,22 @@ class ConvertManager extends ChangeNotifier {
         url: v.url,
         title: v.pageTitle.isNotEmpty ? v.pageTitle : 'HLS视频',
       );
+
+  /// 原生 background URLSession 分片下载 → 回前台自动 -c copy 合成 mp4。
+  /// 锁屏 / 切 App / 系统回收后仍由系统进程继续下分片，产物是自有 mp4。
+  Future<void> nativeDownload(VideoInfo v) {
+    // _start 的 _active 只覆盖「提交中」这一小段；提交完 Dart 就退出了，
+    // 所以还要按 url 查一次在途作业，避免重复 submit 覆盖同一 state.json。
+    final dup = tasks.any((t) =>
+        t.mode == 'native' && t.url == v.url && !t.done && !t.failed);
+    if (dup) return Future<void>.value();
+    return _start(
+      mode: 'native',
+      key: v.url,
+      url: v.url,
+      title: v.pageTitle.isNotEmpty ? v.pageTitle : 'HLS视频',
+    );
+  }
 
   /// 本地 m3u8 文件或包含 .m3u8 的文件夹 → mp4
   Future<void> convertLocal(String folderOrFile) {
@@ -192,6 +226,10 @@ class ConvertManager extends ChangeNotifier {
         break;
       }
     }
+    if (t?.mode == 'native') {
+      // 取消原生在途 task，否则 App 关掉后系统仍会把分片下完
+      await NativeBgDownloader.cancel(id);
+    }
     tasks.removeWhere((x) => x.id == id);
     try {
       if (t?.workDir != null && Directory(t!.workDir!).existsSync()) {
@@ -214,6 +252,22 @@ class ConvertManager extends ChangeNotifier {
       await _removePendingById(id);
     } catch (_) {}
     notifyListeners();
+  }
+
+  /// 取消进行中的转换任务（含原生后台作业）。
+  /// 资源库「取消」原来对 kind=='convert' 会误调 HlsManager，这里统一收口。
+  Future<void> cancel(String id) async {
+    ConvertTask? t;
+    for (final x in tasks) {
+      if (x.id == id) {
+        t = x;
+        break;
+      }
+    }
+    if (t == null) return;
+    // _start 用 url 去重，取消后必须释放，否则同链接再也发不起新任务
+    _active.remove(t.url);
+    await delete(id);
   }
 
   Future<void> _savePending(ConvertTask t) async {
@@ -266,9 +320,15 @@ class ConvertManager extends ChangeNotifier {
       if (task.workDir != null && Directory(task.workDir!).existsSync()) {
         work = Directory(task.workDir!);
       } else {
-        final tmpRoot = await getTemporaryDirectory();
-        work = await Directory(p.join(tmpRoot.path, 'm3u8_${task.id}'))
-            .create(recursive: true);
+        // native 链的分片要由原生后台进程写入：tmp 可能被系统回收，且进程
+        // 被杀后路径失效 → 固定放 Documents/Downloads/.native_<id>。
+        final root = task.mode == 'native'
+            ? (await getApplicationDocumentsDirectory()).path
+            : (await getTemporaryDirectory()).path;
+        final sub = task.mode == 'native'
+            ? p.join('Downloads', '.native_${task.id}')
+            : 'm3u8_${task.id}';
+        work = await Directory(p.join(root, sub)).create(recursive: true);
         task.workDir = work.path;
       }
       // 工作目录确定后落盘，确保进程被杀后重启可恢复
@@ -280,6 +340,9 @@ class ConvertManager extends ChangeNotifier {
           break;
         case 'package':
           await _downloadPackage(task, work);
+          break;
+        case 'native':
+          await _runNative(task, work);
           break;
         default:
           await _convertRemote(task, work);
@@ -436,6 +499,184 @@ class ConvertManager extends ChangeNotifier {
     }
     task.workDir = null;
     await _clearPending(task);
+  }
+
+  // ---------- 原生后台分片下载（mode == 'native'） ----------
+
+  /// Dart 前台只做清单解析与本地 playlist 生成，把整个作业一次性交给原生。
+  /// 提交后立刻返回：分片下载由系统进程托管，锁屏 / 切 App 仍继续。
+  Future<void> _runNative(ConvertTask task, Directory work) async {
+    final playlistText = await _fetchText(task.url);
+    final mediaUrl = _selectMediaPlaylist(task.url, playlistText);
+    final mediaText = await _fetchText(mediaUrl);
+    final lines = _parsePlaylist(mediaUrl, mediaText);
+    final segs = lines.where((l) => l.type == 'seg').toList();
+    if (segs.isEmpty) throw Exception('清单中没有可下载的分片');
+
+    // 原生链不预下密钥：key 也作为 part 交给原生，避免同一文件重复下载。
+    final keyLocal = <String, String>{};
+    for (final e in lines.where((l) => l.type == 'key')) {
+      final src = e.url!;
+      if (!keyLocal.containsKey(src)) {
+        keyLocal[src] = 'key_${keyLocal.length}.bin';
+      }
+    }
+    final names = segs.map((s) => s.name!).toList();
+    final playlistPath = p.join(work.path, 'playlist.m3u8');
+    _writeLocalPlaylist(playlistPath, lines, keyLocal, names);
+
+    final parts = <NativeSegPart>[
+      for (final e in keyLocal.entries)
+        NativeSegPart(url: e.key, name: e.value),
+      for (var i = 0; i < segs.length; i++)
+        NativeSegPart(url: segs[i].url!, name: names[i]),
+    ];
+    // 防盗链：用 media 清单 origin，而不是 Dio 全局写死的 B 站 Referer。
+    final origin = Uri.tryParse(mediaUrl)?.origin ?? '';
+    final headers = <String, String>{
+      'User-Agent': (_dio.options.headers['User-Agent'] ?? '').toString(),
+      if (origin.isNotEmpty) 'Referer': origin,
+    };
+
+    task.totalSegments = segs.length;
+    task.doneSegments = 0;
+    task.progress = 0;
+    task.stage = 'downloading';
+    // 提交后 Dart 不再持有长任务，进程随时可能被系统回收；这里必须把 stage 与
+    // 分片总数写回断点记录，否则冷启动恢复后 totalSegments=0，UI 永远显示 0/0。
+    await _savePending(task);
+    notifyListeners();
+
+    final ok = await NativeBgDownloader.submit(NativeSegJob(
+      jobId: task.id,
+      workDir: work.path,
+      playlistPath: playlistPath,
+      parts: parts,
+      headers: headers,
+    ));
+    if (!ok) {
+      throw Exception('当前平台不支持原生后台分片下载，或作业创建失败');
+    }
+    // 刻意不 await 下载完成：这一步交给系统，Dart 侧不留长任务。
+    AppLog.instance.info(
+        'convert', '已提交原生后台分片作业: ${task.title}（${parts.length} 个文件）');
+  }
+
+  /// 分片齐备后合成 mp4。系统唤醒窗口只有几秒，ffmpeg -c copy 必须放前台做。
+  Future<void> _finishNative(ConvertTask task) async {
+    if (task.done || _nativeFinishing.contains(task.id)) return;
+    final dir = task.workDir;
+    if (dir == null || !Directory(dir).existsSync()) {
+      task.failed = true;
+      task.stage = 'failed';
+      task.error = '后台分片目录已丢失，请重新下载';
+      notifyListeners();
+      return;
+    }
+    _nativeFinishing.add(task.id);
+    final work = Directory(dir);
+    try {
+      task.stage = 'remuxing';
+      task.progress = 1;
+      task.failed = false;
+      task.error = null;
+      notifyListeners();
+      final playlist = p.join(work.path, 'playlist.m3u8');
+      if (!File(playlist).existsSync()) throw Exception('本地清单缺失');
+      await _remux(playlist, p.join(work.path, 'out.mp4'));
+      await _finishMp4(task, work);
+      await NativeBgDownloader.markRemuxed(task.id);
+      AppLog.instance.info('convert', '后台分片转封装完成: ${task.title}');
+    } catch (e, st) {
+      task.failed = true;
+      task.stage = 'failed';
+      task.error = '转封装失败：$e';
+      unawaited(_savePending(task));
+      AppLog.instance.error(
+          'convert', '后台分片转封装失败: ${task.title}', e, st);
+    } finally {
+      _nativeFinishing.remove(task.id);
+      notifyListeners();
+    }
+  }
+
+  /// 前台实时进度（后台期间可能收不到，不能当唯一状态来源）
+  void _onNativeEvent(Map<String, dynamic> e) {
+    final id = e['jobId'] as String? ?? '';
+    ConvertTask? task;
+    for (final t in tasks) {
+      if (t.id == id && t.mode == 'native') {
+        task = t;
+        break;
+      }
+    }
+    if (task == null || task.done) return;
+    final total = (e['total'] as num?)?.toInt() ?? 0;
+    final done = (e['done'] as num?)?.toInt() ?? 0;
+    if (total > 0) {
+      task.progress = (done / total).clamp(0.0, 1.0).toDouble();
+      task.doneSegments = (task.progress * task.totalSegments).round();
+    }
+    switch (e['state'] as String? ?? 'downloading') {
+      case 'ready':
+        task.stage = 'ready';
+        unawaited(_finishNative(task));
+      case 'failed':
+        task.failed = true;
+        task.stage = 'failed';
+        final err = e['error'] as String? ?? '';
+        task.error = err.isEmpty ? '后台分片下载失败' : err;
+        unawaited(_savePending(task));
+      default:
+        task.stage = 'downloading';
+    }
+    notifyListeners();
+  }
+
+  /// App 回前台 / 冷启动对账：后台期间事件可能整段丢失，以原生磁盘状态为准。
+  Future<void> onResume() => _resumeNativeJobs();
+
+  Future<void> _resumeNativeJobs() async {
+    final natives = tasks
+        .where((t) => t.mode == 'native' && !t.done)
+        .toList(growable: false);
+    if (natives.isEmpty) return;
+    final byId = <String, NativeJobStatus>{
+      for (final s in await NativeBgDownloader.listJobs()) s.jobId: s,
+    };
+    for (final t in natives) {
+      final s = byId[t.id];
+      if (s == null) {
+        if (!t.failed) {
+          t.failed = true;
+          t.stage = 'failed';
+          t.error = '后台作业记录已丢失，请重新下载';
+        }
+        continue;
+      }
+      if (s.workDir.isNotEmpty && Directory(s.workDir).existsSync()) {
+        t.workDir = s.workDir;
+      }
+      t.progress = s.progress;
+      t.doneSegments = (s.progress * t.totalSegments).round();
+      if (s.isReady) {
+        t.failed = false;
+        t.error = null;
+        t.stage = 'ready';
+        // 不 await：ffmpeg 可能跑几十秒，别卡 App 启动 / 回前台
+        unawaited(_finishNative(t));
+      } else if (s.isFailed) {
+        t.failed = true;
+        t.stage = 'failed';
+        final err = s.error ?? '';
+        t.error = err.isEmpty ? '后台分片下载失败，可点继续重试' : err;
+      } else {
+        t.failed = false;
+        t.error = null;
+        t.stage = 'downloading';
+      }
+    }
+    notifyListeners();
   }
 
   // ---------- 收尾（mp4 输出 → Downloads） ----------

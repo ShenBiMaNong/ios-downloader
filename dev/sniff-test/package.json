@@ -1,0 +1,11 @@
+{
+  "name": "sniff-test",
+  "private": true,
+  "description": "嗅探判定的 A-B 回归测试（jsdom，不参与 App 构建）",
+  "scripts": {
+    "test": "node test_ab.js && node test_hijack.js"
+  },
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

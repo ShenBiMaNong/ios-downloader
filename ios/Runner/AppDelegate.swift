@@ -13,6 +13,7 @@ import WebKit
   private var shareBridge: ShareBridge?
   private var thumbnailBridge: ThumbnailBridge?
   private var snifferBridge: SnifferBridge?
+  private var nativeSegBridge: NativeSegmentBridge?
 
   /// 其他 App 分享/打开的视频文件队列（已拷贝进本 App 沙盒 tmp）
   private var pendingShareFiles: [(path: String, name: String)] = []
@@ -71,6 +72,32 @@ import WebKit
     return files
   }
 
+  /// 后台 URLSession 事件的入口。工程启用了 UIApplicationSceneManifest / SceneDelegate，
+  /// 但 background session 事件仍由 UIApplicationDelegate 交付（没有对应的 scene 回调）。
+  /// 🔴 需在真机上验证冷启动唤醒时该回调确实到达 AppDelegate。
+  /// 非本桥接的 identifier（如 HlsBridge 的 AVAssetDownloadURLSession）必须转交
+  /// FlutterAppDelegate 的 lifecycleDelegate：直接调 completionHandler() 会让系统
+  /// 认为事件已处理完，可能吞掉尚未交付的 HLS 回调，破坏已有的离线下载链。
+  override func application(
+    _ application: UIApplication,
+    handleEventsForBackgroundURLSession identifier: String,
+    completionHandler: @escaping () -> Void
+  ) {
+    guard identifier == NativeSegmentBridge.sessionIdentifier else {
+      super.application(
+        application,
+        handleEventsForBackgroundURLSession: identifier,
+        completionHandler: completionHandler)
+      return
+    }
+    if let bridge = nativeSegBridge {
+      bridge.storeCompletion(identifier, handler: completionHandler)
+    } else {
+      // 冷启动时引擎还没起来，先暂存；bridge init 会取走并按同 identifier 重建 session
+      NativeSegmentBridge.pendingCompletion[identifier] = completionHandler
+    }
+  }
+
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "HlsBridge") {
@@ -102,6 +129,11 @@ import WebKit
       let bridge = SnifferBridge()
       bridge.register(with: registrar.messenger())
       snifferBridge = bridge
+    }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "NativeSegmentBridge") {
+      let bridge = NativeSegmentBridge()
+      bridge.register(with: registrar.messenger())
+      nativeSegBridge = bridge
     }
   }
 }
@@ -218,8 +250,17 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
     case "playOffline":
       guard
         let args = call.arguments as? [String: Any],
-        let taskId = args["taskId"] as? String,
-        let localUrl = localUrls[taskId]
+        let taskId = args["taskId"] as? String
+      else {
+        result(false)
+        return
+      }
+      // App 重启后内存里的 localUrls 已清空，但 willDownloadTo 已把 .movpkg
+      // 路径持久化到 HlsLocalStore（缩略图用的就是它）。这里回退一次并校验落地，
+      // 否则历史离线条目播放必然失败，表现为「播放失败：本地缓存不存在」。
+      guard
+        let localUrl = localUrls[taskId] ?? HlsLocalStore.shared.url(for: taskId),
+        FileManager.default.fileExists(atPath: localUrl.path)
       else {
         result(false)
         return
@@ -736,6 +777,411 @@ class SnifferBridge: NSObject {
     if let wv = view as? WKWebView { return wv }
     for sub in view.subviews {
       if let found = findWKWebView(in: sub) { return found }
+    }
+    return nil
+  }
+}
+
+// MARK: - 原生后台分片下载（background URLSession，作业化）
+// 方法通道: video_downloader/native_seg  (submit / cancel / listJobs / markRemuxed)
+// 事件通道: video_downloader/native_seg/events
+//
+// 与 HlsBridge（AVAssetDownloadTask → .movpkg）完全不同：这里下的是清单里的
+// 原始分片，落到 App 自己的目录，产物可导出 / 可进 PlayerPage / 有大小与缩略图。
+// Apple《Downloading files in the background》的硬约束：
+// 1) 必须是 URLSessionDownloadTask（data task 不支持后台）；
+// 2) didFinishDownloadingTo 返回前必须把临时文件搬走；
+// 3) 全部 task 一次性提交，绝不能「批 4 个 → 下完再提交下一批」，否则系统
+//    rate limiter 会随每次唤醒递增延迟，几百个分片基本下不完；
+// 4) 后台传输的重定向始终跟随，willPerformHTTPRedirection 不会被调用；
+// 5) 用户从多任务界面强杀 App → 系统取消 session 全部传输且不再自动重启。
+//
+// 状态以 Documents/NativeSegJobs/<jobId>/state.json 为准。后台期间 eventSink
+// 可能根本不存在（Flutter 引擎未启动），所以事件只用于前台刷新，正确性靠
+// Dart 冷启动 / 回前台调用 listJobs() 对账保证。
+
+final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterStreamHandler {
+  static let methodChannelName = "video_downloader/native_seg"
+  static let eventChannelName = "video_downloader/native_seg/events"
+  static let sessionIdentifier = "video_downloader.native_seg.bg"
+
+  /// 冷启动时 handleEventsForBackgroundURLSession 可能早于 Flutter 引擎初始化，
+  /// 先静态暂存 completionHandler，bridge 建好后取走。
+  static var pendingCompletion: [String: () -> Void] = [:]
+
+  private lazy var session: URLSession = {
+    let cfg = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
+    cfg.sessionSendsLaunchEvents = true
+    // 前台发起时不要让系统择机（否则复现「点了半天 0%」）。
+    // 后台发起的任务系统仍会强制按 discretionary 处理，这个标志改不了。
+    cfg.isDiscretionary = false
+    cfg.httpMaximumConnectionsPerHost = 6
+    return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+  }()
+
+  private var eventSink: FlutterEventSink?
+  private var completionHandlers: [String: () -> Void] = [:]
+  private let lock = NSLock()
+
+  override init() {
+    super.init()
+    // 必须用同一 identifier 重建 session，才能接管系统代跑的 task（含冷启动唤醒）。
+    _ = session
+    for (id, handler) in Self.pendingCompletion {
+      completionHandlers[id] = handler
+    }
+    Self.pendingCompletion.removeAll()
+  }
+
+  func register(with messenger: FlutterBinaryMessenger) {
+    let channel = FlutterMethodChannel(
+      name: Self.methodChannelName, binaryMessenger: messenger)
+    channel.setMethodCallHandler { [weak self] call, result in
+      self?.handle(call, result: result)
+    }
+    let events = FlutterEventChannel(
+      name: Self.eventChannelName, binaryMessenger: messenger)
+    events.setStreamHandler(self)
+  }
+
+  func storeCompletion(_ identifier: String, handler: @escaping () -> Void) {
+    guard identifier == Self.sessionIdentifier else { return }
+    completionHandlers[identifier] = handler
+    _ = session
+  }
+
+  // MARK: - 方法通道
+
+  private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "submit":
+      result(submit(call.arguments))
+    case "cancel":
+      result(cancelJob(call.arguments))
+    case "listJobs":
+      result(listJobs())
+    case "markRemuxed":
+      result(clearJob(call.arguments))
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  /// 一次性提交整个作业：写状态文件 + 批量建 task + 全部 resume。
+  /// 已存在且非空的分片直接跳过（断点续传），不重复建 task。
+  private func submit(_ arguments: Any?) -> Bool {
+    guard
+      let args = arguments as? [String: Any],
+      let jobId = args["jobId"] as? String, !jobId.isEmpty,
+      let workDir = args["workDir"] as? String, !workDir.isEmpty,
+      let rawParts = args["parts"] as? [[String: Any]]
+    else { return false }
+
+    var headers = [String: String]()
+    if let rawHeaders = args["headers"] as? [String: Any] {
+      for (k, v) in rawHeaders {
+        if let s = v as? String { headers[k] = s }
+      }
+    }
+    let playlistPath = args["playlistPath"] as? String ?? ""
+
+    // 只接受可解析的绝对 URL，避免无效项让 finished 永远追不上 total
+    let parts: [[String: Any]] = rawParts.compactMap { part in
+      guard let u = part["url"] as? String, let n = part["name"] as? String,
+        !u.isEmpty, !n.isEmpty, URL(string: u) != nil
+      else { return nil }
+      return ["url": u, "name": n]
+    }
+    guard !parts.isEmpty else { return false }
+
+    let fm = FileManager.default
+    do {
+      try fm.createDirectory(atPath: workDir, withIntermediateDirectories: true)
+    } catch {
+      return false
+    }
+
+    let base = URL(fileURLWithPath: workDir)
+    var pending = [[String: Any]]()
+    var skipped = 0
+    for part in parts {
+      let name = part["name"] as? String ?? ""
+      if hasNonEmptyFile(base.appendingPathComponent(name).path) {
+        skipped += 1
+      } else {
+        pending.append(part)
+      }
+    }
+
+    var state: [String: Any] = [
+      "jobId": jobId,
+      "workDir": workDir,
+      "playlistPath": playlistPath,
+      "parts": parts,
+      "headers": headers,
+      "state": "downloading",
+      "done": skipped,
+      "finished": skipped,
+      "failed": 0,
+      "total": parts.count,
+    ]
+    saveState(jobId, state)
+
+    if pending.isEmpty {
+      state["state"] = "ready"
+      saveState(jobId, state)
+      emit(state)
+      return true
+    }
+
+    for part in pending {
+      guard let urlString = part["url"] as? String,
+        let name = part["name"] as? String,
+        let url = URL(string: urlString)
+      else { continue }
+      var req = URLRequest(url: url)
+      for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+      let task = session.downloadTask(with: req)
+      // 后台 relaunch 后 taskDescription 不保证保留，didFinish 里另有 URL 查表兜底
+      task.taskDescription = "\(jobId)|\(name)"
+      task.resume()
+    }
+    return true
+  }
+
+  private func cancelJob(_ arguments: Any?) -> Bool {
+    guard let args = arguments as? [String: Any],
+      let jobId = args["jobId"] as? String, !jobId.isEmpty
+    else { return false }
+    session.getAllTasks { tasks in
+      for t in tasks where (t.taskDescription ?? "").hasPrefix("\(jobId)|") {
+        t.cancel()
+      }
+    }
+    clearJob(arguments)
+    return true
+  }
+
+  /// Dart 侧 mp4 合成成功后清状态；分片目录由 ConvertManager._finishMp4 删除。
+  @discardableResult
+  private func clearJob(_ arguments: Any?) -> Bool {
+    guard let args = arguments as? [String: Any],
+      let jobId = args["jobId"] as? String, !jobId.isEmpty
+    else { return false }
+    let dir = stateURL(jobId).deletingLastPathComponent()
+    try? FileManager.default.removeItem(at: dir)
+    return true
+  }
+
+  private func listJobs() -> [[String: Any]] {
+    allStates().map { entry -> [String: Any] in
+      let st = entry.1
+      return [
+        "jobId": st["jobId"] as? String ?? "",
+        "state": st["state"] as? String ?? "downloading",
+        "workDir": st["workDir"] as? String ?? "",
+        "done": st["done"] as? Int ?? 0,
+        "total": st["total"] as? Int ?? 0,
+        "error": st["error"] as? String ?? "",
+      ]
+    }
+  }
+
+  // MARK: - URLSessionDownloadDelegate
+
+  func urlSession(
+    _ session: URLSession,
+    downloadTask: URLSessionDownloadTask,
+    didFinishDownloadingTo location: URL
+  ) {
+    guard let resolved = resolve(task: downloadTask) else { return }
+    let jobId = resolved.0
+    let name = resolved.1
+    let st = resolved.2
+    let workDir = st["workDir"] as? String ?? ""
+    let dest = URL(fileURLWithPath: workDir).appendingPathComponent(name)
+    let fm = FileManager.default
+    var ok = false
+    // 后台 session 会把 403/404 的响应体也当「下载成功」交给 delegate，
+    // 不校验状态码就会把错误页当成 .ts 落盘，最后 ffmpeg 才报错且无法定位。
+    let httpOk = (downloadTask.response as? HTTPURLResponse)
+      .map { (200...299).contains($0.statusCode) } ?? true
+    if httpOk {
+      try? fm.removeItem(at: dest)
+      do {
+        // 官方：临时文件只在 delegate 方法返回前有效，必须同步搬走
+        try fm.moveItem(at: location, to: dest)
+        ok = hasNonEmptyFile(dest.path)
+      } catch {
+        ok = false
+      }
+    }
+    if let updated = updateState(jobId, { state in
+      state["finished"] = (state["finished"] as? Int ?? 0) + 1
+      if ok {
+        state["done"] = (state["done"] as? Int ?? 0) + 1
+      } else {
+        state["failed"] = (state["failed"] as? Int ?? 0) + 1
+        if state["error"] == nil { state["error"] = "分片落盘失败: \(name)" }
+      }
+      self.finalizeIfNeeded(&state)
+    }) {
+      emit(updated)
+    }
+  }
+
+  func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    // 成功路径已在 didFinishDownloadingTo 里计过 finished，这里只补失败
+    guard let error else { return }
+    guard let resolved = resolve(task: task) else { return }
+    let jobId = resolved.0
+    if let updated = updateState(jobId, { state in
+      state["finished"] = (state["finished"] as? Int ?? 0) + 1
+      state["failed"] = (state["failed"] as? Int ?? 0) + 1
+      if state["error"] == nil { state["error"] = error.localizedDescription }
+      self.finalizeIfNeeded(&state)
+    }) {
+      emit(updated)
+    }
+  }
+
+  func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      let handler = self.completionHandlers.removeValue(forKey: Self.sessionIdentifier)
+      handler?()
+    }
+  }
+
+  // MARK: - FlutterStreamHandler
+
+  func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink)
+    -> FlutterError?
+  {
+    eventSink = events
+    return nil
+  }
+
+  func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    eventSink = nil
+    return nil
+  }
+
+  // MARK: - 状态文件
+
+  private func jobsRoot() -> URL {
+    let fm = FileManager.default
+    let base = fm.urls(for: .documentDirectory, in: .userDomainMask).first
+      ?? fm.temporaryDirectory
+    let dir = base.appendingPathComponent("NativeSegJobs", isDirectory: true)
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+  }
+
+  private func stateURL(_ jobId: String) -> URL {
+    let safe = String(jobId.map { $0.isLetter || $0.isNumber ? $0 : "_" })
+    return jobsRoot()
+      .appendingPathComponent(safe, isDirectory: true)
+      .appendingPathComponent("state.json")
+  }
+
+  private func loadState(_ jobId: String) -> [String: Any]? {
+    guard let data = try? Data(contentsOf: stateURL(jobId)),
+      let obj = try? JSONSerialization.jsonObject(with: data),
+      let j = obj as? [String: Any]
+    else { return nil }
+    return j
+  }
+
+  private func saveState(_ jobId: String, _ state: [String: Any]) {
+    let url = stateURL(jobId)
+    try? FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    guard let data = try? JSONSerialization.data(withJSONObject: state) else { return }
+    try? data.write(to: url, options: .atomic)
+  }
+
+  private func allStates() -> [(String, [String: Any])] {
+    let fm = FileManager.default
+    guard
+      let dirs = try? fm.contentsOfDirectory(
+        at: jobsRoot(), includingPropertiesForKeys: nil)
+    else { return [] }
+    var out: [(String, [String: Any])] = []
+    for d in dirs {
+      let f = d.appendingPathComponent("state.json")
+      guard let data = try? Data(contentsOf: f),
+        let obj = try? JSONSerialization.jsonObject(with: data),
+        let j = obj as? [String: Any]
+      else { continue }
+      out.append(((j["jobId"] as? String) ?? d.lastPathComponent, j))
+    }
+    return out
+  }
+
+  @discardableResult
+  private func updateState(
+    _ jobId: String, _ mutate: (inout [String: Any]) -> Void
+  ) -> [String: Any]? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard var st = loadState(jobId) else { return nil }
+    mutate(&st)
+    saveState(jobId, st)
+    return st
+  }
+
+  private func finalizeIfNeeded(_ state: inout [String: Any]) {
+    let total = state["total"] as? Int ?? 0
+    let finished = state["finished"] as? Int ?? 0
+    guard total > 0, finished >= total,
+      (state["state"] as? String ?? "downloading") == "downloading"
+    else { return }
+    let failed = state["failed"] as? Int ?? 0
+    state["state"] = failed > 0 ? "failed" : "ready"
+  }
+
+  private func emit(_ state: [String: Any]) {
+    let payload: [String: Any] = [
+      "jobId": state["jobId"] as? String ?? "",
+      "state": state["state"] as? String ?? "downloading",
+      "done": state["done"] as? Int ?? 0,
+      "total": state["total"] as? Int ?? 0,
+      "error": state["error"] as? String ?? "",
+    ]
+    DispatchQueue.main.async { [weak self] in
+      self?.eventSink?(payload)
+    }
+  }
+
+  private func hasNonEmptyFile(_ path: String) -> Bool {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+      let size = attrs[.size] as? NSNumber
+    else { return false }
+    return size.intValue > 0
+  }
+
+  /// 定位回调属于哪个作业 / 哪个文件。taskDescription 在后台重启后可能丢失，
+  /// 因此再用 originalRequest.url 去所有 state.json 的 parts 里查一遍。
+  private func resolve(task: URLSessionTask) -> (String, String, [String: Any])? {
+    if let desc = task.taskDescription,
+      let range = desc.range(of: "|"),
+      let st = loadState(String(desc[desc.startIndex..<range.lowerBound]))
+    {
+      let jobId = String(desc[desc.startIndex..<range.lowerBound])
+      let name = String(desc[range.upperBound...])
+      if !jobId.isEmpty && !name.isEmpty { return (jobId, name, st) }
+    }
+    guard let urlString = task.originalRequest?.url?.absoluteString else { return nil }
+    for (jobId, st) in allStates() {
+      guard let parts = st["parts"] as? [[String: Any]] else { continue }
+      for part in parts {
+        if let u = part["url"] as? String, u == urlString,
+          let name = part["name"] as? String
+        {
+          return (jobId, name, st)
+        }
+      }
     }
     return nil
   }
