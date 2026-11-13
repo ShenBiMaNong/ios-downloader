@@ -1,10 +1,12 @@
-// 视频嗅探脚本：注入到内置浏览器的每个页面（含同源 iframe）
+// 视频嗅探脚本：注入到内置浏览器的每个页面（iOS 另注册为 WKUserScript 全帧注入，含跨域 iframe）
 // 识别尽可能多的视频类型：
 // ① <video>/<source> 扫描（含 <source type> MIME 兜底、video 无 src 时读子元素）
-// ② MutationObserver
+// ② MutationObserver（childList + src 属性变化）
 // ③ fetch 钩子 + 响应 Content-Type 兜底（无扩展名的签名 URL）
 // ④ XHR 钩子 + Content-Type 兜底
-// ⑤ 兜底轮询 + 同源 iframe 扩散
+// ⑤ 静态脚本解析：扫描 <script> 文本里的视频地址（点击前即可识别）
+// ⑥ Performance API 资源时间线：被动收集已请求资源（兜底站点缓存原始 fetch 引用的漏网）
+// ⑦ 兜底轮询 + 点击后即时重扫 + 同源 iframe 扩散
 // 噪声治理：.ts/.m4s 分片与字幕（vtt/srt/ttml…）不作为独立视频上报（元素直链除外）
 // 暴露 window.__vdlSniff 注册表，供 video_marker.js 对 blob:/MSE 流做直链兜底
 (function () {
@@ -94,10 +96,54 @@
     });
   }
 
+  // ── A. 静态脚本解析：很多影视站把真实视频地址嵌在 <script> 配置里
+  //（如 var player_x={"url":"https:\/\/cdn…/index.m3u8"}、window.__INITIAL_STATE__），
+  // 页面还没发起请求就能识别 → 点击前即可入列表。
+  var SCRIPT_URL_RE =
+    /https?:\\?\/\\?\/[^"'<>\s]+?\.(mp4|m3u8|mov|webm|mkv|flv|f4v|m4v|ts|m2ts|mts|mpg|mpeg|avi|wmv|asf|3gp|3g2|ogv|ogm|rm|rmvb|mpd)([?#][^"'<>\s]*)?/ig;
+  var _lastScriptCount = -1;
+
+  function scanScripts() {
+    try {
+      var ss = document.querySelectorAll('script');
+      if (ss.length === _lastScriptCount) return; // 脚本没变就不重复扫
+      _lastScriptCount = ss.length;
+      for (var i = 0; i < ss.length; i++) {
+        var txt = ss[i].textContent || '';
+        var m;
+        SCRIPT_URL_RE.lastIndex = 0;
+        while ((m = SCRIPT_URL_RE.exec(txt))) {
+          post(m[0].replace(/\\\//g, '/'), true);
+        }
+      }
+    } catch (e) {}
+  }
+
+  // ── B. Performance API 资源时间线：被动收集所有已请求资源。
+  // 站点若在脚本求值时缓存了原始 fetch 引用，钩子会被绕过；资源时间线不受影响，
+  // 且请求在注入前发生的也能补到（iOS 文档加载即开始记录）。
+  var _perfCursor = 0;
+
+  function collectPerf() {
+    try {
+      if (!window.performance || !performance.getEntriesByType) return;
+      if (performance.setResourceTimingBufferSize) {
+        try { performance.setResourceTimingBufferSize(1000); } catch (e) {}
+      }
+      var res = performance.getEntriesByType('resource');
+      for (var i = _perfCursor; i < res.length; i++) {
+        var r = res[i];
+        if (r && r.name) post(r.name, false);
+      }
+      _perfCursor = res.length;
+    } catch (e) {}
+  }
+
   try {
     var mo = new MutationObserver(collect);
+    // 观察 document 本身：documentStart 注入时 documentElement 可能尚未就绪
     // childList 覆盖动态插入的 <video>；attributes 覆盖点击播放后才赋值的 src
-    mo.observe(document.documentElement, {
+    mo.observe(document, {
       childList: true,
       subtree: true,
       attributes: true,
@@ -182,20 +228,26 @@
     }
   };
 
-  // 兜底轮询（一些站点改 src 但不触发事件）+ 迟到的 iframe
+  // 兜底轮询（一些站点改 src 但不触发事件）+ 资源时间线 + 脚本解析 + 迟到的 iframe
   setInterval(function () {
     collect();
+    collectPerf();
+    scanScripts();
     if (window.__vdlSniffSource) {
       try { window.__vdlSniffPropagate(window.__vdlSniffSource); } catch (e) {}
     }
   }, 2000);
   collect();
+  collectPerf();
+  scanScripts();
 
   // 懒加载站点：点击播放后才创建播放器/发起媒体请求 → 点击后立即重扫 + 扩散，
   // 把「点击 → 识别」的延迟从最长 2s 压到毫秒级（播放器 src 赋值由属性观察覆盖）
   document.addEventListener('click', function () {
     setTimeout(function () {
       collect();
+      collectPerf();
+      scanScripts();
       if (window.__vdlSniffSource) {
         try { window.__vdlSniffPropagate(window.__vdlSniffSource); } catch (e) {}
       }
