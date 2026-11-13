@@ -14,10 +14,10 @@ class BrowserPage extends StatefulWidget {
   const BrowserPage({super.key});
 
   @override
-  State<BrowserPage> createState() => _BrowserPageState();
+  State<BrowserPage> createState() => BrowserPageState();
 }
 
-class _BrowserPageState extends State<BrowserPage> {
+class BrowserPageState extends State<BrowserPage> {
   final _urlController = TextEditingController(text: 'https://www.bilibili.com');
   late final WebViewController _controller;
   final List<VideoInfo> _found = [];
@@ -76,6 +76,11 @@ class _BrowserPageState extends State<BrowserPage> {
       if (_found.any((e) => e.url == v.url)) return;
       setState(() => _found.insert(0, v));
     } catch (_) {}
+  }
+
+  /// 供外部（剪贴板导入等）加载 URL
+  void loadUrl(String raw) {
+    _load(raw);
   }
 
   @override
