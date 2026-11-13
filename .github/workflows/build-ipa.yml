@@ -2,9 +2,12 @@ name: Build unsigned IPA
 
 # 云端 macOS 构建，产出「未签名 IPA」
 # 注意：私有仓库免费额度 macOS 按 10 倍消耗（约 200 分钟/月），一次构建约 20-40 分钟
+# 触发方式：仅手动触发（Actions 页 Run workflow）或推送 v* 版本标签时构建，
+# 避免每次提交到 main 都消耗有限的 macOS 构建分钟额度
 on:
   push:
-    branches: [main]
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 jobs:
