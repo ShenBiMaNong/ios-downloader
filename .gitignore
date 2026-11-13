@@ -30,3 +30,6 @@ android/key.properties
 
 # 本地临时
 *.log
+
+# CI artifacts
+artifacts/
