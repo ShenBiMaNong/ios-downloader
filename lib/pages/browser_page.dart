@@ -20,7 +20,6 @@ class _BrowserPageState extends State<BrowserPage> {
   late final WebViewController _controller;
   final List<VideoInfo> _found = [];
   String? _sniffer;
-  String? _pageTitle;
 
   @override
   void initState() {
@@ -29,11 +28,7 @@ class _BrowserPageState extends State<BrowserPage> {
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (url) => _injectSniffer(),
-        onPageFinished: (url) async {
-          await _injectSniffer();
-          final t = await _controller.getTitle();
-          if (mounted) setState(() => _pageTitle = t);
-        },
+        onPageFinished: (url) => _injectSniffer(),
       ))
       ..addJavaScriptChannel('videoFound', onMessageReceived: (msg) {
         _handleFound(msg.message);

@@ -1,7 +1,6 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:path/path.dart' as p;
 
 import '../services/download_manager.dart';
 import 'player_page.dart';
@@ -59,6 +58,7 @@ class _LibraryPageState extends State<LibraryPage> {
                       final path = (m['localPath'] as String?) ?? '';
                       final title = (m['title'] as String?) ?? '未命名';
                       final kind = (m['kind'] as String?) ?? 'other';
+                      final saved = (m['savedAt'] as String?) ?? '';
                       return ListTile(
                         leading: Icon(
                           kind == 'm3u8' ? Icons.stream : Icons.movie,
@@ -66,7 +66,7 @@ class _LibraryPageState extends State<LibraryPage> {
                         ),
                         title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
                         subtitle: Text(
-                          '${_size(path)} · ${(m['savedAt'] as String? ?? '').substring(0, 10)}',
+                          '${_size(path)} · ${saved.isEmpty ? '' : saved.substring(0, 10)}',
                           style: const TextStyle(fontSize: 12),
                         ),
                         trailing: IconButton(
