@@ -50,17 +50,18 @@ class PlaybackCacher extends ChangeNotifier {
   Future<void> _doInit() async {
     try {
       final docs = await getApplicationDocumentsDirectory();
-      _staging = Directory(p.join(docs.path, '.caching'));
+      final staging = Directory(p.join(docs.path, '.caching'));
+      _staging = staging;
       // 启动时清理上次遗留的半成品（此刻无活跃流）
-      if (await _staging.exists()) {
-        await _staging.delete(recursive: true);
+      if (await staging.exists()) {
+        await staging.delete(recursive: true);
       }
-      await _staging.create(recursive: true);
+      await staging.create(recursive: true);
       final config = GlobalCacheConfig(
-        cacheDirectory: _staging!,
+        cacheDirectory: staging,
         // 所有流都显式传 file:（staging 下），此解析器仅兜底
         cacheFileResolver: (dir, uri) =>
-            File(p.join(_staging!.path, _safeName(uri.toString()) + '.mp4')),
+            File(p.join(staging.path, '${_safeName(uri.toString())}.mp4')),
         customHttpClient: _RefererClient(_referers),
         requestHeaders: {'User-Agent': _ua},
         savePartialCache: true,
@@ -102,7 +103,7 @@ class PlaybackCacher extends ChangeNotifier {
 
     // 同 URL 已在处理中 → 稍等重试（防双击双开）
     if (_starting.contains(url)) {
-      await Future.delayed(const Duration(milliseconds: 300));
+      await Future<void>.delayed(const Duration(milliseconds: 300));
       return start(url: url, title: title, referer: referer);
     }
     _starting.add(url);
@@ -140,7 +141,7 @@ class PlaybackCacher extends ChangeNotifier {
       }
 
       final task = CacheTask(
-        id: '${idPrefix}${DateTime.now().millisecondsSinceEpoch}',
+        id: '$idPrefix${DateTime.now().millisecondsSinceEpoch}',
         url: url,
         title: title,
         referer: referer,
@@ -331,7 +332,7 @@ class PlaybackCacher extends ChangeNotifier {
   }
 }
 
-/// 「边播边缓存」任务（内存态；完成时通过 <id>.json 持久化入库）
+/// 「边播边缓存」任务（内存态；完成时通过 `<id>.json` 持久化入库）
 class CacheTask {
   final String id;
   final String url;

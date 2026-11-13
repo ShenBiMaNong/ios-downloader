@@ -257,10 +257,8 @@ class DownloadManager extends ChangeNotifier {
       // 断点续传沿用原 part 文件名；新下载按标题取唯一名
       //（与已存文件/进行中任务重名时自动追加序号，不再覆盖旧文件）
       var fileName = _resumeFileName(task, dir);
-      if (fileName == null) {
-        fileName = uniqueFileName(
-            dir, _mp4Name(task.title.isNotEmpty ? task.title : task.url));
-      }
+      fileName ??= uniqueFileName(
+          dir, _mp4Name(task.title.isNotEmpty ? task.title : task.url));
       final partPath = p.join(dir.path, '$fileName.part');
       final target = p.join(dir.path, fileName);
       task.partPath = partPath;
