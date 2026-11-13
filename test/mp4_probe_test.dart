@@ -13,7 +13,7 @@ Uint8List _box(String type, [int payloadLen = 0]) {
   be32(8 + payloadLen);
   b.add(type.codeUnits); // fourcc 恰为 4 个 ASCII 字符
   for (var i = 0; i < payloadLen; i++) {
-    b.add(0);
+    b.addByte(0);
   }
   return b.toBytes();
 }
