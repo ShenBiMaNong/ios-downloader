@@ -1,4 +1,5 @@
 import AVFoundation
+import AVKit
 import Flutter
 import UIKit
 
@@ -71,7 +72,7 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
       }
       let asset = AVURLAsset(url: urlObj)
       let downloadConfig = AVAssetDownloadConfiguration(asset: asset, title: title)
-      guard let task = session.makeAssetDownloadTask(configuration: downloadConfig) else {
+      guard let task = session.makeAssetDownloadTask(downloadConfiguration: downloadConfig) else {
         result(FlutterError(code: "create_failed", message: "创建下载任务失败", details: nil))
         return
       }
