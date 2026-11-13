@@ -28,7 +28,7 @@
 
 ## 构建 & 安装（Windows 开发机）
 
-1. 推送到 GitHub 私有仓库，Actions 自动在 macOS runner 上执行 `flutter build ipa --no-codesign`，产物为**未签名 IPA**（artifact: `video-downloader-unsigned-ipa`）。
+1. 推送到 GitHub 私有仓库，Actions 在 macOS runner 上构建并打包**未签名 IPA**。IPA 文件名带版本/日期/commit（如 `VideoDownloader-0.2.0+1-20251113-4f718c0e.ipa`），zip 内附 `build_info.txt` 记录版本/日期/commit/tag，方便区分新旧版本。
 2. 下载 IPA 后，用 **Sideloadly**（Windows）或 **爱思助手** 以你的 Apple ID 签名并安装到 iPhone。
 3. ⚠️ 免费 Personal Team 签名的 App **7 天过期**，到期重新签名安装即可。
 

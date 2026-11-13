@@ -13,8 +13,8 @@ git push -u origin main
 ```
 
 3. 打开仓库 → **Actions** 页 → `Build unsigned IPA` 工作流开始运行（macOS 构建约 20-40 分钟）；
-   - 推送自动触发；也可以在 Actions 页点 **Run workflow** 手动触发；
-4. 构建成功后，进入本次运行 → **Artifacts** → 下载 `video-downloader-unsigned-ipa`，解压得到 `Runner.ipa`。
+   - 推送自动触发；也可以在 Actions 页点 **Run workflow** 手动触发，此时可填「版本号覆盖」（如 `0.3.0+2`），留空则用 pubspec.yaml 的 version；
+4. 构建成功后，进入本次运行 → **Artifacts** → 下载 `video-downloader-unsigned-ipa-<版本>-<日期>-<提交>`，解压得到带版本信息的 IPA（如 `VideoDownloader-0.2.0+1-20251113-4f718c0e.ipa`；zip 内另有 `build_info.txt` 记录版本/日期/commit/tag，可据此确认是不是最新版）。
 
 > 私有仓库分钟账：macOS 按 10 倍消耗，免费约 200 分钟/月 ≈ 5-10 次构建。省着用或以后考虑公开仓库（开源）解锁免费不限量。
 
@@ -23,7 +23,7 @@ git push -u origin main
 1. 官网下载并安装 [Sideloadly](https://sideloadly.io/)（Windows 版，需 iTunes/Apple Devices 组件，安装时按提示装）；
 2. iPhone 用数据线连电脑，信任此电脑；
 3. 打开 Sideloadly：
-   - **IPA** 栏选择解压出的 `Runner.ipa`；
+   - **IPA** 栏选择解压出的 IPA（如 `VideoDownloader-0.2.0+1-….ipa`）；
    - **Apple ID** 填你的 Apple ID 和**App 专用密码**（没有就在 Apple 账户网页开双重认证后生成）；
    - 设备选择你的 iPhone；
    - 点 **Start**，等签名安装完成；

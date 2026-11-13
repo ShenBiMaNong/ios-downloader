@@ -4,11 +4,18 @@ name: Build unsigned IPA
 # 注意：私有仓库免费额度 macOS 按 10 倍消耗（约 200 分钟/月），一次构建约 20-40 分钟
 # 触发方式：仅手动触发（Actions 页 Run workflow）或推送 v* 版本标签时构建，
 # 避免每次提交到 main 都消耗有限的 macOS 构建分钟额度
+# 版本信息：IPA 文件名 = VideoDownloader-<版本>-<日期>-<commit短sha>.ipa，
+#   zip 根目录附 build_info.txt（版本/日期/commit/tag）；手动触发时可填「版本号覆盖」
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version_override:
+        description: '版本号覆盖（如 0.3.0+2），留空则用 pubspec.yaml 的 version'
+        required: false
+        type: string
 
 jobs:
   build-ipa:
@@ -16,6 +23,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve build info
+        id: build_info
+        run: |
+          VERSION="$(sed -n 's/^version: *//p' pubspec.yaml)"
+          INPUT_VER="${{ github.event.inputs.version_override }}"
+          if [ -n "$INPUT_VER" ]; then
+            VERSION="$INPUT_VER"
+          fi
+          SHORT_SHA="${GITHUB_SHA:0:8}"
+          DATE="$(date -u +%Y%m%d)"
+          TAG="$(echo "$GITHUB_REF" | sed -n 's#^refs/tags/##p')"
+          # artifact 名只允许字母数字 - _ . ，把 + 换成 -
+          ARTIFACT_NAME="video-downloader-unsigned-ipa-${VERSION//+/-}-${DATE}-${SHORT_SHA}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -34,20 +60,44 @@ jobs:
         run: flutter test
 
       - name: Build unsigned app
-        # flutter build ipa --no-codesign 在 3.50 只产 xcarchive 不产 ipa，故手动组装
-        run: flutter build ios --release --no-codesign
+        # flutter build ipa --no-codesign 在 3.50 只产 xcarchive 不产 ipa，故手动组装；
+        # 显式传 --build-name/--build-number，让 .app 内 Info.plist 的
+        # CFBundleShortVersionString/CFBundleVersion 与文件名版本一致（支持手动覆盖版本号）
+        run: |
+          VERSION="${{ steps.build_info.outputs.version }}"
+          if [[ "$VERSION" == *+* ]]; then
+            BUILD_NAME="${VERSION%+*}"
+            BUILD_NUMBER="${VERSION##*+}"
+          else
+            BUILD_NAME="$VERSION"
+            BUILD_NUMBER="1"
+          fi
+          flutter build ios --release --no-codesign --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER"
 
       - name: Package unsigned IPA
         run: |
+          VERSION="${{ steps.build_info.outputs.version }}"
+          DATE="${{ steps.build_info.outputs.date }}"
+          SHORT_SHA="${{ steps.build_info.outputs.short_sha }}"
+          TAG="${{ steps.build_info.outputs.tag }}"
+          IPA_NAME="VideoDownloader-${VERSION}-${DATE}-${SHORT_SHA}.ipa"
           mkdir -p Payload
           cp -R build/ios/iphoneos/Runner.app Payload/
-          zip -r Runner.ipa Payload
+          cat > build_info.txt <<EOF
+          App        : 视频下载器 (video_downloader)
+          Version    : ${VERSION}
+          Build date : ${DATE} (UTC)
+          Commit     : ${GITHUB_SHA}
+          Ref        : ${GITHUB_REF}
+          Tag        : ${TAG}
+          EOF
+          zip -r "${IPA_NAME}" Payload build_info.txt
           mkdir -p build/ios/ipa
-          mv Runner.ipa build/ios/ipa/Runner.ipa
+          mv "${IPA_NAME}" build/ios/ipa/
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: video-downloader-unsigned-ipa
+          name: ${{ steps.build_info.outputs.artifact_name }}
           path: build/ios/ipa/*.ipa
           if-no-files-found: error
