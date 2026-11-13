@@ -3,6 +3,7 @@ package com.example.video_downloader
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -77,6 +78,26 @@ class MainActivity : FlutterActivity() {
     }
 
   private fun guessName(uri: Uri): String {
+    // 优先取内容提供者声明的显示名（多数分享方的 lastPathSegment 是 opaque id）
+    if (uri.scheme == "content") {
+      try {
+        contentResolver.query(
+          uri,
+          arrayOf(OpenableColumns.DISPLAY_NAME),
+          null, null, null
+        )?.use { c ->
+          if (c.moveToFirst()) {
+            val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (idx >= 0) {
+              val n = c.getString(idx)
+              if (!n.isNullOrBlank()) return n
+            }
+          }
+        }
+      } catch (e: Exception) {
+        // 提供者不支持查询显示名 → 退回 lastPathSegment
+      }
+    }
     val seg = uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast('\\') ?: ""
     return seg.ifBlank { "shared_video.mp4" }
   }

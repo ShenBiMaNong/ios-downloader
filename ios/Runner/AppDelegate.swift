@@ -41,7 +41,8 @@ import UniformTypeIdentifiers
   }
 
   /// 安全作用域拷贝到沙盒 tmp/pickedShare，再交给 Flutter 导入 Documents/Share
-  private func enqueueShare(_ url: URL) {
+  /// （internal：供 SceneDelegate 在场景生命周期里调用）
+  func enqueueShare(_ url: URL) {
     let scoped = url.startAccessingSecurityScopedResource()
     defer {
       if scoped { url.stopAccessingSecurityScopedResource() }

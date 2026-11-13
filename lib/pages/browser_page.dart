@@ -59,6 +59,8 @@ class BrowserPageState extends State<BrowserPage> {
         onPageStarted: (url) {
           _currentUrl = url;
           _handledRedirects.clear();
+          // 页面切换时重置底部视频列表：只保留当前页嗅探到的视频
+          if (mounted) setState(() => _found.clear());
           AppData.instance.setLastUrl(url);
           _injectSniffer();
           _injectMarker();
@@ -136,7 +138,10 @@ class BrowserPageState extends State<BrowserPage> {
   Future<void> _injectSniffer() async {
     try {
       final js = await _snifferJs();
-      await _controller.runJavaScript(js);
+      // 附带源码：让脚本把自身扩散到同源 iframe（跨域 iframe 由平台限制，跳过）
+      final boot = '\nwindow.__vdlSniffSource=${jsonEncode(js)};\n'
+          'if (window.__vdlSniffPropagate) window.__vdlSniffPropagate(window.__vdlSniffSource);';
+      await _controller.runJavaScript(js + boot);
     } catch (e, st) {
       AppLog.instance.warn('browser', '注入嗅探脚本失败', e, st);
     }
@@ -147,10 +152,13 @@ class BrowserPageState extends State<BrowserPage> {
     try {
       if (AppData.instance.videoMarkEnabled) {
         final js = await _markerJs();
-        await _controller.runJavaScript(js);
+        // 附带源码：脚本自扩散到同源 iframe，让 iframe 内播放器也能出角标
+        final boot = '\nwindow.__vdlMarkerSource=${jsonEncode(js)};\n'
+            'if (window.__vdlMarkerPropagate) window.__vdlMarkerPropagate(window.__vdlMarkerSource);';
+        await _controller.runJavaScript(js + boot);
       } else {
-        await _controller
-            .runJavaScript('if (window.__vdlCleanup) window.__vdlCleanup();');
+        await _controller.runJavaScript(
+            'window.__vdlMarkerSource=null; if (window.__vdlCleanup) window.__vdlCleanup();');
       }
       _lastMarkerApplied = AppData.instance.videoMarkEnabled;
     } catch (e, st) {

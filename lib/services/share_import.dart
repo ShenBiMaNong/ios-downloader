@@ -35,10 +35,12 @@ class ShareBridge {
   static Future<List<Map<String, dynamic>>> takePending() async {
     try {
       final r = await _channel.invokeMethod<List<dynamic>>('takePending');
-      return (r ?? const [])
+      final items = (r ?? const [])
           .whereType<Map>()
           .map((e) => Map<String, dynamic>.from(e.cast<String, dynamic>()))
           .toList();
+      AppLog.instance.info('share', 'takePending 取到 ${items.length} 条待导入');
+      return items;
     } catch (e, st) {
       AppLog.instance.warn('share', 'takePending 失败', e, st);
       return const [];
@@ -89,11 +91,15 @@ class ShareImport {
   static Future<int> importPending() async {
     final items = await ShareBridge.takePending();
     if (items.isEmpty) return 0;
+    AppLog.instance.info('share', '开始导入 ${items.length} 个分享文件');
     var ok = 0;
     for (final m in items) {
       final source = (m['source'] as String?) ?? '';
       final name = (m['name'] as String?) ?? '';
-      if (source.isEmpty) continue;
+      if (source.isEmpty) {
+        AppLog.instance.warn('share', '分享条目缺少 source，跳过');
+        continue;
+      }
       try {
         final dir = await DownloadManager.instance.shareDir();
         // 与下载一致：同名自动追加序号，绝不覆盖
@@ -104,14 +110,19 @@ class ShareImport {
         final copied = source.startsWith('content://')
             ? await ShareBridge.copy(source, dest)
             : await File(source).copy(dest).then((_) => true);
-        if (!copied) continue;
+        if (!copied) {
+          AppLog.instance.warn('share', '拷贝失败 $source');
+          continue;
+        }
         await DownloadManager.instance.addSharedItem(dest, _titleFrom(fileName));
+        AppLog.instance.info('share', '已导入 $fileName');
         ok++;
       } catch (e, st) {
         AppLog.instance.warn('share', '导入失败 $source', e, st);
       }
     }
     if (ok > 0) LibraryRefresh.instance.bump();
+    AppLog.instance.info('share', '分享导入完成：成功 $ok / ${items.length}');
     return ok;
   }
 

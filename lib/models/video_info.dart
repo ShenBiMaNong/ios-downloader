@@ -4,7 +4,7 @@ class VideoInfo {
   final String frameUrl;
   final String pageTitle;
 
-  /// mp4 / m3u8 / other
+  /// m3u8 / mpd / mp4（直链文件：mp4/mkv/flv/ts…均视为可直接下载） / other
   final String kind;
 
   VideoInfo({
@@ -16,7 +16,11 @@ class VideoInfo {
   static String _kindOf(String url) {
     final u = url.toLowerCase();
     if (u.contains('.m3u8')) return 'm3u8';
-    if (RegExp(r'\.(mp4|mov|webm)([?#]|$)').hasMatch(u)) return 'mp4';
+    if (u.contains('.mpd')) return 'mpd';
+    if (RegExp(r'\.(mp4|mov|webm|mkv|flv|f4v|m4v|ts|m2ts|mts|mpg|mpeg|avi|wmv|asf|3gp|3g2|ogv|ogm|rm|rmvb)([?#]|$)')
+        .hasMatch(u)) {
+      return 'mp4';
+    }
     return 'other';
   }
 
