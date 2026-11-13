@@ -358,7 +358,9 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
     // 切「静音 / 显示进度」时还有任务在跑：等全部结束再换 session
     if taskIds.isEmpty && pendingRebuild {
       pendingRebuild = false
-      session = Self.makeSession(silent: silent, delegate: self)
+      // 此方法的 session 参数（URLSession，隐式 let）会遮蔽同名实例属性，
+      // 必须写 self.session 才能给属性重新赋值。
+      self.session = Self.makeSession(silent: silent, delegate: self)
     }
   }
 }
