@@ -37,7 +37,9 @@ class HlsTask {
   final String taskId;
   final String url;
   final String title;
+  final DateTime startedAt;
   double progress = 0;
+  Duration? eta; // 按进度速率估算
   bool done = false;
   bool failed = false;
 
@@ -45,7 +47,8 @@ class HlsTask {
     required this.taskId,
     required this.url,
     required this.title,
-  });
+    DateTime? startedAt,
+  }) : startedAt = startedAt ?? DateTime.now();
 }
 
 /// HLS 离线下载管理（MVP-2）
@@ -58,6 +61,7 @@ class HlsManager extends ChangeNotifier {
 
   final List<HlsTask> tasks = [];
   final Set<String> _started = {};
+  final Map<String, ({double p, DateTime t})> _lastSample = {};
 
   void _onEvent(Map<String, dynamic> e) {
     final id = e['taskId'] as String? ?? '';
@@ -70,7 +74,23 @@ class HlsManager extends ChangeNotifier {
     }
     if (task == null) return;
     if (e['progress'] is num) {
-      task.progress = (e['progress'] as num).toDouble();
+      final p = (e['progress'] as num).toDouble();
+      task.progress = p;
+      // 按进度速率估算剩余时间（AVAssetDownloadTask 不提供字节数）
+      final now = DateTime.now();
+      final prev = _lastSample[task.taskId];
+      if (prev != null) {
+        final dtMs = now.difference(prev.t).inMilliseconds;
+        if (dtMs >= 800) {
+          final rate = (p - prev.p) / (dtMs / 1000.0);
+          if (rate > 0 && p < 1) {
+            task.eta = Duration(seconds: ((1 - p) / rate).round());
+          }
+          _lastSample[task.taskId] = (p: p, t: now);
+        }
+      } else {
+        _lastSample[task.taskId] = (p: p, t: now);
+      }
       notifyListeners();
     }
     if (e['done'] == true) {

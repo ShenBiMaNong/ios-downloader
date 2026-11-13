@@ -2,7 +2,6 @@ import 'package:material_ui/material_ui.dart';
 
 import 'models/video_info.dart';
 import 'pages/browser_page.dart';
-import 'pages/downloads_page.dart';
 import 'pages/library_page.dart';
 import 'services/download_manager.dart';
 import 'services/hls_manager.dart';
@@ -47,7 +46,6 @@ class _HomeShellState extends State<HomeShell> {
     super.initState();
     _pages = [
       BrowserPage(key: _browserKey),
-      const DownloadsPage(),
       const LibraryPage(),
     ];
     WidgetsBinding.instance.addPostFrameCallback((_) => _checkClipboard());
@@ -146,14 +144,9 @@ class _HomeShellState extends State<HomeShell> {
             label: '浏览器',
           ),
           NavigationDestination(
-            icon: Icon(Icons.download_outlined),
-            selectedIcon: Icon(Icons.download),
-            label: '下载',
-          ),
-          NavigationDestination(
             icon: Icon(Icons.video_library_outlined),
             selectedIcon: Icon(Icons.video_library),
-            label: '本地库',
+            label: '资源库',
           ),
         ],
       ),

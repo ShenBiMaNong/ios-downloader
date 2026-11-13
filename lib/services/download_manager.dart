@@ -15,8 +15,11 @@ class DownloadTask {
   final String url;
   final String title;
   final String kind;
+  final DateTime startedAt;
   String? localPath;
   double progress = 0;
+  double speed = 0; // 字节/秒（仅 mp4 直链）
+  Duration? eta;
   DownloadStatus status = DownloadStatus.queued;
   String? error;
 
@@ -25,7 +28,8 @@ class DownloadTask {
     required this.url,
     required this.title,
     required this.kind,
-  });
+    DateTime? startedAt,
+  }) : startedAt = startedAt ?? DateTime.now();
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -109,6 +113,8 @@ class DownloadManager extends ChangeNotifier {
     final cancel = CancelToken();
     _cancels[task.id] = cancel;
     final dir = await downloadsDir();
+    var lastBytes = 0;
+    var lastTime = DateTime.now();
 
     var fileName = _safeName(task.title.isNotEmpty ? task.title : task.url);
     if (!fileName.toLowerCase().endsWith('.mp4')) fileName = '$fileName.mp4';
@@ -125,6 +131,23 @@ class DownloadManager extends ChangeNotifier {
         ),
         onReceiveProgress: (received, total) {
           task.progress = total > 0 ? received / total : 0;
+          // 网速与预计剩余时间（每 ~1s 采样一次）
+          final now = DateTime.now();
+          final dtMs = now.difference(lastTime).inMilliseconds;
+          if (dtMs >= 800) {
+            final dBytes = received - lastBytes;
+            if (dBytes > 0 && dtMs > 0) {
+              task.speed = dBytes / (dtMs / 1000.0);
+              if (total > 0) {
+                final rem = total - received;
+                task.eta = rem > 0 && task.speed > 0
+                    ? Duration(seconds: (rem / task.speed).round())
+                    : null;
+              }
+            }
+            lastBytes = received;
+            lastTime = now;
+          }
           notifyListeners();
         },
       );

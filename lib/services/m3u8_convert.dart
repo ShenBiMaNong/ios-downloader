@@ -15,7 +15,12 @@ class ConvertTask {
   final String id;
   final String url;
   final String title;
+  final DateTime startedAt;
   double progress = 0; // 0~1（分片下载阶段）
+  double speed = 0; // 字节/秒（分片下载阶段）
+  Duration? eta;
+  int doneSegments = 0;
+  int totalSegments = 0;
   bool done = false;
   bool failed = false;
   String? error;
@@ -25,7 +30,8 @@ class ConvertTask {
     required this.id,
     required this.url,
     required this.title,
-  });
+    DateTime? startedAt,
+  }) : startedAt = startedAt ?? DateTime.now();
 }
 
 /// m3u8 → mp4（MVP-3）：
@@ -74,10 +80,14 @@ class ConvertManager extends ChangeNotifier {
       final segs = _parseSegments(mediaUrl, mediaText);
       if (segs.isEmpty) throw Exception('清单中没有可下载的分片');
 
-      // 3) 并发下载分片（批 4 个）
+      // 3) 并发下载分片（批 4 个），统计网速与预计剩余
       final urls = segs.map((s) => s.url).toList();
       final names = segs.map((s) => s.name).toList();
+      task.totalSegments = urls.length;
       var done = 0;
+      var cumulative = 0;
+      var lastBytes = 0;
+      var lastTime = DateTime.now();
       for (var i = 0; i < urls.length; i += 4) {
         final batch = <Future<void>>[];
         for (var j = i; j < urls.length && j < i + 4; j++) {
@@ -85,7 +95,30 @@ class ConvertManager extends ChangeNotifier {
         }
         await Future.wait(batch);
         done += batch.length;
+        task.doneSegments = done;
         task.progress = done / urls.length;
+        var batchBytes = 0;
+        for (var j = i; j < urls.length && j < i + 4; j++) {
+          try {
+            batchBytes += File(p.join(work.path, names[j])).lengthSync();
+          } catch (_) {}
+        }
+        cumulative += batchBytes;
+        final now = DateTime.now();
+        final dtMs = now.difference(lastTime).inMilliseconds;
+        if (dtMs >= 800) {
+          final dBytes = cumulative - lastBytes;
+          if (dBytes > 0 && dtMs > 0) {
+            task.speed = dBytes / (dtMs / 1000.0);
+            if (done > 0 && task.speed > 0) {
+              final avg = cumulative / done;
+              final remBytes = avg * (urls.length - done);
+              task.eta = Duration(seconds: (remBytes / task.speed).round());
+            }
+          }
+          lastBytes = cumulative;
+          lastTime = now;
+        }
         notifyListeners();
       }
 
