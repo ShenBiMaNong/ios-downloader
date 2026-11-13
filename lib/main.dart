@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'pages/browser_page.dart';
 import 'pages/downloads_page.dart';

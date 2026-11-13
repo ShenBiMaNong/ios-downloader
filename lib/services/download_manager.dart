@@ -135,7 +135,7 @@ class DownloadManager extends ChangeNotifier {
         task.status = DownloadStatus.done;
         task.progress = 1;
         final meta = task.toJson();
-        await File(p.join(dir.path, '$id.json')).writeAsString(jsonEncode(meta));
+        await File(p.join(dir.path, '${task.id}.json')).writeAsString(jsonEncode(meta));
       } else {
         throw Exception('文件为空');
       }

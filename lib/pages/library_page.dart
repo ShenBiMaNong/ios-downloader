@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../services/download_manager.dart';
 import 'player_page.dart';
@@ -81,7 +81,7 @@ class _LibraryPageState extends State<LibraryPage> {
                           if (path.isEmpty) return;
                           Navigator.push(
                             context,
-                            MaterialPageRoute(
+                            MaterialPageRoute<void>(
                               builder: (_) => PlayerPage(path: path, title: title),
                             ),
                           );
