@@ -30,8 +30,17 @@ jobs:
       - name: Test
         run: flutter test
 
-      - name: Build unsigned IPA
-        run: flutter build ipa --no-codesign --release
+      - name: Build unsigned app
+        # flutter build ipa --no-codesign 在 3.50 只产 xcarchive 不产 ipa，故手动组装
+        run: flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -r Runner.ipa Payload
+          mkdir -p build/ios/ipa
+          mv Runner.ipa build/ios/ipa/Runner.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
