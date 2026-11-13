@@ -96,7 +96,13 @@
 
   try {
     var mo = new MutationObserver(collect);
-    mo.observe(document.documentElement, { childList: true, subtree: true });
+    // childList 覆盖动态插入的 <video>；attributes 覆盖点击播放后才赋值的 src
+    mo.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src']
+    });
   } catch (e) {}
 
   // 钩住 fetch：很多播放器/站点用 fetch 取 m3u8 / mp4；响应头 MIME 兜底
@@ -184,6 +190,17 @@
     }
   }, 2000);
   collect();
+
+  // 懒加载站点：点击播放后才创建播放器/发起媒体请求 → 点击后立即重扫 + 扩散，
+  // 把「点击 → 识别」的延迟从最长 2s 压到毫秒级（播放器 src 赋值由属性观察覆盖）
+  document.addEventListener('click', function () {
+    setTimeout(function () {
+      collect();
+      if (window.__vdlSniffSource) {
+        try { window.__vdlSniffPropagate(window.__vdlSniffSource); } catch (e) {}
+      }
+    }, 60);
+  }, true);
 
   // 首次注入后立即扩散（源码由 Dart 侧注入时传入 window.__vdlSniffSource）
   if (window.__vdlSniffSource) {

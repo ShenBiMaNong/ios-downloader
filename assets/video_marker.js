@@ -310,6 +310,8 @@
   }
 
   function update() {
+    // 清理后（开关关闭）不再重建角标：click/play/观察器等残留监听可能仍会触发
+    if (!window.__vdlMarkerInstalled) return;
     if (!document.body) return;
     var videos = document.querySelectorAll('video');
     for (var i = 0; i < videos.length; i++) {
@@ -349,6 +351,30 @@
     update();
   }, 1000);
 
+  // 懒加载站点：点击播放后才挂 src / 创建播放器 → 即时刷新 + 扩散
+  function onQuick() {
+    setTimeout(function () {
+      update();
+      if (window.__vdlMarkerSource) {
+        try { window.__vdlMarkerPropagate(window.__vdlMarkerSource); } catch (e) {}
+      }
+    }, 60);
+  }
+  document.addEventListener('click', onQuick, true);
+  document.addEventListener('play', onQuick, true);
+
+  // <video>/<source> 的 src 属性变化（点击播放后赋值）→ 即时出角标
+  var srcObserver = null;
+  try {
+    srcObserver = new MutationObserver(function () { update(); });
+    srcObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src']
+    });
+  } catch (e) {}
+
   // 全屏播放时隐藏标记
   function fsEvt() {
     var fs = !!(document.fullscreenElement || document.webkitFullscreenElement);
@@ -362,6 +388,9 @@
     window.clearInterval(timer);
     window.removeEventListener('scroll', update, true);
     window.removeEventListener('resize', update);
+    document.removeEventListener('click', onQuick, true);
+    document.removeEventListener('play', onQuick, true);
+    if (srcObserver) { try { srcObserver.disconnect(); } catch (e) {} }
     var st = document.getElementById('vdl-style');
     if (st && st.parentNode) st.parentNode.removeChild(st);
     var el = document.querySelectorAll('.vdl-badge, .vdl-card');
