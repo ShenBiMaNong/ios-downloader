@@ -19,6 +19,7 @@ dependencies:
   # 本地播放
   video_player: ^2.9.2
   material_ui: ^1.11.0
+  ffmpeg_kit_flutter_new_min: ^3.6.8
 
 dev_dependencies:
   flutter_test:

@@ -7,6 +7,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 import '../models/video_info.dart';
 import '../services/download_manager.dart';
 import '../services/hls_manager.dart';
+import '../services/m3u8_convert.dart';
 
 /// 内置浏览器 + 视频嗅探页
 class BrowserPage extends StatefulWidget {
@@ -199,14 +200,39 @@ class _BrowserPageState extends State<BrowserPage> {
                         v.kind.toUpperCase(),
                         style: const TextStyle(fontSize: 12),
                       ),
-                      trailing: IconButton(
-                        icon: const Icon(Icons.download),
-                        tooltip: '下载',
-                        onPressed: () {
-                          Navigator.pop(ctx);
-                          _startDownload(v);
-                        },
-                      ),
+                      trailing: v.isHls
+                          ? Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  icon: const Icon(Icons.download),
+                                  tooltip: 'HLS 离线缓存',
+                                  onPressed: () {
+                                    Navigator.pop(ctx);
+                                    _startDownload(v);
+                                  },
+                                ),
+                                IconButton(
+                                  icon: const Icon(Icons.transform),
+                                  tooltip: '转 MP4',
+                                  onPressed: () {
+                                    Navigator.pop(ctx);
+                                    ConvertManager.instance.convert(v);
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(content: Text('已开始 m3u8 → mp4 转换，进度见「下载」页')),
+                                    );
+                                  },
+                                ),
+                              ],
+                            )
+                          : IconButton(
+                              icon: const Icon(Icons.download),
+                              tooltip: '下载',
+                              onPressed: () {
+                                Navigator.pop(ctx);
+                                _startDownload(v);
+                              },
+                            ),
                     );
                   },
                 ),

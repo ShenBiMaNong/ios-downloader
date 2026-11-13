@@ -2,20 +2,23 @@ import 'package:material_ui/material_ui.dart';
 
 import '../services/download_manager.dart';
 import '../services/hls_manager.dart';
+import '../services/m3u8_convert.dart';
 
-/// 下载任务列表页（mp4 直链 + HLS 离线）
+/// 下载任务列表页（mp4 直链 + HLS 离线 + m3u8 转 mp4）
 class DownloadsPage extends StatelessWidget {
   const DownloadsPage({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final merged = Listenable.merge([DownloadManager.instance, HlsManager.instance]);
+    final merged = Listenable.merge(
+        [DownloadManager.instance, HlsManager.instance, ConvertManager.instance]);
     return ListenableBuilder(
       listenable: merged,
       builder: (context, _) {
         final mp4 = DownloadManager.instance.tasks;
         final hls = HlsManager.instance.tasks;
-        final empty = mp4.isEmpty && hls.isEmpty;
+        final converts = ConvertManager.instance.tasks;
+        final empty = mp4.isEmpty && hls.isEmpty && converts.isEmpty;
         return Scaffold(
           appBar: AppBar(title: const Text('下载')),
           body: empty
@@ -25,6 +28,10 @@ class DownloadsPage extends StatelessWidget {
                     if (hls.isNotEmpty) ...[
                       const _SectionTitle('HLS 离线下载'),
                       ...hls.map((t) => _HlsTile(task: t)),
+                    ],
+                    if (converts.isNotEmpty) ...[
+                      const _SectionTitle('m3u8 → mp4'),
+                      ...converts.map((t) => _ConvertTile(task: t)),
                     ],
                     if (mp4.isNotEmpty) ...[
                       const _SectionTitle('mp4 直链'),
@@ -90,6 +97,36 @@ class _HlsTile extends StatelessWidget {
             ),
         ],
       ),
+    );
+  }
+}
+
+class _ConvertTile extends StatelessWidget {
+  final ConvertTask task;
+  const _ConvertTile({required this.task});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      leading: Icon(
+        task.done
+            ? Icons.check_circle
+            : task.failed
+                ? Icons.error
+                : Icons.transform,
+        color: task.done
+            ? Colors.green
+            : task.failed
+                ? Colors.red
+                : Colors.teal,
+      ),
+      title: Text(task.title.isNotEmpty ? task.title : task.url,
+          maxLines: 1, overflow: TextOverflow.ellipsis),
+      subtitle: task.failed
+          ? Text(task.error ?? '转换失败', style: const TextStyle(color: Colors.red))
+          : task.done
+              ? const Text('已完成（本地库可播放）')
+              : LinearProgressIndicator(value: task.progress),
     );
   }
 }
