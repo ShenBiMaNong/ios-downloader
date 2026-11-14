@@ -159,23 +159,45 @@ void main() {
     await first;
   });
 
+  /// 轮询等待真实异步完成：testWidgets 跑在 fake-async zone 里，
+  /// 只有让出到 runAsync 并 pump，资产读取 / 文件 IO 的后续才会被推进
+  /// （与 browser_page_navigation_test 里的 waitFor 同一做法）
+  Future<void> waitFor(WidgetTester tester, bool Function() ready) async {
+    for (var i = 0; i < 50; i++) {
+      if (ready()) return;
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      await tester.pump();
+    }
+  }
+
   testWidgets('冷启动按设置恢复上次打开页，而不是默认首页 bilibili', (tester) async {
+    // 存档必须用同步 API 写：testWidgets 的 body 在 fake-async zone 里执行，
+    // 真实文件 IO 的异步后续不会自己完成，`await dir.create(...)` 会一直挂到
+    // 10 分钟框架超时（CI 上就是这么超时的，不是断言失败）
     final dir = Directory(p.join(docs.path, 'AppData'));
-    await dir.create(recursive: true);
-    await File(p.join(dir.path, 'appdata.json'))
-        .writeAsString(jsonEncode({'lastUrl': 'https://example.com/watch/42'}));
+    dir.createSync(recursive: true);
+    File(p.join(dir.path, 'appdata.json'))
+        .writeAsStringSync(jsonEncode({'lastUrl': 'https://example.com/watch/42'}));
 
     final platform = _FakeWebViewPlatform();
     WebViewPlatform.instance = platform;
     AppSettings.instance.browserStartPage = BrowserStartPage.lastPage;
 
+    // 首帧也在真实异步环境里 pump：initState 会读 assets / appdata.json
     await tester.runAsync(() async {
       await tester.pumpWidget(const MaterialApp(home: BrowserPage()));
       await Future<void>.delayed(const Duration(milliseconds: 80));
     });
-    await tester.pumpAndSettle();
+    // 不再用 pumpAndSettle 兜底：存档加载若没走完，settle 只会空转，
+    // 用有界轮询把失败落成一条可读的断言
+    await waitFor(
+      tester,
+      () => platform.controller != null && platform.controller!.loaded.isNotEmpty,
+    );
 
-    expect(platform.controller!.loaded, isNotEmpty);
+    expect(platform.controller!.loaded, isNotEmpty, reason: '启动页应发起一次加载');
     expect(
       platform.controller!.loaded.first,
       'https://example.com/watch/42',
