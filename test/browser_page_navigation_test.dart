@@ -72,7 +72,11 @@ class _FakeController extends PlatformWebViewController {
   }
 
   @override
-  Future<void> addJavaScriptChannel(JavaScriptChannelParams params) async {}
+  Future<void> addJavaScriptChannel(JavaScriptChannelParams params) async {
+    // 必须真记下来：产品代码的通道注册走 WebViewController.addJavaScriptChannel
+    // → platform.addJavaScriptChannel，fake 不记就等于测试里永远查不到通道。
+    channels[params.name] = params.onMessageReceived;
+  }
 
   @override
   Future<void> loadRequest(LoadRequestParams params) async {
@@ -350,6 +354,13 @@ void main() {
     // 测试环境没有 iOS 原生桥（MissingPluginException）→ 走 Dart 侧兜底注入，
     // 这段脚本要注销 ServiceWorker + 删光 CacheStorage。注意它跑在「重置前那个实例」上，
     // 所以按实例查会查不到，要看历次控制器的调用记录。
+    // 兜底注入前面还挂着一个桥调用（异常回抛要等真实 IO），fake-async 下不会自己走完，
+    // 按本文件既有做法用 waitFor 让出事件循环轮询。
+    await waitFor(
+      tester,
+      () => platform.controllers.any((c) =>
+          c.jsCalls.any((s) => s.contains('navigator.serviceWorker.getRegistrations'))),
+    );
     final js = platform.controllers.expand((c) => c.jsCalls).toList();
     expect(
       js.any((s) =>

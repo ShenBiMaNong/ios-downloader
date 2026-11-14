@@ -696,26 +696,30 @@ class BrowserPageState extends State<BrowserPage> {
 
   /// iOS：原生侧注销 ServiceWorker + 清 HTTP 缓存（保留 Cookie），返回是否清成功。
   /// 非 iOS 无此桥接 → 只做页内注销，重建实例那一步照样有效。
+  ///
+  /// 「桥没成功」的形态不止一种：通道未注册抛 MissingPluginException、原生侧执行报错、
+  /// 假死导致超时、回包为空。这些都同一条兜底路 —— 页内自己注销。以前只认
+  /// MissingPluginException，于是 iOS 上一次桥失败就等于静默放弃了 ServiceWorker 清理，
+  /// 而它正是「刷新也治不好」那半条成因。
   Future<bool> _resetWebsiteData() async {
+    String? status;
     try {
       // 回包是状态串（sw=页内注销结果 cache=清缓存），出问题时日志能分清哪步没成
-      final status = await _sniffBridge
+      status = await _sniffBridge
           .invokeMethod<String>('resetWebsiteData', [_serviceWorkerCleanupJs])
           .timeout(const Duration(seconds: 8));
-      if (status == null) return false;
+    } on TimeoutException {
+      AppLog.instance.warn('browser', '重置：原生清缓存超时，改走页内注销 + 重建 WebView');
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '重置：原生清网站数据不可用，改走页内注销', e, st);
+    }
+    if (status != null) {
       AppLog.instance.info('browser', '重置：原生清网站数据 $status');
       return true;
-    } on MissingPluginException {
-      await _timebox(
-          () => _controller.runJavaScript(_serviceWorkerCleanupJs), '注销 ServiceWorker');
-      return false;
-    } on TimeoutException {
-      AppLog.instance.warn('browser', '重置：原生清缓存超时，直接重建 WebView');
-      return false;
-    } catch (e, st) {
-      AppLog.instance.warn('browser', '重置：清理网站缓存失败', e, st);
-      return false;
     }
+    await _timebox(
+        () => _controller.runJavaScript(_serviceWorkerCleanupJs), '注销 ServiceWorker');
+    return false;
   }
 
   /// 跳转拦截：脚本发现「非用户点击」的自动跳转时回调。
