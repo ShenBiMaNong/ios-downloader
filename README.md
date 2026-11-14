@@ -30,6 +30,9 @@
 | M6.19 | 角标「刷新后不出、设置项关了又开就有了」——按用户实测线索定位到**注入链路与元素收集**，四类根因一起修：① marker 只靠 `onPageStarted/onPageFinished` 的 `runJavaScript` 注入，导航竞态下脚本打在旧文档上；改为 **WKUserScript 全帧 atDocumentStart 注入**（每个新文档自动装），`onPageFinished` 后 1.2s 再补一次兜底。② `_injectMarker` 注入/清理两次调用并发时完成顺序不定（关→开可能变成「先注入后清理」），改为 **Future 链串行**。③ `__vdlBadge` 残留（指向已脱离文档的 badge）让 `if (!badge)` 永远走不进去、不再重建 —— 开关的 cleanup 恰好清残留，所以「关→开就好了」；`update()` 增加自愈：无跟踪角标时清光残留重建。④ 收集面补齐：`attachShadow` 钩子 + 兜底扫描抓 **shadow root 内的 `<video>`**（自绘播放器）；`video.srcObject`（`src`/`currentSrc` 全空）不再被当「没地址」；同源 iframe 内视频由主帧收集且**坐标逐级换算 frameElement 偏移**。诊断升级为 tag/shadow/frames/playing/srcObj/原生全屏，「点播放没角标」一次日志定位 | 已实现（jsdom 回归 E1–E4/F1–F2 六场景通过，待真机验证） |
 | M6.20 | HLS 转 MP4「仍要合成」：分片部分下载失败后，失败条目出「仍要合成（缺 N 片）」入口（行内按钮 + 菜单），`ConvertManager.mergeAnyway` 把本地清单**过滤成磁盘上真实存在的分片子集**（缺失/空分片连同其 #EXTINF/#EXT-DISCONTINUITY 丢掉；#EXT-X-KEY 立即保留——密钥对其后所有分片生效）后强制出片，正常入库并清理工作目录。代价在确认框说清：合成后不能续传补片、缺片处时长偏短/跳跃，AES-128 无显式 IV 时 IV=片序号、从缺失位置起可能解密失败（HLS 协议层限制）。`failedSegments`/`canForceMerge` 持久化（重启按钮不丢），与 retry 互斥去重；合成失败回到失败态、按钮保留 | 已实现（🔴 待编译与真机验证；已知边界：旧任务绕过 retry 直接强合会踩未重写的本地清单（fMP4 无 MAP），需 retry 重写后再强合） |
 | M6.21 | 浏览器手势导航：WebView 区域内**右滑=后退、左滑=前进**（与地址栏按钮同语义）。JS 注入检测水平滑动（`browser_swipe.js`，WKUserScript 全帧 + onPageFinished 兜底），经 `browserGesture` 通道触发 `goBack/goForward`。防误触：输入框/contenteditable、文本选区、多点触控、慢速拖拽（>800ms）、纵向主导、位移 <80px 均不触发；横向滚动容器（轮播/横滑列表）该方向未到边界时手势让给页面滚动，到边界才导航；触发后吞掉合成 click 防误触链接 | 已实现（jsdom 回归 13 场景通过，🔴 待 Xcode 编译与真机验证） |
+| M6.22 | m3u8 转 MP4 默认走系统级后台下载：iOS 上「直接转 MP4」不再由 Dart 批下分片，而是解析清单后一次性提交给原生 `background URLSession`（锁屏/切 App/进程被回收仍继续传输），分片齐备后同样在前台 `ffmpeg -c copy` 合成——亮屏时 `ready` 事件即时触发，锁屏期间下完则回前台对账触发。原生通道不可用（非 iOS / 桥未注册 / 模拟器）时**就地降级**为原 Dio 前台链路并把降级写进断点记录，避免「不支持后台」变成用户可见的下载失败。入口随之收敛为一个：页内角标卡与剪贴板面板去掉并列的「后台下载并转 MP4」 | 已实现（🔴 待 Xcode 编译与真机验证） |
+| M6.23 | 浏览器「更多」菜单新增**强制重置浏览器状态**：治「页面加载一半就卡住、点刷新也没用」。刷新治不好是因为它只调 `reload()`，三条成因一条都不动——渲染进程假死、坏缓存/ServiceWorker 把半截响应喂给每个新文档、半截导航还占着连接。重置按序做四件事：原生 `stopLoading` → 页内注销 ServiceWorker + 删光 CacheStorage（按源清，WebKit 没有对应的 WKWebsiteDataType） → 清 HTTP 内存/磁盘缓存与 SW 注册 → **销毁并重建 WebView 实例**（换新渲染进程，这是唯一能治假死的手段），250ms 后重新加载原地址。`Cookies/LocalStorage/IndexedDB` 有意不动（自救按钮不该把已登录站点全登出）；代价是前进/后退历史随旧实例销毁。每步都限时（假死时调用可能永不返回，宁可跳过也要走到重建），结果状态串进 App 日志（`sw=ok/partial/err/timeout/skipped`）。重建后必须在新实例上重装 WKUserScript，否则新页面没角标 | 已实现（新增 3 例 widget 用例覆盖「换实例 + 重载原地址 + 取消不动」，🔴 本机无 Flutter 未跑 `flutter test`，待 CI 编译与真机验证） |
+| M6.24 | mp4 直链下载接入系统级后台：iOS 上「下载视频」不再走 Dio 前台流（锁屏即断），改为提交**单文件原生作业**给同一个 `background URLSession`（`singleFile` 标记，落盘文件即产物，无清单无合成）。进度改由 `getAllTasks` 的 `countOfBytesReceived/ExpectedToReceive` 提供——单文件作业在下载期间磁盘上一直没有增量，只看文件的旧口径会全程 0%；总量拿不到时退回「已下 X B」不显示百分比。暂停走 `cancel(byProducingResumeData:)` 存断点数据、继续走 `downloadTask(withResumeData:)`；原生侧把主动取消（-999）与真实失败分开，暂停不会再被标成错误。下完由 Dart 把中间文件搬进 Downloads 唯一名并写元数据，与 Dio 链产物同格式。通道不可用（非 iOS/模拟器）就地降级回 Dio 链 | 已实现（🔴 待 Xcode 编译与真机验证） |
 
 ## 架构
 
@@ -46,7 +49,7 @@
   接管时把当前帧地址作为 `Referer` 一并回传 —— 跨域 iframe 播放器用主框架地址会 403。
   ⚠️ 已知边界：接管后若 App 侧起播失败（CDN 403、DRM 等），页面视频已被拦下，需关掉开关并刷新页面才能恢复。
 - 手势导航（M6.21）：[assets/browser_swipe.js](assets/browser_swipe.js) 在 capture 阶段跟踪 touch，水平位移 ≥80px 且横向主导（|dy| ≤ 0.7×|dx|）、800ms 内完成才判定为滑动；右滑→`goBack`、左滑→`goForward`。横向滚动容器在该方向未到边界时手势让给页面（轮播/地图不误触），触发后 400ms 窗口吞掉合成 click。
-- 下载：mp4 直链走 Dio（带移动端 UA），存到 `Documents/Downloads/`，元数据存 `<id>.json`。
+- 下载：mp4 直链在 iOS 上提交给原生 `background URLSession` 的单文件作业（M6.24，锁屏后系统继续传、暂停走 `resumeData` 续传），产物由 Dart 搬进 `Documents/Downloads/<唯一名>.mp4` 并写 `<id>.json`；非 iOS 与原生通道不可用时仍走 Dio（带移动端 UA + Range 断点续传）。两条链的元数据格式一致，资源库不区分来源。
 - 本地库：path_provider 扫描元数据 + video_player 播放。
 
 ## 构建 & 安装（Windows 开发机）
@@ -68,7 +71,16 @@ flutter build apk       # 顺带出 Android 包
 
 ## 已知限制 / 待办
 
-- HLS(m3u8) 与 `blob:`(MSE) 视频暂不支持下载（MVP-2 接入 AVAssetDownloadTask；blob: 无解，降级提示）。
+- `blob:`(MSE) 本身不可下载：只能靠嗅探兜底到它背后的直链/清单（证据分级见上），取不到地址就只做播放接管，卡片上给降级提示。
+  HLS(m3u8) 已支持：分片包下载、转 MP4（iOS 走系统级后台传输）、系统离线缓存（`.movpkg`，不可导出）三条产物。
+- 系统级后台（iOS 上 HLS 转 MP4 与 mp4 直链共用同一个 `background URLSession`）只覆盖**传输**阶段：
+  合成 `-c copy` 必须回 App 前台跑；锁屏期间 `didWriteData` 不回调，进度数字原地不动属预期，
+  回前台按原生侧状态对账；用户从多任务界面强杀 App 会取消该 session 全部传输且不自动重启
+  （分片与断点数据已落盘，点「继续」可续传）。
+- 续传凭据绑的是**原始请求**：签名 URL 在后台过期后，续传依旧 403；此时只能回页面刷新重新
+  嗅探、新建一条下载（直链换地址等于从头下，已下字节不作数）。
+- 安卓侧 mp4 直链仍是 Dio 前台链（只有 `beginBackgroundTask` 的约 30 秒宽限），锁屏即中断，
+  靠 `.part` + Range 续传；iOS 上原生通道不可用（模拟器 / 桥未注册）时也按这条降级。
 - 分享扩展依赖付费账号的 App Groups 才能走标准路线，免费账号用剪贴板降级方案（MVP-4）。
 - 各平台（抖音/快手/B站/YouTube）分享链接解析为逆向接口，易变，建议后续服务端化。
 

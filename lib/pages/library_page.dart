@@ -580,7 +580,7 @@ class _LibraryPageState extends State<LibraryPage> {
       frameUrl: '',
       pageTitle: it.sortName,
     ));
-    _toast('已开始重新下载');
+    _toast(Platform.isIOS ? '已重新下载，锁屏后继续' : '已开始重新下载');
   }
 
   /// 「仍要合成」确认框：缺片出片是一次性决定，代价必须先说清

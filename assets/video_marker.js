@@ -691,14 +691,15 @@
       html += '</div>';
     }
     if (info.kind === 'hls') {
-      // HLS 四种产物，别混为一谈：
-      //  bg      → 原生 background URLSession 下分片（锁屏/切 App 继续），回前台自动转 mp4
+      // HLS 三种产物，别混为一谈：
       //  package → 自己下 .ts 分片包存 Downloads，可离线、可随时「本地转 MP4」
-      //  convert → 下分片后直接 ffmpeg 转封装成单个 mp4（中间分片用完即删）
+      //  convert → 转成单个 mp4（中间分片用完即删）。iOS 上分片由原生 background
+      //            URLSession 代跑，锁屏 / 切 App 继续下载，齐备后回前台 -c copy
+      //            合成；非 iOS 没有系统级后台传输，这条就是前台下完直接出片。
+      //            入口对用户只有一个，不要再并列一个「后台下载」按钮。
       //  hls     → 系统 AVAssetDownloadTask 的 .movpkg，只能 AVFoundation 播，不能导出
-      html += '<button class="vdl-btn hl" data-a="bg">后台下载并转 MP4</button>';
+      html += '<button class="vdl-btn hl" data-a="convert">直接转 MP4（锁屏继续下载）</button>';
       html += '<button class="vdl-btn" data-a="package">下载 m3u8 分片（可转 MP4）</button>';
-      html += '<button class="vdl-btn hl" data-a="convert">直接转 MP4（单文件）</button>';
       html += '<button class="vdl-btn" data-a="hls">系统离线缓存（仅播放，不可导出）</button>';
     } else if (info.kind === 'dash') {
       html += '<div class="vdl-card-n" style="padding:10px 12px;">DASH 流（.mpd）暂不支持离线下载，可复制清单链接自行处理。</div>';

@@ -409,7 +409,7 @@ async function runAttrMarker() {
   console.log('转义还原   =', d4esc ? d4esc.url : '(未找到)',
     d4esc && d4ok ? '✅' : '❌');
 
-  const d5ok = d5.label.indexOf('HLS') === 0 && d5.actions.indexOf('bg') >= 0 &&
+  const d5ok = d5.label.indexOf('HLS') === 0 && d5.actions.indexOf('convert') >= 0 &&
     d5.cardUrl === d1.live;
   console.log('===== 场景 D5：标记层（角标 + 卡片）=====');
   console.log('角标文案 :', d5.label, '| 动作 :', d5.actions.join(', '));

@@ -30,8 +30,13 @@ class ConvertTask {
   /// 页面播放器报告的时长（秒），0 = 未知。用于核对清单是不是同一个视频。
   final double pageDur;
 
-  /// remote: 远程 m3u8 URL → mp4；local: 本地 m3u8 → mp4；package: 下载 m3u8 分片包
-  final String mode;
+  /// remote: 远程 m3u8 URL → mp4（Dio 前台链路）；local: 本地 m3u8 → mp4；
+  /// package: 下载 m3u8 分片包；native: 原生 background URLSession 下分片。
+  ///
+  /// 可变：iOS 上「m3u8 转 MP4」先按 native 提交，原生通道不可用时就地降级为
+  /// remote（见 _runNative）。降级必须写进断点记录，否则重启后冷启动对账会把它
+  /// 当成「作业记录丢失」的后台作业报错，而它其实是个普通前台任务。
+  String mode;
 
   double progress = 0; // 0~1（分片下载阶段）
   double speed = 0; // 字节/秒（分片下载阶段）
@@ -197,15 +202,32 @@ class ConvertManager extends ChangeNotifier {
 
   // ---------- 入口 ----------
 
-  /// 远程 m3u8 URL → mp4
-  Future<void> convert(VideoInfo v) => _start(
-        mode: 'remote',
-        key: v.url,
-        url: v.url,
-        title: v.pageTitle.isNotEmpty ? v.pageTitle : 'HLS视频',
-        referer: v.effectiveReferer,
-        pageDur: v.duration,
-      );
+  /// 远程 m3u8 URL → mp4。
+  ///
+  /// iOS：分片交给原生 background URLSession（系统进程代跑传输），锁屏 / 切 App /
+  /// 进程被回收后仍继续下载；分片齐备后由前台 ffmpeg `-c copy` 合成 —— 亮屏时事件
+  /// 即时触发（_onNativeEvent 的 ready 分支），锁屏期间下完则等回前台对账触发。
+  /// 其它平台没有系统级后台传输，留在 Dio 前台链路（下完同一次运行里直接出片）。
+  /// 两条链路的产物都是自有 mp4，入口对用户只有一个。
+  Future<void> convert(VideoInfo v) {
+    final mode = Platform.isIOS ? 'native' : 'remote';
+    // 后台作业提交后 Dart 侧不留长任务，_start 的 _active 只覆盖「提交中」这一小段，
+    // 所以还要按 url 查一次在途作业：重复 submit 会用新 id 覆盖同一 state.json，
+    // 既有作业变成孤儿（分片重下 + 列表出现两条同一视频）。
+    if (mode == 'native' &&
+        tasks.any((t) =>
+            t.mode == 'native' && t.url == v.url && !t.done && !t.failed)) {
+      return Future<void>.value();
+    }
+    return _start(
+      mode: mode,
+      key: v.url,
+      url: v.url,
+      title: v.pageTitle.isNotEmpty ? v.pageTitle : 'HLS视频',
+      referer: v.effectiveReferer,
+      pageDur: v.duration,
+    );
+  }
 
   /// 下载 m3u8 分片包（含密钥）到 Downloads，可离线本地转 mp4
   Future<void> downloadM3u8(VideoInfo v) => _start(
@@ -217,23 +239,8 @@ class ConvertManager extends ChangeNotifier {
         pageDur: v.duration,
       );
 
-  /// 原生 background URLSession 分片下载 → 回前台自动 -c copy 合成 mp4。
-  /// 锁屏 / 切 App / 系统回收后仍由系统进程继续下分片，产物是自有 mp4。
-  Future<void> nativeDownload(VideoInfo v) {
-    // _start 的 _active 只覆盖「提交中」这一小段；提交完 Dart 就退出了，
-    // 所以还要按 url 查一次在途作业，避免重复 submit 覆盖同一 state.json。
-    final dup = tasks.any((t) =>
-        t.mode == 'native' && t.url == v.url && !t.done && !t.failed);
-    if (dup) return Future<void>.value();
-    return _start(
-      mode: 'native',
-      key: v.url,
-      url: v.url,
-      title: v.pageTitle.isNotEmpty ? v.pageTitle : 'HLS视频',
-      referer: v.effectiveReferer,
-      pageDur: v.duration,
-    );
-  }
+  /// 兼容旧入口：原生后台链现在就是 convert() 在 iOS 上的默认走法。
+  Future<void> nativeDownload(VideoInfo v) => convert(v);
 
   /// 本地 m3u8 文件或包含 .m3u8 的文件夹 → mp4
   Future<void> convertLocal(String folderOrFile) {
@@ -802,7 +809,18 @@ class ConvertManager extends ChangeNotifier {
       headers: headers,
     ));
     if (!ok) {
-      throw Exception('后台下载不可用');
+      // 原生通道不可用（非 iOS / 桥未注册 / 模拟器）。这不是用户造成的错误，
+      // 不能让他看到「后台下载不可用」就完事：就地改走 Dio 前台链路，
+      // 已经解析好的清单和工作目录都在，接着下分片并同一次运行里合成 mp4。
+      // 降级要落到断点记录，否则重启后对账会把这个任务当成「作业记录丢失」。
+      AppLog.instance.warn(
+          'convert', '原生后台通道不可用，降级为前台下载: ${task.title}');
+      task.mode = 'remote';
+      task.stage = '';
+      await _savePending(task);
+      await _convertRemote(task, work);
+      await _finishMp4(task, work);
+      return;
     }
     // 刻意不 await 下载完成：这一步交给系统，Dart 侧不留长任务。
     AppLog.instance.info(

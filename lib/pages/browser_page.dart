@@ -1,3 +1,4 @@
+import 'dart:async' show Timer, TimeoutException;
 import 'dart:convert';
 import 'dart:io' show Platform;
 
@@ -42,7 +43,14 @@ class BrowserPageState extends State<BrowserPage> {
 
   /// 地址栏焦点：用户正在输入时不覆盖他写的内容
   final _urlFocus = FocusNode();
-  late final WebViewController _controller;
+  late WebViewController _controller;
+
+  /// WebView 实例代次：强制重置时自增，并作为平台视图的 Key ——
+  /// Key 变了 Flutter 才会拆掉旧 WebView（连带它的数据存储会话与渲染进程）
+  int _viewEpoch = 0;
+
+  /// 强制重置进行中（防重入 + 地址栏下方出进度条）
+  bool _resetting = false;
   String? _sniffer;
   String? _adblock;
   String? _marker;
@@ -71,7 +79,19 @@ class BrowserPageState extends State<BrowserPage> {
   @override
   void initState() {
     super.initState();
-    _controller = WebViewController()
+    _controller = _newController();
+    AppData.instance.addListener(_onAppDataChanged);
+    // iOS：把自动播放拦截 + 嗅探脚本注册为 WKUserScript（atDocumentStart + 全帧含跨域 iframe），
+    // 必须在页面脚本之前执行；失败由 onPageStarted/onPageFinished 注入兜底
+    _installEarlyScripts();
+    _initStartPage();
+  }
+
+  /// 建一个 WebView 控制器并挂上导航代理 + JS 通道。
+  /// 单独成方法是因为「强制重置浏览器状态」要整个换掉 WebView 实例：
+  /// 只有重建平台视图才会把卡死的渲染进程一起丢掉，`reload()` 做不到。
+  WebViewController _newController() {
+    return WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (url) {
@@ -131,11 +151,6 @@ class BrowserPageState extends State<BrowserPage> {
       ..addJavaScriptChannel('browserGesture', onMessageReceived: (msg) {
         _handleBrowserGesture(msg.message);
       });
-    AppData.instance.addListener(_onAppDataChanged);
-    // iOS：把自动播放拦截 + 嗅探脚本注册为 WKUserScript（atDocumentStart + 全帧含跨域 iframe），
-    // 必须在页面脚本之前执行；失败由 onPageStarted/onPageFinished 注入兜底
-    _installEarlyScripts();
-    _initStartPage();
   }
 
   /// 按设置决定启动页：空白页 / 上次打开页（无记录时用默认首页兜底）
@@ -466,20 +481,8 @@ class BrowserPageState extends State<BrowserPage> {
           // 页内播放器继续播着会让系统一直挂「正在播放」媒体通知，且白耗流量
           await _pausePageVideos();
           DownloadManager.instance.download(v);
-          _toast('已加入下载');
-          break;
-        case 'bg':
-          // 原生 background URLSession 是 iOS 专有；Android 无对应桥接，
-          // 直接提交必然失败，降级为 Dart 侧分片包下载并明确告知用户。
-          await _pausePageVideos();
-          if (!Platform.isIOS) {
-            ConvertManager.instance.downloadM3u8(v);
-            _toast('不支持后台下载，已改为分片包');
-            break;
-          }
-          // 锁屏/切 App 后由系统继续下分片，齐备后回前台 ffmpeg -c copy 合成 mp4。
-          ConvertManager.instance.nativeDownload(v);
-          _toast('已提交后台下载');
+          // iOS 走原生后台传输（锁屏后系统继续下）；安卓/模拟器仍是前台 Dio 链
+          _toast(Platform.isIOS ? '已开始下载，锁屏后继续' : '已加入下载');
           break;
         case 'package':
           // 自己下 .ts 分片包（产物可离线、可随时「本地转 MP4」），
@@ -496,8 +499,12 @@ class BrowserPageState extends State<BrowserPage> {
           break;
         case 'convert':
           await _pausePageVideos();
+          // iOS：分片交给系统后台进程，锁屏继续下，齐备后回 App 自动 -c copy 合成。
+          // 其它平台没有系统级后台传输，是前台下完直接出片。
           ConvertManager.instance.convert(v);
-          _toast('已开始转换');
+          _toast(Platform.isIOS
+              ? '已开始转 MP4，锁屏后继续下载'
+              : '已开始转换');
           break;
         case 'copy':
           Clipboard.setData(ClipboardData(text: url));
@@ -548,6 +555,166 @@ class BrowserPageState extends State<BrowserPage> {
     } catch (e) {
       AppLog.instance
           .warn('browser', '解析 browserGesture 消息失败: ${_truncate(raw)}', e);
+    }
+  }
+
+  /// 注销当前源的 ServiceWorker + 清空它的 CacheStorage（脚本自身返回 Promise）。
+  /// 「刷新也没用」有一半出在这里：站点 ServiceWorker 用 cache-first 把半截响应
+  /// 喂给每一个新文档，reload() 读的正是同一份缓存，永远修不好。
+  /// 同一份脚本两处用：iOS 交给原生 evaluateJavaScript（它会等这里返回的 Promise 落定，
+  /// 页内注销与清 CacheStorage 才算真的做完）；没有原生桥时（Android）直接 runJavaScript
+  /// 尽力而为。脚本按当前源生效，且自身不抛异常。
+  static const _serviceWorkerCleanupJs = r'''
+(function () {
+  var jobs = [];
+  try {
+    if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+      jobs.push(navigator.serviceWorker.getRegistrations().then(function (rs) {
+        return Promise.all((rs || []).map(function (r) {
+          try { return r.unregister(); } catch (e) { return null; }
+        }));
+      }));
+    }
+  } catch (e) {}
+  try {
+    if (window.caches && caches.keys) {
+      jobs.push(caches.keys().then(function (ks) {
+        return Promise.all((ks || []).map(function (k) {
+          try { return caches.delete(k); } catch (e) { return null; }
+        }));
+      }));
+    }
+  } catch (e) {}
+  return Promise.all(jobs).then(function () { return 1; }, function () { return 0; });
+})();
+''';
+
+  /// 「强制重置浏览器状态」菜单入口：先确认，免得误触把导航历史清掉
+  Future<void> _confirmForceReset() async {
+    if (_resetting) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        // 标题刻意与菜单项文案不同：让测试/无障碍能按文本唯一找到那一项
+        title: const Text('确定要强制重置浏览器状态？'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: const [
+            Text('适用于「页面加载一半就卡住、点刷新也没用」。依次做四件事：'),
+            SizedBox(height: 8),
+            Text('1. 停掉当前还在跑的加载'),
+            Text('2. 注销 ServiceWorker，清空它的 CacheStorage'),
+            Text('3. 清掉 HTTP 内存/磁盘缓存（登录 Cookie 与站点数据不动）'),
+            Text('4. 销毁并重建 WebView 实例，重新加载本页'),
+            SizedBox(height: 8),
+            Text('第 4 步是刷新做不到的：卡死的渲染进程只有重建才换得掉。'),
+            Text('代价：前进/后退历史清空（仍停在当前地址），页内播放中断。'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('立即重置'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) await _forceReset();
+  }
+
+  /// 强制重置浏览器状态。「加载一半卡住、刷新也没用」的三条成因，reload() 一条都治不了：
+  /// 1) 渲染进程假死 —— 只有销毁重建 WKWebView 才会换新进程；
+  /// 2) 坏缓存 / ServiceWorker 把半截响应喂给每个新文档 —— 要清 HTTP 缓存 + SW 注册；
+  /// 3) 旧请求还在占连接 —— 由原生 resetWebsiteData 先 stopLoading。
+  /// Cookie 与站点存储有意保留：一个自救按钮不该把已登录的站点全登出。
+  Future<void> _forceReset() async {
+    if (_resetting) return;
+    setState(() => _resetting = true);
+    final target = _currentUrl.isNotEmpty ? _currentUrl : _urlController.text.trim();
+    final reloadUri = target.isEmpty ? null : Uri.tryParse(target);
+    try {
+      final cleared = await _resetWebsiteData();
+      // 换控制器 == 换 WebView 实例：旧实例连同它的渲染进程、内存缓存、正在跑的页内
+      // 脚本一起销毁（新实例的 configuration 也拿不到旧实例那份 WKUserScript）
+      _handledRedirects.clear();
+      _markerChain = null;
+      setState(() {
+        _viewEpoch++;
+        _controller = _newController();
+      });
+      AppLog.instance.info('browser',
+          '强制重置浏览器状态：$target（清缓存=${cleared ? 'ok' : '未生效'}）');
+      _toast(cleared ? '已重建浏览器，正在重新加载' : '已重建浏览器实例（缓存清理未生效）');
+      // 等这一帧把旧 WebView 平台视图真正拆掉，再动新实例：早了的话原生按视图树找到的
+      // 还是旧实例，WKUserScript 会装进正在销毁的那个，新页面反而没角标
+      //（和 v0.3.5 修的「刷新后角标不出」同一个坑）。
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _earlySnifferInstalled = false;
+        _earlySnifferTries = 0;
+        _installEarlyScripts();
+        // 装脚本只是一次通道往返，给它 250ms，别让重置卡在白屏上。
+        // 真没装上也不影响正确性：onPageStarted/onPageFinished 的 runJavaScript 照样注入，
+        // 且 _installEarlyScripts 自身会重试，下一次导航起 WKUserScript 就位。
+        Timer(const Duration(milliseconds: 250), () {
+          if (!mounted) return;
+          final uri = reloadUri;
+          if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
+            _urlController.text = uri.toString();
+            _controller.loadRequest(uri);
+          }
+          // 进度条走到「新实例真的开始加载」为止，而不是 setState 一结束就灭
+          _endReset();
+        });
+      });
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '强制重置浏览器状态失败', e, st);
+      _toast('重置失败，详情见日志');
+      _endReset();
+    }
+  }
+
+  /// 结束重置态（进度条 + 菜单项禁用）
+  void _endReset() {
+    if (mounted && _resetting) setState(() => _resetting = false);
+  }
+
+  /// 限时跑一步重置：WebView 假死时这些调用可能永远不返回，
+  /// 卡在任何一步上都等于「重置按钮也没用」—— 超时/异常只记日志，继续往下走。
+  Future<void> _timebox(Future<void> Function() op, String step) async {
+    try {
+      await op().timeout(const Duration(milliseconds: 1500));
+    } catch (e) {
+      AppLog.instance.warn('browser', '重置：$step 未完成，跳过继续', e);
+    }
+  }
+
+  /// iOS：原生侧注销 ServiceWorker + 清 HTTP 缓存（保留 Cookie），返回是否清成功。
+  /// 非 iOS 无此桥接 → 只做页内注销，重建实例那一步照样有效。
+  Future<bool> _resetWebsiteData() async {
+    try {
+      // 回包是状态串（sw=页内注销结果 cache=清缓存），出问题时日志能分清哪步没成
+      final status = await _sniffBridge
+          .invokeMethod<String>('resetWebsiteData', [_serviceWorkerCleanupJs])
+          .timeout(const Duration(seconds: 8));
+      if (status == null) return false;
+      AppLog.instance.info('browser', '重置：原生清网站数据 $status');
+      return true;
+    } on MissingPluginException {
+      await _timebox(
+          () => _controller.runJavaScript(_serviceWorkerCleanupJs), '注销 ServiceWorker');
+      return false;
+    } on TimeoutException {
+      AppLog.instance.warn('browser', '重置：原生清缓存超时，直接重建 WebView');
+      return false;
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '重置：清理网站缓存失败', e, st);
+      return false;
     }
   }
 
@@ -699,6 +866,8 @@ class BrowserPageState extends State<BrowserPage> {
                 if (on) {
                   _toast('点播放即接管：已开启');
                 }
+              } else if (v == 'forcereset') {
+                _confirmForceReset();
               }
             },
             itemBuilder: (ctx) => [
@@ -789,6 +958,22 @@ class BrowserPageState extends State<BrowserPage> {
                   ],
                 ),
               ),
+              const PopupMenuDivider(),
+              // 不是开关，是一次性动作：页面加载一半卡住、刷新无效时用（见 _forceReset）
+              PopupMenuItem(
+                value: 'forcereset',
+                enabled: !_resetting,
+                child: Row(
+                  children: [
+                    Icon(
+                      _resetting ? Icons.hourglass_top : Icons.autorenew,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(_resetting ? '正在重置…' : '强制重置浏览器状态'),
+                  ],
+                ),
+              ),
             ],
           ),
           IconButton(
@@ -839,8 +1024,16 @@ class BrowserPageState extends State<BrowserPage> {
               ],
             ),
           ),
+          // 重置要清缓存 + 重建实例，耗时可见（避免看起来「点了没反应」）
+          if (_resetting) const LinearProgressIndicator(minHeight: 2),
           // 页内角标（video_marker.js）是唯一的视频入口，不再额外挂底部列表
-          Expanded(child: WebViewWidget(controller: _controller)),
+          // key：强制重置时靠换 key 让 Flutter 拆掉旧 WebView 平台视图，换新实例
+          Expanded(
+            child: WebViewWidget(
+              key: ValueKey(_viewEpoch),
+              controller: _controller,
+            ),
+          ),
         ],
       ),
     );

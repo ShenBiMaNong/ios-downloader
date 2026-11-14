@@ -1,7 +1,7 @@
 name: video_downloader
 description: "内置浏览器视频下载器（个人自用，sideload 安装）"
 publish_to: "none"
-version: 0.3.5+1
+version: 0.3.6+1
 
 environment:
   sdk: ">=3.4.0 <4.0.0"

@@ -161,6 +161,8 @@ class _HomeShellState extends State<HomeShell> {
     // 后台分片事件在锁屏期间可能整段丢失：回前台以原生磁盘状态对账，
     // 已下齐的作业立即触发 ffmpeg 合成（合成放前台，后台唤醒窗口不够跑）。
     await ConvertManager.instance.onResume();
+    // mp4 直链的同一条对账：后台下完的文件还在原生作业目录里，回前台才搬进资源库
+    await DownloadManager.instance.onResume();
     await _importPendingShares();
   }
 
@@ -206,35 +208,28 @@ class _HomeShellState extends State<HomeShell> {
           ListTile(
             leading: const Icon(Icons.download),
             title: const Text('下载 mp4'),
+            subtitle: Platform.isIOS
+                ? const Text('锁屏后由系统继续下载')
+                : null,
             onTap: () {
               Navigator.pop(ctx);
               DownloadManager.instance.download(v);
-              _toast('已加入下载队列');
+              _toast(Platform.isIOS ? '已开始下载，锁屏后继续' : '已加入下载队列');
             },
           ),
         if (v.isHls) ...[
           ListTile(
-            leading: const Icon(Icons.download),
-            title: const Text('HLS 离线缓存'),
+            leading: const Icon(Icons.transform),
+            title: const Text('m3u8 转 MP4'),
+            subtitle: Platform.isIOS
+                ? const Text('锁屏后由系统继续下载，分片齐备回 App 自动合成')
+                : null,
             onTap: () {
               Navigator.pop(ctx);
-              HlsManager.instance.start(v.url, v.pageTitle,
-                  referer: v.effectiveReferer);
-              _toast('已开始 HLS 离线下载');
-            },
-          ),
-          ListTile(
-            leading: const Icon(Icons.download_for_offline),
-            title: const Text('后台下载并转 MP4'),
-            onTap: () {
-              Navigator.pop(ctx);
-              if (!Platform.isIOS) {
-                ConvertManager.instance.downloadM3u8(v);
-                _toast('当前平台不支持系统级后台下载，已改为下载 m3u8 分片包');
-                return;
-              }
-              ConvertManager.instance.nativeDownload(v);
-              _toast('已提交后台下载；分片下完后回到 App 会自动合成 MP4');
+              ConvertManager.instance.convert(v);
+              _toast(Platform.isIOS
+                  ? '已开始转 MP4，锁屏后继续下载'
+                  : '已开始 m3u8 → mp4 转换');
             },
           ),
           ListTile(
@@ -247,12 +242,14 @@ class _HomeShellState extends State<HomeShell> {
             },
           ),
           ListTile(
-            leading: const Icon(Icons.transform),
-            title: const Text('m3u8 转 MP4'),
+            leading: const Icon(Icons.download),
+            title: const Text('HLS 离线缓存'),
+            subtitle: const Text('系统私有格式，只能在本机播，不能导出'),
             onTap: () {
               Navigator.pop(ctx);
-              ConvertManager.instance.convert(v);
-              _toast('已开始 m3u8 → mp4 转换');
+              HlsManager.instance.start(v.url, v.pageTitle,
+                  referer: v.effectiveReferer);
+              _toast('已开始 HLS 离线下载');
             },
           ),
         ],

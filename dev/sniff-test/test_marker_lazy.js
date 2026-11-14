@@ -161,7 +161,7 @@ async function runOpaqueUrl() {
   console.log('角标文案   :', JSON.stringify(P2.label), P2.label === '视频' ? '✅ 中性' : '❌');
   console.log('占位卡片   :', JSON.stringify(P2.hint.slice(0, 40)),
     /尚未捕获/.test(P2.hint) ? '✅' : '❌');
-  console.log('赋 src 后  :', /后台下载并转 MP4/.test(P2.cardAfter) ? '✅ 卡片自动出现下载项' : '❌ 仍是占位',
+  console.log('赋 src 后  :', /直接转 MP4/.test(P2.cardAfter) ? '✅ 卡片自动出现下载项' : '❌ 仍是占位',
     '| 角标=' + JSON.stringify(P2.labelAfter));
 
   const P3 = await runTiny();
@@ -178,7 +178,7 @@ async function runOpaqueUrl() {
     P1.n >= 1 && /HLS/.test(P1.label) && !!P1.diag &&
     P1.diag.videos >= 1 && P1.diag.badged >= 1 && P1.diag.frame === 'top' &&
     P2.n >= 1 && P2.label === '视频' && /尚未捕获/.test(P2.hint) &&
-    /后台下载并转 MP4/.test(P2.cardAfter) &&
+    /直接转 MP4/.test(P2.cardAfter) &&
     P3.n === 0 &&
     P4.n >= 1 && P4.label === '视频' && /下载视频/.test(P4.card);
   console.log('\n结论：' + (okAll ? '全部通过' : '存在未通过项，需复查'));

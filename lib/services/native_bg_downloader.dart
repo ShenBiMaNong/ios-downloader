@@ -25,10 +25,36 @@ class NativeBgDownloader {
     }
   }
 
-  /// 取消作业（取消在途 task + 删除状态记录；分片目录由 ConvertManager 清理）
+  /// 取消作业（取消在途 task + 删除状态记录；分片目录由调用方清理）
   static Future<bool> cancel(String jobId) async {
     try {
       final r = await _method.invokeMethod<bool>('cancel', {'jobId': jobId});
+      return r ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 暂停：原生给在途 task 产生断点续传数据并落进作业状态，之后可 [resume]。
+  /// 与 [cancel] 的区别是保留状态记录和已落盘分片。
+  static Future<bool> pause(String jobId) async {
+    try {
+      final r = await _method.invokeMethod<bool>('pause', {'jobId': jobId});
+      return r ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 继续：重新拉起磁盘上还不存在的分片。
+  /// [url] 只用于单文件作业换链接（签名过期后重新嗅探到的新地址）；
+  /// 传了它原生会丢掉旧的断点数据从头下——续传凭据绑的是原请求。
+  static Future<bool> resume(String jobId, {String? url}) async {
+    try {
+      final r = await _method.invokeMethod<bool>('resume', {
+        'jobId': jobId,
+        if (url != null && url.isNotEmpty) 'url': url,
+      });
       return r ?? false;
     } catch (_) {
       return false;
@@ -75,12 +101,17 @@ class NativeSegJob {
   final List<NativeSegPart> parts;
   final Map<String, String> headers;
 
+  /// 单文件作业（mp4 直链）：parts 只有一项，落盘文件本身就是产物，
+  /// 原生不需要清单，也不需要后续合成。
+  final bool singleFile;
+
   const NativeSegJob({
     required this.jobId,
     required this.workDir,
     required this.playlistPath,
     required this.parts,
     required this.headers,
+    this.singleFile = false,
   });
 
   Map<String, dynamic> toMap() => {
@@ -89,6 +120,7 @@ class NativeSegJob {
         'playlistPath': playlistPath,
         'parts': [for (final p in parts) p.toMap()],
         'headers': headers,
+        'singleFile': singleFile,
       };
 }
 
@@ -101,7 +133,7 @@ class NativeSegPart {
   Map<String, String> toMap() => {'url': url, 'name': name};
 }
 
-/// 作业状态：downloading / ready / failed / remuxed
+/// 作业状态：downloading / paused / ready / failed / remuxed
 class NativeJobStatus {
   final String jobId;
   final String state;
@@ -116,6 +148,9 @@ class NativeJobStatus {
   /// 外推未知分片，因此 [bytesEstimated] 为 true 时这是估算值。
   final int bytesTotal;
   final bool bytesEstimated;
+
+  /// 单文件作业：落盘文件即产物，进度只有 0/1 两态，展示必须按字节口径
+  final bool single;
   final String? error;
 
   const NativeJobStatus({
@@ -127,6 +162,7 @@ class NativeJobStatus {
     this.bytes = 0,
     this.bytesTotal = 0,
     this.bytesEstimated = false,
+    this.single = false,
     this.error,
   });
 
@@ -139,11 +175,19 @@ class NativeJobStatus {
         bytes: (j['bytes'] as num?)?.toInt() ?? 0,
         bytesTotal: (j['bytesTotal'] as num?)?.toInt() ?? 0,
         bytesEstimated: (j['bytesEstimated'] as bool?) ?? false,
+        single: (j['single'] as bool?) ?? false,
         error: j['error'] as String?,
       );
 
   bool get isReady => state == 'ready';
   bool get isFailed => state == 'failed';
+  bool get isPaused => state == 'paused';
   double get progress =>
       total <= 0 ? 0 : (done / total).clamp(0.0, 1.0).toDouble();
+
+  /// 字节口径进度。单文件作业分片数恒为 1，[progress] 在它下完前一直是 0，
+  /// 只有这个值会动；总大小未知（服务器没给 Content-Length）时返回 0，
+  /// 调用方按「已下 X B」降级展示。
+  double get byteProgress =>
+      bytesTotal <= 0 ? 0 : (bytes / bytesTotal).clamp(0.0, 1.0).toDouble();
 }
