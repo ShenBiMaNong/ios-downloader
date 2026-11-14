@@ -54,7 +54,7 @@ class AppData extends ChangeNotifier {
   /// 跳转拦截开关：网站自动跳转时先询问是否跳转（默认开）
   bool redirectGuardEnabled = true;
 
-  /// 页面视频标记开关：嗅探到的 <video> 直接描边 + 角标展示（默认开）
+  /// 页面视频标记开关：嗅探到的 `<video>` 直接描边 + 角标展示（默认开）
   bool videoMarkEnabled = true;
 
   /// 禁止视频自动播放：页面自己开始的播放一律拦下（默认开）

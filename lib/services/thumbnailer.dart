@@ -13,7 +13,7 @@ import 'app_log.dart';
 /// .movpkg 是 AVFoundation 私有封装的目录，ffmpeg/纯 Dart 解不开，
 /// 只有 AVAssetImageGenerator 能直接读，所以缩略图统一走原生。
 ///
-/// 缓存：原生把 jpg 落在 Caches/video_thumbnails/<条目id>.jpg，
+/// 缓存：原生把 jpg 落在 `Caches/video_thumbnails/<条目id>.jpg`，
 /// Dart 侧再挂一层内存 memo —— 列表滚动时同一 id 只发起一次异步请求。
 class Thumbnailer {
   static const MethodChannel _channel = MethodChannel('video_downloader/thumb');

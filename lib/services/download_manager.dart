@@ -48,7 +48,7 @@ class DownloadTask {
   /// 原生作业 id（与 [id] 同值，分开存是因为降级后同一任务会转回 Dio 链）
   String? nativeJobId;
 
-  /// 原生作业目录（Documents/Downloads/.direct_<id>），落盘文件在里面的
+  /// 原生作业目录（`Documents/Downloads/.direct_<id>`），落盘文件在里面的
   /// direct.bin；搬运完成后目录删除。
   String? nativeDir;
 
@@ -136,8 +136,8 @@ class DownloadTask {
 /// iOS 上优先走原生后台单文件作业（系统 background URLSession）：提交后传输交给
 /// 系统，锁屏 / 切 App / 进程被回收都能继续；Dio 链保留作非 iOS 与原生通道不可用
 /// 时的降级（前台下载 + `beginBackgroundTask` 约 30 秒宽限）。
-/// Dio 过程始终写 <名字>.part，完成后重命名为 .mp4；失败/取消时保留 .part
-/// 并持久化 pending 状态，可断点续传。原生作业的中间文件落在 .direct_<id>/ 目录，
+/// Dio 过程始终写 `<名字>.part`，完成后重命名为 .mp4；失败/取消时保留 .part
+/// 并持久化 pending 状态，可断点续传。原生作业的中间文件落在 `.direct_<id>/` 目录，
 /// 下完由 Dart 搬到 Downloads 的唯一名，元数据格式与 Dio 链一致。
 class DownloadManager extends ChangeNotifier {
   static final DownloadManager instance = DownloadManager._();
@@ -723,7 +723,7 @@ class DownloadManager extends ChangeNotifier {
     return '下载失败（HTTP $code）';
   }
 
-  /// 产物搬运：原生作业目录里的 direct.bin → Downloads/<唯一名>.mp4 + 元数据。
+  /// 产物搬运：原生作业目录里的 direct.bin → `Downloads/<唯一名>.mp4` + 元数据。
   /// 与 Dio 链共用同一套命名与元数据格式，资源库不需要区分来源。
   Future<void> _finishNative(DownloadTask task) async {
     if (task.status == DownloadStatus.done || _nativeFinishing.contains(task.id)) {

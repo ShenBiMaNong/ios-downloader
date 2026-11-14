@@ -521,7 +521,7 @@ class BrowserPageState extends State<BrowserPage> {
     }
   }
 
-  /// 暂停页内所有 <video>/<audio>，并清掉页面设置的 Media Session：
+  /// 暂停页内所有 `<video>`/`<audio>`，并清掉页面设置的 Media Session：
   /// 一来避免下载/本地播放时页内继续出声、白耗流量，
   /// 二来避免浏览器/系统一直挂着「正在播放」的媒体通知（下载期间尤其明显）。
   Future<void> _pausePageVideos() async {
