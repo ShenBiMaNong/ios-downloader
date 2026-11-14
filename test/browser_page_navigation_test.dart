@@ -5,6 +5,10 @@
 // 这正是本轮修复的 bug：此前只有用户手输地址才更新地址栏，页内跳转 / SPA 路由变化都不更新。
 //
 // ignore_for_file: depend_on_referenced_packages, invalid_use_of_protected_member
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:webview_flutter_platform_interface/webview_flutter_platform_interface.dart';
@@ -138,6 +142,7 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   late _FakeWebViewPlatform platform;
+  final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
 
   setUp(() {
     platform = _FakeWebViewPlatform();
@@ -146,6 +151,21 @@ void main() {
     AppSettings.instance.browserStartPage = BrowserStartPage.blank;
     AppData.instance.lastUrl = '';
     AppData.instance.blockAutoplayEnabled = true;
+    // 资产改为同步读盘（mock 'flutter/assets' 通道）：真实资产 IO 在 fake-async
+    // zone 里的完成时机不稳定，v0.3.8 起脚本变大后 CI 上出现过「脚本等不到注入」。
+    // 同步读盘让 loadString 只排一个 microtask，pump 一次就绪，断言不再赌时机。
+    messenger.setMockMessageHandler('flutter/assets', (message) async {
+      final key = utf8.decode(
+        message!.buffer.asUint8List(message.offsetInBytes, message.lengthInBytes),
+      );
+      final f = File(key);
+      if (!f.existsSync()) return null;
+      return ByteData.sublistView(f.readAsBytesSync());
+    });
+  });
+
+  tearDown(() {
+    messenger.setMockMessageHandler('flutter/assets', null);
   });
 
   String addressBarText(WidgetTester tester) =>
