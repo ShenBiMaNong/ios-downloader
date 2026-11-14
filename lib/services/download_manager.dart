@@ -336,8 +336,9 @@ class DownloadManager extends ChangeNotifier {
           return;
         }
       }
+      // 走到这里 relocator 必然已拿到（上面失败直接 return），故无需 `?.`
       // null = 按当前容器也认不出这个文件（交给起播前的检查说清楚）
-      final hit = relocator?.relocate(stored);
+      final hit = relocator.relocate(stored);
       // 前面已排除了活路径，same 理论上不会出现，出现也当无需处理
       if (hit == null || hit.kind == Relocation.same) continue;
       m['localPath'] = hit.path;
