@@ -48,6 +48,7 @@ class BrowserPageState extends State<BrowserPage> {
   String? _marker;
   String? _redirectGuard;
   String? _noAutoplay;
+  String? _swipe;
   String _currentUrl = '';
   String _pageTitle = '';
 
@@ -84,6 +85,7 @@ class BrowserPageState extends State<BrowserPage> {
           _injectMarker();
           _injectRedirectGuard();
           _injectNoAutoplay();
+          _injectSwipe();
           if (AppData.instance.adBlockEnabled) _injectAdBlock();
         },
         // SPA 路由变化（history.pushState / 页内锚点）不会触发 onPageStarted，
@@ -98,10 +100,17 @@ class BrowserPageState extends State<BrowserPage> {
           await _injectMarker();
           await _injectRedirectGuard();
           await _injectNoAutoplay();
+          await _injectSwipe();
           if (AppData.instance.adBlockEnabled) await _injectAdBlock();
           final t = await _controller.getTitle();
           if (mounted) setState(() => _pageTitle = t ?? '');
           AppData.instance.recordHistory(t ?? '', url);
+          // 导航竞态补刀：onPageStarted 阶段的 evaluateJavaScript 可能打在旧文档上，
+          // onPageFinished 时播放器也常常还没布局出 <video>。1.2s 后再补一次注入
+          // （marker 幂等，已装则秒回）—— 这是「刷新后角标不出」的最后一道兜底。
+          Future<void>.delayed(const Duration(milliseconds: 1200), () {
+            if (mounted) _injectMarker();
+          });
         },
         onWebResourceError: (err) {
           // 主框架加载失败→警告；子资源（广告/图标等）失败→调试级，避免刷屏
@@ -117,6 +126,10 @@ class BrowserPageState extends State<BrowserPage> {
       })
       ..addJavaScriptChannel('redirectAttempt', onMessageReceived: (msg) {
         _handleRedirectAttempt(msg.message);
+      })
+      // 页面左右滑动手势（右滑=后退、左滑=前进）：browser_swipe.js 回传方向
+      ..addJavaScriptChannel('browserGesture', onMessageReceived: (msg) {
+        _handleBrowserGesture(msg.message);
       });
     AppData.instance.addListener(_onAppDataChanged);
     // iOS：把自动播放拦截 + 嗅探脚本注册为 WKUserScript（atDocumentStart + 全帧含跨域 iframe），
@@ -166,6 +179,9 @@ class BrowserPageState extends State<BrowserPage> {
   Future<String> _noAutoplayJs() async =>
       _noAutoplay ??= await rootBundle.loadString('assets/no_autoplay.js');
 
+  Future<String> _swipeJs() async =>
+      _swipe ??= await rootBundle.loadString('assets/browser_swipe.js');
+
   Future<void> _injectSniffer() async {
     try {
       final js = await _snifferJs();
@@ -192,15 +208,28 @@ class BrowserPageState extends State<BrowserPage> {
     if (_earlySnifferInstalled || _earlySnifferTries > 12) return;
     _earlySnifferTries++;
     try {
-      // 顺序：自动播放拦截在嗅探器之前（先拿到 play() 的原生引用）
-      final scripts = [await _noAutoplayJs(), await _snifferJs()];
+      // 开关快照要取已加载的持久化值（initState 时 AppData 可能还没读完文件）
+      await AppData.instance.ensureLoaded();
+      // 顺序：自动播放拦截在嗅探器之前（先拿到 play() 的原生引用）；
+      // 视频标记最后（依赖嗅探器的 __vdlSniff，且要读前面写入的 __vdlMarkEnabled）。
+      // marker 进 WKUserScript 的意义：每个新文档自动装上角标，不再依赖
+      // onPageStarted/onPageFinished 的 runJavaScript —— 那条路在导航竞态下会把脚本
+      // 打到旧文档上，症状就是「刷新页面角标不出、开关关→开又有了」。
+      final scripts = [
+        'window.__vdlMarkEnabled=${AppData.instance.videoMarkEnabled};',
+        await _noAutoplayJs(),
+        await _snifferJs(),
+        await _markerJs(),
+        // 手势导航：touch 监听也要赶在页面脚本之前挂上（页面可能自己吞 touch）
+        await _swipeJs(),
+      ];
       final ok = await _sniffBridge
               .invokeMethod<bool>('installUserScripts', scripts) ??
           false;
       if (ok) {
         _earlySnifferInstalled = true;
-        AppLog.instance
-            .info('browser', 'iOS 早期注入成功（WKUserScript 全帧：自动播放拦截 + 嗅探）');
+        AppLog.instance.info('browser',
+            'iOS 早期注入成功（WKUserScript 全帧：自动播放拦截 + 嗅探 + 视频标记）');
         return;
       }
     } on MissingPluginException {
@@ -245,6 +274,15 @@ class BrowserPageState extends State<BrowserPage> {
     }
   }
 
+  /// 左右滑动手势：脚本自身幂等（已装则立即返回），无开关、常开
+  Future<void> _injectSwipe() async {
+    try {
+      await _controller.runJavaScript(await _swipeJs());
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '注入手势脚本失败', e, st);
+    }
+  }
+
   /// 地址栏 / 当前地址跟随页面变化。
   /// ref: onPageStarted（整页导航）、onUrlChange（SPA pushState、页内锚点）、onPageFinished（兜底）。
   /// 用户正在地址栏输入时不覆盖（否则打字打到一半被导航结果冲掉）。
@@ -265,16 +303,33 @@ class BrowserPageState extends State<BrowserPage> {
   }
 
   /// 页面视频标记（方案A）：开关打开才注入；关闭时清理已注入的标记
-  Future<void> _injectMarker() async {
+  ///
+  /// 串行化：注入/清理必须按调用顺序执行。「关→开」会连续调两次本方法（一次 cleanup、
+  /// 一次注入），二者都是 async（await loadString + runJavaScript），并发时完成顺序
+  /// 不确定 —— 注入先完成、cleanup 后执行的话，角标就被清没了，表现为「开关关了又开，
+  /// 角标时有时无」。用 Future 链排队，前一个跑完再跑下一个。
+  Future<void>? _markerChain;
+
+  Future<void> _injectMarker() {
+    final prev = _markerChain;
+    final task = prev == null ? _doInjectMarker() : prev.then((_) => _doInjectMarker());
+    _markerChain = task.catchError((_) {});
+    return task;
+  }
+
+  Future<void> _doInjectMarker() async {
     try {
       if (AppData.instance.videoMarkEnabled) {
         final js = await _markerJs();
-        // 附带源码：脚本自扩散到同源 iframe，让 iframe 内播放器也能出角标
-        final boot = '\nwindow.__vdlMarkerSource=${jsonEncode(js)};\n'
+        // 先纠正开关再注入：WKUserScript 里的开关是安装时快照，用户改过设置后
+        // 新文档可能带着旧值（marker 看到 false 会直接不启动）。前缀一行就地修正。
+        // 附带源码：脚本自扩散到同源 iframe，让 iframe 内播放器也能出角标。
+        final code = 'window.__vdlMarkEnabled=true;\n$js\n'
+            'window.__vdlMarkerSource=${jsonEncode(js)};\n'
             'if (window.__vdlMarkerPropagate) window.__vdlMarkerPropagate(window.__vdlMarkerSource);';
-        await _controller.runJavaScript(js + boot);
+        await _controller.runJavaScript(code);
       } else {
-        await _controller.runJavaScript(
+        await _controller.runJavaScript('window.__vdlMarkEnabled=false;'
             'window.__vdlMarkerSource=null; if (window.__vdlCleanup) window.__vdlCleanup();');
       }
       _lastMarkerApplied = AppData.instance.videoMarkEnabled;
@@ -355,6 +410,19 @@ class BrowserPageState extends State<BrowserPage> {
         AppLog.instance.info(
           'browser',
           '已拦截页面自动播放（${j['count'] ?? 1} 次）: ${url.isEmpty ? _currentUrl : url}',
+        );
+        return;
+      }
+      // 标记层诊断（每个文档最多两条：boot + 首次发现播放）：排查「角标不出来」时，
+      // 这行日志就能分清是 video 在别的帧/shadow 里（frames/shadow > 0、dom=0）、
+      // 还是角标建了被盖住（covered > 0）、还是 iOS 原生全屏播放（nativefs > 0）。
+      if (action == 'markerDiag') {
+        AppLog.instance.info(
+          'browser',
+          '标记诊断[${j['tag'] ?? ''}] 帧=${j['frame']} 视频=${j['videos']}(dom=${j['dom']} '
+              'shadow=${j['shadow']} frames=${j['frames']}) 播放中=${j['playing']} '
+              'srcObj=${j['srcobj']} 原生全屏=${j['nativefs']} 角标=${j['badged']} '
+              '可见=${j['shown']} 被遮挡=${j['covered']} ${j['href'] ?? ''}',
         );
         return;
       }
@@ -458,6 +526,28 @@ class BrowserPageState extends State<BrowserPage> {
       );
     } catch (e, st) {
       AppLog.instance.warn('browser', '暂停页内播放失败', e, st);
+    }
+  }
+
+  /// 页面左右滑动手势（browser_swipe.js）：右滑=后退、左滑=前进，
+  /// 与地址栏后退/前进按钮同语义。无历史时 goBack/goForward 由 WebView 自行忽略。
+  void _handleBrowserGesture(String raw) {
+    try {
+      final j = jsonDecode(raw) as Map<String, dynamic>;
+      if (j['action'] != 'swipe') return;
+      final dir = (j['direction'] as String?) ?? '';
+      final url = (j['url'] as String?) ?? _currentUrl;
+      switch (dir) {
+        case 'back':
+          AppLog.instance.info('browser', '手势右滑 → 后退（$url）');
+          _controller.goBack();
+        case 'forward':
+          AppLog.instance.info('browser', '手势左滑 → 前进（$url）');
+          _controller.goForward();
+      }
+    } catch (e) {
+      AppLog.instance
+          .warn('browser', '解析 browserGesture 消息失败: ${_truncate(raw)}', e);
     }
   }
 

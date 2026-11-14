@@ -183,6 +183,8 @@ class _LibraryPageState extends State<LibraryPage> {
         bytesTotal: t.bytesTotal,
         bytesEstimated: t.bytesEstimated,
         resumable: t.resumable,
+        failedSegments: t.failedSegments,
+        canForceMerge: t.canForceMerge,
         folder: folderById[t.id] ?? '',
         stage: t.stage.isEmpty ? null : t.stage,
       ));
@@ -555,6 +557,8 @@ class _LibraryPageState extends State<LibraryPage> {
         } else {
           DownloadManager.instance.resume(it.id);
         }
+      case 'forcemerge':
+        _confirmForceMerge(it);
       case 'detail':
         _showError(it);
       case 'reconvert':
@@ -577,6 +581,38 @@ class _LibraryPageState extends State<LibraryPage> {
       pageTitle: it.sortName,
     ));
     _toast('已开始重新下载');
+  }
+
+  /// 「仍要合成」确认框：缺片出片是一次性决定，代价必须先说清
+  Future<void> _confirmForceMerge(LibraryItem it) async {
+    final missing = it.failedSegments;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('仍要合成？'),
+        content: Text(
+          missing > 0
+              ? '缺少 $missing 个分片，合成后的视频会缺失对应片段（时长偏短、可能黑屏跳跃）。\n\n'
+                  '注意：合成后本次下载即完成，已下分片会被清理，无法再续传补齐缺失部分。\n'
+                  '加密流（AES-128）从缺失位置起可能解密失败。'
+              : '将用已下载的分片合成视频。\n\n'
+                  '注意：合成后本次下载即完成，无法再续传补片。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('仍要合成'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      await ConvertManager.instance.mergeAnyway(it.id);
+    }
   }
 
   /// 完整错误详情（列表里只显示收敛后的单行摘要）
@@ -633,6 +669,10 @@ class _LibraryPageState extends State<LibraryPage> {
         const PopupMenuItem(value: 'cancel', child: Text('取消')),
       if (it.failed && it.resumable)
         const PopupMenuItem(value: 'resume', child: Text('继续下载')),
+      if (it.failed && it.kind == 'convert' && it.canForceMerge)
+        PopupMenuItem(
+            value: 'forcemerge',
+            child: Text('仍要合成（缺 ${it.failedSegments} 片）')),
       if (it.failed)
         const PopupMenuItem(value: 'detail', child: Text('查看错误详情')),
       if (playable) const PopupMenuItem(value: 'rename', child: Text('重命名')),
@@ -760,7 +800,7 @@ class _LibraryPageState extends State<LibraryPage> {
       return Row(mainAxisSize: MainAxisSize.min, children: [play, cancel]);
     }
     if (it.failed && it.resumable) {
-      return _smallFab(Icons.play_arrow, '继续下载', () {
+      final resume = _smallFab(Icons.play_arrow, '继续下载', () {
         if (it.kind == 'convert') {
           ConvertManager.instance.retry(it.id);
         } else if (it.kind == 'm3u8') {
@@ -769,6 +809,20 @@ class _LibraryPageState extends State<LibraryPage> {
           DownloadManager.instance.resume(it.id);
         }
       });
+      // 分片部分失败的 convert 任务：多给一个「仍要合成」入口
+      if (it.kind == 'convert' && it.canForceMerge) {
+        return Row(mainAxisSize: MainAxisSize.min, children: [
+          _smallFab(Icons.merge_type, '仍要合成（缺 ${it.failedSegments} 片）',
+              () => _confirmForceMerge(it)),
+          resume,
+        ]);
+      }
+      return resume;
+    }
+    // 失败但不可续传（如清单已丢）：只要工作目录里还有清单和分片，仍可强合
+    if (it.failed && it.kind == 'convert' && it.canForceMerge) {
+      return _smallFab(Icons.merge_type, '仍要合成（缺 ${it.failedSegments} 片）',
+          () => _confirmForceMerge(it));
     }
     if (it.kind == 'm3u8' &&
         it.hlsTaskId == null &&

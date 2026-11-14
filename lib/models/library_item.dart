@@ -38,6 +38,11 @@ class LibraryItem {
   final int bytesTotal;
   final bool bytesEstimated;
   final bool resumable; // 失败/中断后是否可续传（断点续传）
+  /// 分片下载失败数（仅 convert 链路有值）。>0 且 [canForceMerge] 时
+  /// 失败条目出现「仍要合成」入口
+  final int failedSegments;
+  /// 是否允许「仍要合成」（用已下分片强制出片，放弃缺失片段）
+  final bool canForceMerge;
   final String folder; // 归属文件夹（'' = 全部 / 未分组）
   /// 原生后台分片下载阶段（仅 mode=='native' 的 convert 任务有值）：
   /// downloading | ready | remuxing | failed
@@ -64,6 +69,8 @@ class LibraryItem {
     this.bytesTotal = 0,
     this.bytesEstimated = false,
     this.resumable = false,
+    this.failedSegments = 0,
+    this.canForceMerge = false,
     this.folder = '',
     this.stage,
   });

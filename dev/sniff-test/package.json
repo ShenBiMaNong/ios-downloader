@@ -3,7 +3,7 @@
   "private": true,
   "description": "嗅探判定的 A-B 回归测试（jsdom，不参与 App 构建）",
   "scripts": {
-    "test": "node test_ab.js && node test_hijack.js && node test_verify_card.js && node test_pick_dur.js",
+    "test": "node test_ab.js && node test_hijack.js && node test_verify_card.js && node test_pick_dur.js && node test_marker_lazy.js && node test_marker_early.js && node test_swipe.js",
     "test:toggle": "node test_autoplay_toggle.js",
     "test:rootcause": "node test_autoplay_rootcause.js"
   },

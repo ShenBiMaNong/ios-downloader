@@ -1,7 +1,7 @@
 name: video_downloader
 description: "内置浏览器视频下载器（个人自用，sideload 安装）"
 publish_to: "none"
-version: 0.3.4+1
+version: 0.3.5+1
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
@@ -40,3 +40,4 @@ flutter:
     - assets/redirect_guard.js
     - assets/video_marker.js
     - assets/no_autoplay.js
+    - assets/browser_swipe.js

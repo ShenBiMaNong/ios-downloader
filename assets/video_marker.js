@@ -29,6 +29,13 @@
   }
 
   if (window.__vdlMarkerInstalled) return;
+  // 开关：iOS 全帧 user script 里由 Dart 在脚本前写入 window.__vdlMarkEnabled。
+  // 关掉时连 iframe 帧也不启动（否则关掉开关后跨域播放器帧里还会冒角标）。
+  if (window.__vdlMarkEnabled === false) return;
+  // 这里**不能**再因为 `!document.documentElement` 就 return：iOS 的 WKUserScript 是
+  // atDocumentStart + 全帧注入，那个时刻 <html>/<head> 常常还没创建，而 user script 对每个
+  // 文档只执行一次 —— return 掉就等于这个文档（以及每个跨域 iframe 播放器帧）永远没有角标。
+  // 这正是「视频已经播起来了、角标一个都不出」的根因。样式表改为轮询补挂（见 mountStyle）。
   window.__vdlMarkerInstalled = true;
   window.__vdlMarkerPropagate = propagate;
 
@@ -46,7 +53,7 @@
   style.id = 'vdl-style';
   style.textContent =
     '.vdl-video{outline:2px dashed rgba(59,130,246,.75)!important;outline-offset:3px;}' +
-    '.vdl-badge{position:fixed;z-index:2147483000;background:rgba(15,23,42,.94);color:#fff;' +
+    '.vdl-badge{position:fixed;z-index:2147483647;background:rgba(15,23,42,.94);color:#fff;' +
     'font:12px/1 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;' +
     'padding:5px 9px;border-radius:13px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.4);' +
     'display:flex;align-items:center;gap:5px;user-select:none;-webkit-user-select:none;' +
@@ -65,7 +72,7 @@
     '.vdl-dash .vdl-ic{background:#0e7490;}' +
     '.vdl-mse .vdl-ic{background:#64748b;}' +
     '.vdl-tx{max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
-    '.vdl-card{position:fixed;z-index:2147483001;width:252px;max-height:360px;overflow:auto;' +
+    '.vdl-card{position:fixed;z-index:2147483647;width:252px;max-height:360px;overflow:auto;' +
     // overscroll-behavior:contain：卡片内滚到底后不要「链式」带动页面上滚，
     // 页面一滚 dismiss 逻辑就会把卡片关掉（旧版 iOS 不支持时另有 touch 手势兜底）
     'overscroll-behavior:contain;-webkit-overflow-scrolling:touch;' +
@@ -95,7 +102,28 @@
     '.vdl-line.dead .vdl-lm{color:#dc2626;}' +
     '.vdl-warn{color:#b45309;background:#fffbeb;border-radius:6px;padding:6px 8px;margin-top:6px;}' +
     '.vdl-lu{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}';
-  (document.head || document.documentElement).appendChild(style);
+  // 样式表挂载：atDocumentStart 时 head 甚至 documentElement 都可能还没创建。
+  // 轮询补挂（10ms × 600 ≈ 6s）；挂不上期间角标仍然会创建（只是没样式），
+  // 绝不能因为挂不上就 return —— 那会让整个文档没有角标。
+  var styleTries = 0;
+  function mountStyle() {
+    if (style.parentNode) return;
+    var host = document.head || document.documentElement;
+    if (host) {
+      try { host.appendChild(style); } catch (e) {}
+    }
+    if (style.parentNode) return;
+    if (++styleTries > 600) return;
+    setTimeout(mountStyle, 10);
+  }
+  mountStyle();
+
+  // 角标/卡片的挂载点。用 documentElement 而不是 body：站点常给 body（或 #app 外壳）
+  // 加 transform/filter（页面切换动画），那会让 position:fixed 相对它定位而跑到屏幕外；
+  // 同时作为 html 的最后一个子节点，z-index 打平时也能压在站点浮层上（广告遮罩常用 2147483647）
+  function hostOf() {
+    return document.documentElement || document.body;
+  }
 
   function postAction(payload) {
     try {
@@ -152,6 +180,11 @@
 
   // video 的 src：元素自身 → <source> 子元素（URL 或 type MIME 命中视频）
   function srcOf(video) {
+    // 自绘播放器常见写法：video.srcObject = mediaSource（MSE 直挂对象）。
+    // 这时 src / currentSrc 全是空串 —— 不认这一条就会被当成「没有地址」，
+    // 旧版直接 continue 跳过，于是「视频明明在播、角标一个不出」。
+    // 返回一个固定的伪 blob:，让下游走 MSE（靠嗅探池找 m3u8）这条路。
+    if (video.srcObject) return 'blob:srcobject';
     var s = video.currentSrc ||
       (video.getAttribute && video.getAttribute('src')) || video.src || '';
     if (s) return s;
@@ -172,7 +205,10 @@
     try {
       var s = window.__vdlSniff;
       if (!s || !s.best) return null;
-      if (kindOf(srcOf(video)) !== 'mse') return null;
+      // 元素地址缺失 / blob: / 非扩展名形式 → 三种情况都只能靠嗅探池；
+      // 之前只放过 blob:，于是「懒赋 src 的播放器」在赋 src 之前一个角标都不出
+      var k = kindOf(srcOf(video));
+      if (k !== 'mse' && k !== 'other') return null;
       var b = s.best('hls') || s.best('dash') || s.best('file');
       if (b && b.url) return b;
       var u = s.getLatest ? (s.getLatest('hls') || s.getLatest('file')) : '';
@@ -198,7 +234,7 @@
 
   function infoOf(video) {
     var src = srcOf(video);
-    var kind = kindOf(src);
+    var kind = src ? kindOf(src) : '';
     var cap = null;
     // 用户手动选了线路（多条候选里挑一条）→ 以他选的为准
     var manual = video.__vdlLine || '';
@@ -206,8 +242,9 @@
       src = manual;
       kind = kindOf(manual);
       cap = { url: manual, kind: kind, state: stateOfUrl(manual) };
-    } else if (kind === 'mse') {
-      // blob: 播放器：地址只能来自嗅探器（元素句柄 / 容器 data-url / 网络证据）
+    } else if (!src || kind === 'mse' || kind === 'other') {
+      // 元素拿不到地址（blob: / 懒赋 src / 不是扩展名形式）：地址只能来自嗅探器
+      // （元素句柄 / 容器 data-url / 网络证据 / 分片目录）
       cap = capturedFor(video);
       if (cap) { src = cap.url; kind = kindOf(cap.url); }
     } else if (kind === 'hls' || kind === 'dash') {
@@ -218,6 +255,8 @@
         if (b && b.url && b.state === 'ok') { src = b.url; kind = kindOf(b.url); cap = b; }
       }
     }
+    // 既没有元素地址、嗅探也没捞到东西 → 中性「视频」角标（入口先有，等地址到了再升级）
+    if (!src) kind = 'none';
     var t = (video.getAttribute && (video.getAttribute('title') || video.getAttribute('aria-label'))) || '';
     var lines = (kind === 'hls' || kind === 'dash' || kind === 'file') ? linesOf(kind) : [];
     return {
@@ -238,6 +277,7 @@
   function labelOf(info) {
     // ✓ = 已确认可用（2xx + 内容校验 或 正在播放）；? = 未验证；✗ = 已确认失效
     var mk = info.state === 'ok' ? ' ✓' : (info.state === 'dead' ? ' ✗' : ' ?');
+    if (info.kind === 'none') return '视频'; // 还没拿到地址：入口先立着，别让用户以为「没识别到」
     if (info.kind === 'hls') return 'HLS' + mk + (info.dur ? ' · ' + info.dur : '');
     if (info.kind === 'dash') return 'DASH' + mk;
     if (info.kind === 'mse') return '流';
@@ -274,8 +314,18 @@
       }
       toggleCard(video, b);
     });
-    document.body.appendChild(b);
+    // 挂到 documentElement（见 hostOf）：body 上有 transform 时，body 里的 fixed 元素
+    // 会跟着 body 一起偏出屏幕；挂 html 上不受影响
+    (hostOf() || document.body).appendChild(b);
     return b;
+  }
+
+  // 「主播放器」判据：没拿到地址的 <video> 只有够大才值得立角标（避免给广告位/小窗
+  // 预览视频都挂一个）；阈值与接管的小窗判据一致（240×135）
+  function isMainPlayer(video) {
+    var r = null;
+    try { r = video.getBoundingClientRect(); } catch (e) { return false; }
+    return !!(r && r.width >= 240 && r.height >= 135);
   }
 
   // 已标记视频登记表。必需：video 从 DOM 移除后 querySelectorAll 就查不到它了，
@@ -283,11 +333,99 @@
   // 而且再没有任何代码更新它的坐标（表现为「视频没了角标还在、位置卡死不动」）。
   var marked = [];
 
+  // ── 视频元素收集：document + shadow root + 同源 iframe ─────────────────
+  // 1) 自绘播放器把 <video> 塞进 shadow root，`document.querySelectorAll('video')` 一个都
+  //    看不到 —— 现象就是「页面上视频在播、旁边没有角标」，而页面里随便一个广告 <video>
+  //    反而有角标。atDocumentStart 就钩住 attachShadow，之后创建的 shadow root 全部登记
+  //    （closed 模式拿不到，无法处理；主流播放器是 open）。
+  // 2) 同源 iframe 里的播放器直接遍历；跨域帧由全帧注入的 marker 在自己的帧里处理。
+  var shadowRoots = [];
+  try {
+    var EP = window.Element && window.Element.prototype;
+    if (EP && EP.attachShadow && !EP.__vdlAttachShadowHooked) {
+      var origAttachShadow = EP.attachShadow;
+      EP.attachShadow = function () {
+        var sr = origAttachShadow.apply(this, arguments);
+        try {
+          if (sr && sr.nodeType === 11 && shadowRoots.indexOf(sr) < 0) {
+            shadowRoots.push(sr);
+            // 播放器刚挂上 → 立刻重扫（0ms 抓住首帧，300ms 兜住后续插入）
+            setTimeout(update, 0);
+            setTimeout(update, 300);
+          }
+        } catch (e) {}
+        return sr;
+      };
+      EP.__vdlAttachShadowHooked = true;
+    }
+  } catch (e) {}
+
+  // hook 装得比播放器晚时（注入时机不确定）已经创建好的 shadow root 只能靠扫。
+  // 5s 一次、只读属性，成本可忽略。
+  var lastShadowSweep = 0;
+  function sweepShadowRoots() {
+    var now = Date.now ? Date.now() : new Date().getTime();
+    if (now - lastShadowSweep < 5000) return;
+    lastShadowSweep = now;
+    var els;
+    try { els = document.querySelectorAll('*'); } catch (e) { return; }
+    for (var i = 0; i < els.length; i++) {
+      var sr = null;
+      try { sr = els[i].shadowRoot; } catch (e) {}
+      if (sr && sr.nodeType === 11 && shadowRoots.indexOf(sr) < 0) shadowRoots.push(sr);
+    }
+  }
+
+  function collectVideos() {
+    var out = [];
+    function take(root) {
+      if (!root || !root.querySelectorAll) return;
+      var vs;
+      try { vs = root.querySelectorAll('video'); } catch (e) { return; }
+      for (var i = 0; i < vs.length; i++) if (out.indexOf(vs[i]) < 0) out.push(vs[i]);
+    }
+    take(document);
+    for (var i = 0; i < shadowRoots.length; i++) take(shadowRoots[i]);
+    var fs;
+    try { fs = document.querySelectorAll('iframe'); } catch (e) { fs = []; }
+    for (var j = 0; j < fs.length; j++) {
+      try { take(fs[j].contentDocument); } catch (e) {}
+    }
+    return out;
+  }
+
+  // 元素在本帧视口里的矩形。视频在同源 iframe 里时，getBoundingClientRect 给的是
+  // 该 iframe 自己的坐标系，必须逐级加上各层 frameElement 的偏移，否则角标会画在
+  // 左上角/错位（用户看到的就是「角标位置莫名其妙」）。跨域帧拿不到 frameElement，
+  // 返回 null —— 那个帧里的视频由它自己的 marker 画。
+  function rectOf(video) {
+    var r;
+    try { r = video.getBoundingClientRect(); } catch (e) { return null; }
+    var out = {
+      left: r.left, top: r.top, width: r.width, height: r.height,
+      right: r.right, bottom: r.bottom
+    };
+    var w = null;
+    try { w = video.ownerDocument && video.ownerDocument.defaultView; } catch (e) {}
+    var guard = 0;
+    while (w && w !== window && guard++ < 8) {
+      var fe = null;
+      try { fe = w.frameElement; } catch (e) {}
+      if (!fe) return null;
+      var fr;
+      try { fr = fe.getBoundingClientRect(); } catch (e) { return null; }
+      out.left += fr.left; out.top += fr.top;
+      out.right += fr.left; out.bottom += fr.top;
+      w = (fe.ownerDocument && fe.ownerDocument.defaultView) || null;
+    }
+    return out;
+  }
+
   function place(badge, video) {
-    var r = video.getBoundingClientRect();
+    var r = rectOf(video);
     // 尺寸为 0 / 移出视口 / 被祖先 display:none 藏起来 → 不显示角标
     if (
-      r.width < 10 || r.height < 10 ||
+      !r || r.width < 10 || r.height < 10 ||
       r.bottom <= 0 || r.top >= window.innerHeight ||
       r.right <= 0 || r.left >= window.innerWidth
     ) {
@@ -306,6 +444,10 @@
 
   var currentCard = null;
   var currentCardAnchor = null;
+  // 卡片对应的视频 + 打开时是否已经有地址：没有地址的卡片（占位态）在嗅探拿到地址后
+  // 要自动重绘一次，否则用户会一直看着「尚未捕获」的空卡片
+  var currentCardVideo = null;
+  var currentCardHasUrl = false;
   var cardDismissBound = false;
   // 手势是否「起手在卡片内」：卡片内滑动被带动页面时不应该关掉卡片
   var cardGesture = 0;
@@ -338,6 +480,8 @@
     }
     currentCard = null;
     currentCardAnchor = null;
+    currentCardVideo = null;
+    currentCardHasUrl = false;
     cardGesture = 0;
     if (cardDismissBound) {
       cardDismissBound = false;
@@ -450,7 +594,7 @@
   function verifyCardLines(card, video, badge, info) {
     try {
       var s = window.__vdlSniff;
-      if (!s || !s.verify || info.kind === 'mse') return;
+      if (!s || !s.verify || info.kind === 'mse' || info.kind === 'none') return;
       var need = [];
       function push(u) {
         if (!u || need.indexOf(u) >= 0) return;
@@ -511,6 +655,10 @@
       '<div class="vdl-card-m">' + esc(meta) + '</div>';
     if (info.kind === 'mse') {
       html += '<div class="vdl-card-n">分段/加密流（blob:），未捕获到可下载直链，暂不支持离线下载。</div>';
+    } else if (info.kind === 'none') {
+      // 占位态：视频元素在、地址还没有（站点点播放才赋 src）。不说「没识别到」——
+      // 嗅探器一到地址这张卡会自己重绘成可下载状态
+      html += '<div class="vdl-card-n">尚未捕获可下载地址 · 点一下页面播放，1–2 秒后这里会自动出现下载项</div>';
     } else {
       html += '<div class="vdl-card-u">' + esc(info.url) + '</div>';
     }
@@ -554,13 +702,13 @@
       html += '<button class="vdl-btn" data-a="hls">系统离线缓存（仅播放，不可导出）</button>';
     } else if (info.kind === 'dash') {
       html += '<div class="vdl-card-n" style="padding:10px 12px;">DASH 流（.mpd）暂不支持离线下载，可复制清单链接自行处理。</div>';
-    } else if (info.kind === 'file') {
-      // 直链：立即播放（边播边缓存）+ 下载
+    } else if (info.kind === 'file' || info.kind === 'other') {
+      // 直链（含不带扩展名的播放地址，如 /play?id=1）：立即播放（边播边缓存）+ 下载
       html += '<button class="vdl-btn hl" data-a="play">立即播放（边播边缓存）</button>';
       html += '<button class="vdl-btn hl" data-a="mp4">下载视频</button>';
     }
-    // MSE 且未兜底到直链：无可下载操作
-    if (info.kind !== 'mse') {
+    // MSE 且未兜底到直链 / 还没地址：无可复制的东西
+    if (info.kind !== 'mse' && info.url) {
       html += '<button class="vdl-btn" data-a="copy">复制链接</button>';
     }
     html += '<button class="vdl-btn" data-a="ignore">忽略此条</button>';
@@ -607,7 +755,7 @@
         setTimeout(function () { refreshBadge(badge, video); }, 1800);
       }
     });
-    document.body.appendChild(card);
+    (hostOf() || document.body).appendChild(card);
     var br = badge.getBoundingClientRect();
     var cw = card.offsetWidth || 252;
     var ch = card.offsetHeight || 240;
@@ -620,6 +768,8 @@
     card.style.top = top + 'px';
     currentCard = card;
     currentCardAnchor = badge;
+    currentCardVideo = video;
+    currentCardHasUrl = !!info.url;
     bindDismiss();
 
     // 卡片内起手的手势：内部没有可滚动的容器时直接吃掉（不带动页面滚），
@@ -653,12 +803,29 @@
     if (!window.__vdlMarkerInstalled) return;
     // iframe 导航中 / 文档卸载后 document 可能已经不可用（定时器还在跑）
     if (typeof document === 'undefined' || !document || !document.body) return;
-    // 先摘掉已从 DOM 移除的角标（它们不会出现在下面的 querySelectorAll 结果里）
+    // 先摘掉已从 DOM 移除的角标（它们不会出现在下面的收集结果里）
     sweepDetached();
-    var videos = document.querySelectorAll('video');
+    sweepShadowRoots();
+    var videos = collectVideos();
+    // 自愈：一个跟踪中的角标都没有、页面里却有 <video> —— 说明之前的创建流程中断过
+    // （badge 建了一半、挂载点错位、__vdlBadge 残留指向已 detached 的元素）。
+    // 残留引用会让下面 `if (!badge)` 走不进去，永远不再重建；而「开关关→开」的
+    // cleanup 恰好会清残留 —— 这就是「刷新后没角标、关了又开就有了」的机制。
+    if (!marked.length) {
+      for (var pi = 0; pi < videos.length; pi++) {
+        if (videos[pi].__vdlBadge) videos[pi].__vdlBadge = null;
+      }
+    }
     for (var i = 0; i < videos.length; i++) {
       var v = videos[i];
       if (v.__vdlIgnored) continue;
+      // 第一次发现「视频真的在播」→ 补报一次现场诊断。
+      // 用户报的问题就发生在这个时刻，2.5s 的 boot 那次通常还没点播放，数据没用。
+      if (!diagPlayPosted) {
+        var isPlaying = false;
+        try { isPlaying = !v.paused; } catch (e9) {}
+        if (isPlaying) { diagPlayPosted = true; reportDiag('playing'); }
+      }
       // 换集/换源：src 变了说明是新一条，之前手动选的线路作废
       var curSrc = srcOf(v);
       if (curSrc !== v.__vdlSeenSrc) {
@@ -668,8 +835,14 @@
       var badge = v.__vdlBadge;
       if (!badge) {
         var src = srcOf(v);
-        if (!src) continue;
-        if (kindOf(src) === 'other') continue;
+        var k0 = src ? kindOf(src) : '';
+        // 没有元素地址（懒赋 src / 只挂了 poster）时，只要嗅探器已经拿到候选（容器
+        // data-url、网络证据、分片目录）就该立刻出角标 —— 旧版这里 `if (!src) continue`，
+        // 于是「刷新后视频明明在旁边、角标不出来，点一下页面才冒出来」，正是本次的 bug
+        var cap0 = (!src || k0 === 'mse' || k0 === 'other') ? capturedFor(v) : null;
+        // 两边都没有：只有「主播放器」级别的 <video> 才立一个中性角标（避免给广告位、
+        // 小窗预览视频满屏挂角标）
+        if (!src && !cap0 && !isMainPlayer(v)) continue;
         badge = makeBadge(v);
         v.__vdlBadge = badge;
         v.classList.add('vdl-video');
@@ -689,6 +862,11 @@
       }
       refreshBadge(badge, v);
       place(badge, v);
+      // 卡片停在「尚未捕获地址」的占位态时，一旦嗅探到地址就原地重绘，
+      // 不用让用户把卡片关掉再点一次
+      if (currentCard && currentCardVideo === v && !currentCardHasUrl && infoOf(v).url) {
+        toggleCard(v, badge);
+      }
     }
     // 有待跟随的角标 → 开启逐帧对齐（脱离文档的会在 tick/sweep 里被摘掉）
     if (marked.length) kick();
@@ -716,16 +894,24 @@
   document.addEventListener('click', onQuick, true);
   document.addEventListener('play', onQuick, true);
   document.addEventListener('playing', onQuick, true);
+  // 媒体事件不冒泡，但**捕获阶段**能收到（document 在最外层）。
+  // loadeddata/canplay 是「播放器已经拿到数据、地址该有了」的最早信号 ——
+  // 只靠 click/play 的话，站点「自动起播」或「静音预加载」场景会一直等到 1s 轮询。
+  document.addEventListener('loadstart', onQuick, true);
+  document.addEventListener('loadeddata', onQuick, true);
+  document.addEventListener('canplay', onQuick, true);
 
-  // <video>/<source> 的 src 属性变化（点击播放后赋值）→ 即时出角标
+  // <video>/<source> 的 src 属性变化（点击播放后赋值）→ 即时出角标。
+  // 观察 document 本身而不是 documentElement：atDocumentStart 时 <html> 可能还没创建，
+  // 观察 documentElement 会抛（被 catch 吞掉后只剩 1s 轮询，反应迟钝）。
   var srcObserver = null;
   try {
     srcObserver = new MutationObserver(function () { update(); });
-    srcObserver.observe(document.documentElement, {
+    srcObserver.observe(document, {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['src']
+      attributeFilter: ['src', 'poster']
     });
   } catch (e) {}
 
@@ -737,6 +923,61 @@
   }
   document.addEventListener('fullscreenchange', fsEvt);
   document.addEventListener('webkitfullscreenchange', fsEvt);
+
+  // ── 现场诊断（每个文档最多两条，进 App 日志）───────────────────────────
+  // 用户反馈「视频在播、角标不出」时，靠这条日志一次分辨到底是哪种情况：
+  //   ① videos=0 但 frames>0 / shadow>0 → 视频在别的帧或 shadow root 里
+  //   ② videos>0 playing>0 但 badged=0 → 建角标条件被卡住
+  //   ③ badged>0 shown=0 → 坐标算出来在视口外（rectOf 换算/祖先隐藏）
+  //   ④ badged>0 covered>0 → 建了但被站点浮层盖住（要上 top-layer）
+  //   ⑤ nativefs>0 → iOS 原生全屏播放，HTML 角标物理上不可能可见
+  var diagBootPosted = false;
+  var diagPlayPosted = false;
+  function reportDiag(tag) {
+    try {
+      if (!window.__vdlMarkerInstalled) return;
+      var vs = collectVideos();
+      var big = 0, shown = 0, covered = 0, playing = 0, srcobj = 0, nativefs = 0;
+      for (var i = 0; i < vs.length; i++) {
+        if (isMainPlayer(vs[i])) big++;
+        try {
+          if (!vs[i].paused) playing++;
+          if (vs[i].srcObject) srcobj++;
+          if (vs[i].webkitDisplayingFullscreen) nativefs++;
+        } catch (e3) {}
+        var b = vs[i].__vdlBadge;
+        if (!b || b.style.display === 'none') continue;
+        shown++;
+        try {
+          if (typeof document.elementFromPoint !== 'function') continue;
+          var r = b.getBoundingClientRect();
+          var hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+          if (hit && hit !== b && !b.contains(hit)) covered++;
+        } catch (e2) {}
+      }
+      var frames = 0;
+      try { frames = document.querySelectorAll('iframe').length; } catch (e4) {}
+      postAction({
+        action: 'markerDiag',
+        url: '',
+        tag: tag,
+        frame: (window === window.top) ? 'top' : 'sub',
+        videos: vs.length,
+        dom: (function () { try { return document.querySelectorAll('video').length; } catch (e5) { return 0; } })(),
+        shadow: shadowRoots.length,
+        frames: frames,
+        playing: playing,
+        srcobj: srcobj,
+        nativefs: nativefs,
+        big: big,
+        badged: marked.length,
+        shown: shown,
+        covered: covered,
+        href: location.href
+      });
+    } catch (e) {}
+  }
+  window.setTimeout(function () { diagBootPosted = true; reportDiag('boot'); }, 2500);
 
   window.__vdlCleanup = function () {
     window.clearInterval(timer);

@@ -54,6 +54,8 @@ class _FakeController extends PlatformWebViewController {
 
   final List<String> jsCalls = [];
   final List<String> loaded = [];
+  final Map<String, void Function(JavaScriptMessage)> channels = {};
+  final List<String> navOps = [];
   _FakeDelegate? delegate;
   String title = '测试页标题';
 
@@ -85,10 +87,14 @@ class _FakeController extends PlatformWebViewController {
   Future<void> reload() async {}
 
   @override
-  Future<void> goBack() async {}
+  Future<void> goBack() async {
+    navOps.add('back');
+  }
 
   @override
-  Future<void> goForward() async {}
+  Future<void> goForward() async {
+    navOps.add('forward');
+  }
 }
 
 class _FakeDelegate extends PlatformNavigationDelegate {
@@ -235,5 +241,46 @@ void main() {
     final js = platform.controller!.jsCalls;
     expect(js.any((s) => s.contains('__vdlNoAutoplayInstalled')), isTrue);
     expect(js.any((s) => s.contains('window.__vdlNoAutoplayEnabled=true')), isTrue);
+  });
+
+  testWidgets('加载页面时注入手势脚本本体', (tester) async {
+    await pumpBrowser(tester);
+    platform.delegate!.pageStarted!('https://a.example/x');
+    await tester.pumpAndSettle();
+    await waitFor(
+      tester,
+      () => platform.controller!.jsCalls.any((s) => s.contains('__vdlSwipeInstalled')),
+    );
+    expect(
+      platform.controller!.jsCalls.any((s) => s.contains('__vdlSwipeInstalled')),
+      isTrue,
+      reason: '手势脚本（browser_swipe.js）应随页面注入',
+    );
+  });
+
+  testWidgets('手势通道：右滑=后退、左滑=前进', (tester) async {
+    await pumpBrowser(tester);
+    platform.delegate!.pageStarted!('https://a.example/x');
+    await tester.pumpAndSettle();
+
+    final ch = platform.controller!.channels['browserGesture'];
+    expect(ch, isNotNull, reason: '应注册 browserGesture 通道');
+
+    ch!(JavaScriptMessage(
+        message: '{"action":"swipe","direction":"back","url":"https://a.example/x"}'));
+    ch(JavaScriptMessage(
+        message: '{"action":"swipe","direction":"forward","url":"https://a.example/x"}'));
+    expect(platform.controller!.navOps, ['back', 'forward']);
+  });
+
+  testWidgets('手势通道收到非法消息时不崩溃、不导航', (tester) async {
+    await pumpBrowser(tester);
+    final ch = platform.controller!.channels['browserGesture'];
+    expect(ch, isNotNull);
+
+    ch!(JavaScriptMessage(message: 'not json'));
+    ch(JavaScriptMessage(message: '{"action":"other"}'));
+    ch(JavaScriptMessage(message: '{"action":"swipe","direction":"up"}'));
+    expect(platform.controller!.navOps, isEmpty);
   });
 }

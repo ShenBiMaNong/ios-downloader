@@ -63,6 +63,15 @@ class ConvertTask {
   /// 工作目录；失败/中断时保留，供 retry() 续传
   String? workDir;
 
+  /// 下载阶段失败的分片数（0 = 没有分片失败）。成功后清零；
+  /// >0 且工作目录里已有本地清单时，UI 出现「仍要合成」入口
+  /// （放弃缺失片段、用已下分片强制出片）。
+  int failedSegments = 0;
+
+  /// 是否允许「仍要合成」：分片部分失败、工作目录与本地清单还在时为 true。
+  /// 与 failedSegments 一起持久化，重启后按钮不丢。
+  bool canForceMerge = false;
+
   ConvertTask({
     required this.id,
     required this.url,
@@ -93,6 +102,9 @@ class ConvertTask {
         'bytes': bytes,
         'bytesTotal': bytesTotal,
         'bytesEstimated': bytesEstimated,
+        // 「仍要合成」入口状态也要跨重启保留
+        'failedSegments': failedSegments,
+        'canForceMerge': canForceMerge,
       };
 
   factory ConvertTask.fromPendingJson(Map<String, dynamic> j) => ConvertTask(
@@ -110,6 +122,8 @@ class ConvertTask {
         ..bytes = (j['bytes'] as num?)?.toInt() ?? 0
         ..bytesTotal = (j['bytesTotal'] as num?)?.toInt() ?? 0
         ..bytesEstimated = (j['bytesEstimated'] as bool?) ?? true
+        ..failedSegments = (j['failedSegments'] as num?)?.toInt() ?? 0
+        ..canForceMerge = (j['canForceMerge'] as bool?) ?? false
         ..failed = true
         ..error = (j['error'] as String?) ?? '已暂停';
 }
@@ -256,10 +270,118 @@ class ConvertManager extends ChangeNotifier {
     task.error = null;
     task.progress = 0;
     task.doneSegments = 0;
+    // 上一轮的「仍要合成」入口随续传清掉：是否还能强合，由新一轮下载结果决定
+    task.failedSegments = 0;
+    task.canForceMerge = false;
     notifyListeners();
     await _run(task);
     _active.remove(task.url);
     notifyListeners();
+  }
+
+  /// 部分分片下载失败后，放弃缺失片段、用已下分片强制合成 mp4（「仍要合成」）。
+  ///
+  /// 与 retry() 互斥（同 url 走 _active 去重）。成功后走 _finishMp4 正常入库，
+  /// 工作目录随之清理 —— 意味着不能再续传补片，UI 的确认框必须说清这层代价。
+  /// 失败（清单缺失 / ffmpeg 报错）则回到失败态，canForceMerge 保持，按钮仍在。
+  Future<void> mergeAnyway(String id) async {
+    ConvertTask? task;
+    for (final t in tasks) {
+      if (t.id == id) {
+        task = t;
+        break;
+      }
+    }
+    if (task == null || task.done || !task.canForceMerge) return;
+    if (task.workDir == null || !Directory(task.workDir!).existsSync()) {
+      task.failed = true;
+      task.canForceMerge = false;
+      task.error = '缓存已失效';
+      notifyListeners();
+      return;
+    }
+    if (_active.contains(task.url)) return;
+    _active.add(task.url);
+    task.failed = false;
+    task.error = null;
+    notifyListeners();
+    final bg = await BackgroundTask.begin();
+    try {
+      final work = Directory(task.workDir!);
+      // 本地清单：remote/local 链叫 local.m3u8，remote package / native 链叫
+      // playlist.m3u8 —— 两个名字都试，谁在用谁
+      File? pl;
+      for (final name in const ['local.m3u8', 'playlist.m3u8']) {
+        final f = File(p.join(work.path, name));
+        if (f.existsSync()) {
+          pl = f;
+          break;
+        }
+      }
+      if (pl == null) throw Exception('本地清单缺失，无法强制合成');
+      final partial = p.join(work.path, 'local_partial.m3u8');
+      final kept = await _filterPlaylistToExisting(pl, work, partial);
+      AppLog.instance.warn('convert',
+          '强制合成（$kept/${task.totalSegments} 片，放弃 ${task.failedSegments} 片）: ${task.title}');
+      await _remux(partial, p.join(work.path, 'out.mp4'));
+      await _finishMp4(task, work);
+    } catch (e) {
+      task.failed = true;
+      task.error = e.toString();
+      await _savePending(task);
+      AppLog.instance.error('convert', '强制合成失败: ${task.title}', e);
+    } finally {
+      await BackgroundTask.end(bg);
+      _active.remove(task.url);
+      notifyListeners();
+    }
+  }
+
+  /// 把本地清单过滤成「磁盘上真实存在且非空」的分片子集，写入 [dst]，
+  /// 返回保留的分片数（一片都没有直接抛错）。
+  ///
+  /// 过滤规则：
+  /// - 非注释行 = 分片文件名（_writeLocalPlaylist 写的都是相对工作目录的名字）；
+  ///   文件缺失或为空 → 连同挂在它前面的 EXTINF / DISCONTINUITY 一起丢掉；
+  /// - 其余指令行（#EXTM3U / MEDIA-SEQUENCE / ENDLIST…）立即落盘，不挂在分片上；
+  /// - #EXT-X-KEY 也立即落盘：密钥对「其后所有分片」生效，缺的只是中间几片，
+  ///   后面的分片还得用上这把钥匙。
+  ///
+  /// 已知限制：AES-128 未显式给 IV 时 IV = 片序号，丢中间片会改变后续片序号，
+  /// 从缺失位置起可能解密失败 —— 这是 HLS 协议层面的限制，UI 确认框有提示。
+  Future<int> _filterPlaylistToExisting(
+      File src, Directory work, String dst) async {
+    final text = await src.readAsString();
+    final out = StringBuffer();
+    final pending = <String>[]; // 挂在下一个分片上的行（EXTINF / DISCONTINUITY）
+    var kept = 0;
+    for (final raw in text.split('\n')) {
+      final t = raw.trim();
+      if (t.isEmpty) continue;
+      if (t.startsWith('#')) {
+        if (t.startsWith('#EXTINF') || t.startsWith('#EXT-X-DISCONTINUITY')) {
+          pending.add(t);
+        } else {
+          out.writeln(t);
+        }
+        continue;
+      }
+      final f = File(p.join(work.path, t));
+      if (f.existsSync() && f.lengthSync() > 0) {
+        for (final tag in pending) {
+          out.writeln(tag);
+        }
+        pending.clear();
+        out.writeln(t);
+        kept++;
+      } else {
+        // 分片缺失：挂在其上的 EXTINF / DISCONTINUITY 一并丢弃
+        pending.clear();
+      }
+    }
+    if (kept == 0) throw Exception('没有可用的已下载分片，无法强制合成');
+    File(dst).writeAsStringSync(out.toString(), flush: true);
+    return kept;
   }
 
   Future<void> delete(String id) async {
@@ -400,6 +522,9 @@ class ConvertManager extends ChangeNotifier {
     } catch (e) {
       task.failed = true;
       task.error = e.toString();
+      // 分片部分失败时点亮「仍要合成」：工作目录里已有本地清单（清单在
+      // 下载前就写入），用户可以用已下分片强制出片，不必先补齐再合成。
+      if (task.failedSegments > 0) task.canForceMerge = true;
       // 工作目录保留，供 retry() 续传；持久化以便重启后恢复
       await _savePending(task);
       AppLog.instance.error(
@@ -434,17 +559,19 @@ class ConvertManager extends ChangeNotifier {
 
     final ref = _refFor(mediaUrl, task.referer);
 
-    // 3) 密钥下载
+    // 3) 密钥 / fMP4 init 段下载
     final keyLocal = await _fetchKeys(work, lines, referer: ref);
-
-    // 4) 并发下载分片（跳过已存在的，断点续传）
+    final mapLocal = await _fetchMaps(work, lines, referer: ref);
     final urls = segs.map((s) => s.url!).toList();
     final names = segs.map((s) => s.name!).toList();
-    await _downloadSegments(task, work, urls, names, referer: ref);
 
-    // 5) 生成本地清单
+    // 4) 生成本地清单（提前到下载之前：部分分片失败时工作目录里也要有
+    //    local.m3u8，用户才能点「仍要合成」用已下分片出片）
     final localPlaylist = p.join(work.path, 'local.m3u8');
-    _writeLocalPlaylist(localPlaylist, lines, keyLocal, names);
+    _writeLocalPlaylist(localPlaylist, lines, keyLocal, mapLocal, names);
+
+    // 5) 并发下载分片（跳过已存在的，断点续传）
+    await _downloadSegments(task, work, urls, names, referer: ref);
 
     // 6) ffmpeg 无损转封装（解密在解封装阶段由 ffmpeg 完成）
     await _remux(localPlaylist, p.join(work.path, 'out.mp4'));
@@ -491,13 +618,16 @@ class ConvertManager extends ChangeNotifier {
     // 密钥：本地复制 / 远程下载
     final keyLocal =
         await _fetchKeys(work, lines, referer: _refFor(task.url, task.referer));
-
-    // 复制分片（已存在的跳过）
+    final mapLocal =
+        await _fetchMaps(work, lines, referer: _refFor(task.url, task.referer));
     final names = segs.map((s) => s.name!).toList();
-    await _copyLocalSegments(task, work, baseDir.path, segs, names);
 
+    // 清单先写（理由同 _convertRemote：复制阶段缺片时工作目录里要有 local.m3u8）
     final localPlaylist = p.join(work.path, 'local.m3u8');
-    _writeLocalPlaylist(localPlaylist, lines, keyLocal, names);
+    _writeLocalPlaylist(localPlaylist, lines, keyLocal, mapLocal, names);
+
+    // 复制分片（已存在的跳过；缺片只计数，跑完统一抛错）
+    await _copyLocalSegments(task, work, baseDir.path, segs, names);
 
     await _remux(localPlaylist, p.join(work.path, 'out.mp4'));
   }
@@ -519,13 +649,15 @@ class ConvertManager extends ChangeNotifier {
 
     final ref = _refFor(mediaUrl, task.referer);
     final keyLocal = await _fetchKeys(work, lines, referer: ref);
-
+    final mapLocal = await _fetchMaps(work, lines, referer: ref);
     final urls = segs.map((s) => s.url!).toList();
     final names = segs.map((s) => s.name!).toList();
-    await _downloadSegments(task, work, urls, names, referer: ref);
 
+    // 清单同样先写（理由同 _convertRemote：失败现场里要有 playlist.m3u8）
     final localPlaylist = p.join(work.path, 'playlist.m3u8');
-    _writeLocalPlaylist(localPlaylist, lines, keyLocal, names);
+    _writeLocalPlaylist(localPlaylist, lines, keyLocal, mapLocal, names);
+
+    await _downloadSegments(task, work, urls, names, referer: ref);
 
     // 整个工作目录 → Downloads/<标题>_m3u8/（重名时自动追加序号，不再覆盖旧包）
     final docs = await getApplicationDocumentsDirectory();
@@ -621,12 +753,22 @@ class ConvertManager extends ChangeNotifier {
         keyLocal[src] = 'key_${keyLocal.length}.bin';
       }
     }
+    // fMP4 init 段同理：作为 part 交给原生下载，本地清单里改写为 init_N.mp4
+    final mapLocal = <String, String>{};
+    for (final e in lines.where((l) => l.type == 'map')) {
+      final src = e.url!;
+      if (!mapLocal.containsKey(src)) {
+        mapLocal[src] = 'init_${mapLocal.length}.mp4';
+      }
+    }
     final names = segs.map((s) => s.name!).toList();
     final playlistPath = p.join(work.path, 'playlist.m3u8');
-    _writeLocalPlaylist(playlistPath, lines, keyLocal, names);
+    _writeLocalPlaylist(playlistPath, lines, keyLocal, mapLocal, names);
 
     final parts = <NativeSegPart>[
       for (final e in keyLocal.entries)
+        NativeSegPart(url: e.key, name: e.value),
+      for (final e in mapLocal.entries)
         NativeSegPart(url: e.key, name: e.value),
       for (var i = 0; i < segs.length; i++)
         NativeSegPart(url: segs[i].url!, name: names[i]),
@@ -741,6 +883,12 @@ class ConvertManager extends ChangeNotifier {
         task.stage = 'failed';
         final err = e['error'] as String? ?? '';
         task.error = err.isEmpty ? '后台分片下载失败' : err;
+        // 原生链失败多半是部分分片没下完：playlist.m3u8 在提交时已写入
+        // 工作目录，点亮「仍要合成」用已落盘分片强制出片
+        if (task.totalSegments > task.doneSegments) {
+          task.failedSegments = task.totalSegments - task.doneSegments;
+        }
+        task.canForceMerge = true;
         unawaited(_savePending(task));
       default:
         task.stage = 'downloading';
@@ -796,6 +944,11 @@ class ConvertManager extends ChangeNotifier {
         t.stage = 'failed';
         final err = s.error ?? '';
         t.error = err.isEmpty ? '下载失败' : err;
+        // 与 _onNativeEvent 的 failed 分支同理：点亮「仍要合成」
+        if (t.totalSegments > t.doneSegments) {
+          t.failedSegments = t.totalSegments - t.doneSegments;
+        }
+        t.canForceMerge = true;
       } else {
         t.failed = false;
         t.error = null;
@@ -978,6 +1131,8 @@ class ConvertManager extends ChangeNotifier {
   /// 旧实现是 `Future.wait(batch)` 直接冒泡，几百片里断一片就整任务 failed。
   Future<void> _downloadSegments(ConvertTask task, Directory work,
       List<String> urls, List<String> names, {String? referer}) async {
+    // 新一轮下载：清掉上一轮的失败计数（retry 续传时状态由本轮结果决定）
+    task.failedSegments = 0;
     // 待下载集合先算好：续传起点 + 顺手清掉上次遗留的 .tmp 残片
     final pending = <int>[];
     var existing = 0;
@@ -1027,6 +1182,8 @@ class ConvertManager extends ChangeNotifier {
       // 失败的分片不算「已下」：进度条停在真实完成度上，用户看到的 x/y 才可信
       done += slice.length - (failed.length - failBefore);
       task.doneSegments = existing + done;
+      // 失败数实时写回：熔断提前抛出时 catch 也要能拿到准确值点亮「仍要合成」
+      task.failedSegments = failed.length;
       task.progress = urls.isEmpty ? 0 : (existing + done) / urls.length;
       // 熔断：连续整批全灭说明源站/网络整体不可用。不熔断的话每片要耗 3 次重试
       // × 30s 超时，几百片能空转十几分钟才报错。
@@ -1072,9 +1229,13 @@ class ConvertManager extends ChangeNotifier {
     }
   }
 
-  /// 复制本地分片到工作目录（已存在的跳过）
+  /// 复制本地分片到工作目录（已存在的跳过）。
+  ///
+  /// 单片缺失不再立即中止：跳过并计数，跑完再统一抛错 —— 与远程链
+  /// `_downloadSegments` 的容错策略一致，失败后用户可点「仍要合成」。
   Future<void> _copyLocalSegments(ConvertTask task, Directory work,
       String baseDir, List<_PlaylistEntry> segs, List<String> names) async {
+    task.failedSegments = 0;
     var existing = 0;
     var totalBytes = 0;
     for (var i = 0; i < names.length; i++) {
@@ -1093,11 +1254,14 @@ class ConvertManager extends ChangeNotifier {
     task.bytesTotal = totalBytes;
     task.bytesEstimated = false;
     var done = 0;
+    final missing = <int>[];
     for (var i = 0; i < segs.length; i++) {
       final srcPath = segs[i].url!;
       final src = File(srcPath);
-      if (!await src.exists()) {
-        throw Exception('本地缺少分片文件: $srcPath');
+      if (!await src.exists() || await src.length() == 0) {
+        // 缺片只记录不冒泡：一片缺失不该丢掉整轮复制进度
+        missing.add(i);
+        continue;
       }
       final dst = p.join(work.path, names[i]);
       if (File(dst).existsSync() && File(dst).lengthSync() > 0) continue;
@@ -1113,6 +1277,10 @@ class ConvertManager extends ChangeNotifier {
             (task.bytes / task.bytesTotal).clamp(0.0, 1.0).toDouble();
       }
       notifyListeners();
+    }
+    if (missing.isNotEmpty) {
+      task.failedSegments = missing.length;
+      throw Exception('本地缺少 ${missing.length}/${segs.length} 个分片文件');
     }
   }
 
@@ -1136,15 +1304,66 @@ class ConvertManager extends ChangeNotifier {
           ));
           await File(localPath).writeAsBytes(resp.data ?? const [], flush: true);
         } else {
-          final srcFile = File(src);
-          if (!await srcFile.exists()) throw Exception('本地缺少密钥文件: $src');
-          await srcFile.copy(localPath);
+          // 本地恢复场景（重启后从工作目录的 local.m3u8 续跑）：清单里的
+          // key URI 就是 key_i.bin 自身，不能对自己 copy —— 同路径复制会把
+          // 文件截断成空。已在工作目录即视为就绪，直接落到下面的映射赋值。
+          if (!p.equals(src, localPath)) {
+            final srcFile = File(src);
+            if (!await srcFile.exists()) {
+              throw Exception('本地缺少密钥文件: $src');
+            }
+            await srcFile.copy(localPath);
+          }
         }
         if (await File(localPath).length() == 0) {
           throw Exception('密钥文件为空: $src');
         }
       } catch (err) {
         throw Exception('获取 AES-128 密钥失败: $src ($err)');
+      }
+      map[src] = localName;
+      i++;
+    }
+    return map;
+  }
+
+  /// 下载/复制 fMP4 初始化段（#EXT-X-MAP）到工作目录；返回 源地址 → 本地文件名 映射。
+  ///
+  /// 与密钥同理：清单里的 MAP URI 在本地清单里必须改写成工作目录内的文件，
+  /// 否则 ffmpeg 打不开。没有 init 段的 fMP4 清单，ffmpeg 解封装 m4s 时
+  /// 找不到 trex/tfhd，直接 error reading header（即线上「合成失败」的根因）。
+  Future<Map<String, String>> _fetchMaps(Directory work,
+      List<_PlaylistEntry> lines, {String? referer}) async {
+    final map = <String, String>{};
+    var i = 0;
+    for (final e in lines.where((l) => l.type == 'map')) {
+      final src = e.url!;
+      if (map.containsKey(src)) continue;
+      final localName = 'init_$i.mp4';
+      final localPath = p.join(work.path, localName);
+      try {
+        if (e.remote) {
+          final resp = await _dio.get<List<int>>(src, options: Options(
+            responseType: ResponseType.bytes,
+            headers: {
+              if (referer != null && referer.isNotEmpty) 'Referer': referer,
+            },
+          ));
+          await File(localPath).writeAsBytes(resp.data ?? const [], flush: true);
+        } else {
+          // 本地恢复场景：清单里的 init URI 就是 init_N.mp4 自身，
+          // 不能对自己 copy（同路径复制会截断成空），已在工作目录即视为就绪
+          if (!p.equals(src, localPath)) {
+            final srcFile = File(src);
+            if (!await srcFile.exists()) throw Exception('本地缺少 init 段: $src');
+            await srcFile.copy(localPath);
+          }
+        }
+        if (await File(localPath).length() == 0) {
+          throw Exception('init 段为空: $src');
+        }
+      } catch (err) {
+        throw Exception('获取 fMP4 init 段失败: $src ($err)');
       }
       map[src] = localName;
       i++;
@@ -1252,6 +1471,21 @@ class ConvertManager extends ChangeNotifier {
         }
         continue;
       }
+      if (t.startsWith('#EXT-X-MAP')) {
+        // fMP4 清单的初始化段：URI 是标签自身属性，按可下载资源解析，
+        // 落盘后在本地清单里改写回本地文件名（见 _writeLocalPlaylist）
+        final m = _parseMapTag(t);
+        if (m.uri != null && m.uri!.isNotEmpty) {
+          result.add(_PlaylistEntry.map(
+            url: base.resolve(m.uri!).toString(),
+            remote: true,
+            raw: raw,
+          ));
+        } else {
+          result.add(_PlaylistEntry.plain(raw));
+        }
+        continue;
+      }
       if (t.startsWith('#')) {
         result.add(_PlaylistEntry.plain(raw));
         continue;
@@ -1294,6 +1528,20 @@ class ConvertManager extends ChangeNotifier {
         }
         continue;
       }
+      if (t.startsWith('#EXT-X-MAP')) {
+        final m = _parseMapTag(t);
+        if (m.uri != null && m.uri!.isNotEmpty) {
+          final isRemote = m.uri!.toLowerCase().startsWith('http');
+          result.add(_PlaylistEntry.map(
+            url: isRemote ? m.uri! : p.normalize(p.join(baseDir, m.uri!)),
+            remote: isRemote,
+            raw: raw,
+          ));
+        } else {
+          result.add(_PlaylistEntry.plain(raw));
+        }
+        continue;
+      }
       if (t.startsWith('#')) {
         result.add(_PlaylistEntry.plain(raw));
         continue;
@@ -1308,6 +1556,26 @@ class ConvertManager extends ChangeNotifier {
       segCount++;
     }
     return result;
+  }
+
+  /// 解析 #EXT-X-MAP 行 → (uri, iv, byterange)
+  ({String? uri, String? iv, bool byterange}) _parseMapTag(String line) {
+    final m = RegExp(r'#EXT-X-MAP:(.*)').firstMatch(line);
+    if (m == null) return (uri: null, iv: null, byterange: false);
+    final attrs = <String, String>{};
+    final re = RegExp(r'([A-Z0-9-]+)=("[^"]*"|[^,"]*)');
+    for (final mm in re.allMatches(m.group(1)!)) {
+      var v = mm.group(2)!;
+      if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) {
+        v = v.substring(1, v.length - 1);
+      }
+      attrs[mm.group(1)!] = v;
+    }
+    return (
+      uri: attrs['URI'],
+      iv: attrs['IV'],
+      byterange: (attrs['BYTERANGE'] ?? '').isNotEmpty,
+    );
   }
 
   /// 解析 #EXT-X-KEY 行 → (method, uri, iv)
@@ -1330,9 +1598,11 @@ class ConvertManager extends ChangeNotifier {
     );
   }
 
-  /// 生成本地清单：密钥行改写为本地密钥文件（保留 IV），分片行改写为本地文件名
+  /// 生成本地清单：密钥行改写为本地密钥文件（保留 IV），init 段行改写为本地
+  /// init 文件（保留 IV），分片行改写为本地文件名
   void _writeLocalPlaylist(String path, List<_PlaylistEntry> lines,
-      Map<String, String> keyLocal, List<String> names) {
+      Map<String, String> keyLocal, Map<String, String> mapLocal,
+      List<String> names) {
     final buf = StringBuffer('#EXTM3U\n');
     var segIndex = 0;
     for (final e in lines) {
@@ -1348,8 +1618,20 @@ class ConvertManager extends ChangeNotifier {
           if (e.iv != null && e.iv!.isNotEmpty) line += ',IV=${e.iv}';
           buf.writeln(line);
           break;
+        case 'map':
+          final local = mapLocal[e.url];
+          if (local == null) continue;
+          final tag = _parseMapTag(e.raw);
+          // BYTERANGE 指向原 URI 文件的某个字节区间，本地已整文件落盘，
+          // 改写后会指错范围 —— 保底跳过（等价旧行为），正常 URI 型 MAP 不走这里
+          if (tag.byterange) continue;
+          var line = '#EXT-X-MAP:URI="$local"';
+          if (tag.iv != null && tag.iv!.isNotEmpty) line += ',IV=${tag.iv}';
+          buf.writeln(line);
+          break;
         default:
-          // 保留 EXTINF / MEDIA-SEQUENCE 等指令（默认 IV 依赖序列号）；跳过 MAP
+          // 保留 EXTINF / MEDIA-SEQUENCE 等指令（默认 IV 依赖序列号）；
+          // 裸 MAP（无 URI，极少见）维持跳过
           if (e.raw.trim().startsWith('#EXT-X-MAP')) continue;
           buf.writeln(e.raw);
           break;
@@ -1381,9 +1663,9 @@ class ConvertManager extends ChangeNotifier {
   }
 }
 
-/// 清单行：分片 / 密钥 / 其它指令（保持顺序）
+/// 清单行：分片 / 密钥 / init 段 / 其它指令（保持顺序）
 class _PlaylistEntry {
-  final String type; // seg | key | plain
+  final String type; // seg | key | map | plain
   final String raw;
   final String? url; // seg: 下载地址（URI 或本地绝对路径）；key: 密钥源地址
   final bool remote; // url 是否为网络地址
@@ -1405,6 +1687,16 @@ class _PlaylistEntry {
     required this.raw,
   })  : type = 'key',
         name = null;
+
+  /// fMP4 初始化段（#EXT-X-MAP 的 URI）。没有它，m4s 分片在 ffmpeg 眼里
+  /// 是「没有 trex 的 moof」，合成必败（could not find corresponding trex）。
+  _PlaylistEntry.map({
+    required this.url,
+    required this.remote,
+    required this.raw,
+  })  : type = 'map',
+        name = null,
+        iv = null;
 
   _PlaylistEntry.plain(this.raw)
       : type = 'plain',
