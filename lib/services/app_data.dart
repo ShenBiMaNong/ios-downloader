@@ -66,11 +66,17 @@ class AppData extends ChangeNotifier {
 
   /// 上次打开的页面（供「浏览器启动页 = 上次打开页」恢复）
   String lastUrl = '';
-  bool _loaded = false;
 
-  Future<void> ensureLoaded() async {
-    if (_loaded) return;
-    _loaded = true;
+  /// 加载中的 Future，而不是「已开始加载」的 bool：
+  /// 浏览器页 initState 里 `_installEarlyScripts` 与 `_initStartPage` 会并发调用
+  /// 本方法，若第二个调用者一看到标记就返回，它读到的是尚未落盘的 [lastUrl]
+  /// （空串）→ 启动页回落到默认首页 bilibili，并且随后的 onPageStarted
+  /// 还会把 bilibili 当成「上次打开页」覆盖存档，于是每次启动都停在 bilibili。
+  Future<void>? _loading;
+
+  Future<void> ensureLoaded() => _loading ??= _load();
+
+  Future<void> _load() async {
     try {
       final f = await _file();
       if (await f.exists()) {
@@ -196,6 +202,9 @@ class AppData extends ChangeNotifier {
 
   /// 记录最近打开的页面（页面开始加载时调用）
   Future<void> setLastUrl(String url) async {
+    // 只记真实网页：选「空白页」启动时 WebView 会加载 about:blank，
+    // 记下来会让「上次打开页」下次去加载 https://about:blank 这种废地址
+    if (!url.startsWith('http://') && !url.startsWith('https://')) return;
     if (url == lastUrl) return;
     lastUrl = url;
     notifyListeners();

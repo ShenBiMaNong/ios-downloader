@@ -13,6 +13,7 @@ import '../models/video_info.dart';
 import 'app_log.dart';
 import 'background_task.dart';
 import 'file_names.dart';
+import 'local_media_path.dart';
 import 'native_bg_downloader.dart';
 
 class ConvertTask {
@@ -180,6 +181,24 @@ class ConvertManager extends ChangeNotifier {
             if (j is! Map<String, dynamic>) continue;
             final t = ConvertTask.fromPendingJson(j);
             if (tasks.any((x) => x.id == t.id)) continue;
+            final wd = t.workDir ?? '';
+            if (wd.isNotEmpty && !Directory(wd).existsSync()) {
+              // 记的是下载那一刻的绝对路径；换了数据容器（重装 / 换签名后 UUID 变）
+              // 分片目录跟着 Documents 一起搬了家，先按当前容器翻译回去再判丢失，
+              // 否则这条断点会被当成「缓存已丢」直接删掉，明明还能续传
+              final mapped = remapToDocuments(wd, docs.path);
+              if (mapped != null && Directory(mapped).existsSync()) {
+                t.workDir = mapped;
+                j['workDir'] = mapped;
+                AppLog.instance.info(
+                    'convert', '分片工作目录已按当前容器重新定位: $wd → $mapped');
+                try {
+                  await entity.writeAsString(jsonEncode(j));
+                } catch (e) {
+                  AppLog.instance.warn('convert', '重新定位后的断点回写失败: ${t.id}', e);
+                }
+              }
+            }
             if (t.workDir == null || !Directory(t.workDir!).existsSync()) {
               // 分片缓存已丢失，无法续传，清理记录
               if (await entity.exists()) await entity.delete();

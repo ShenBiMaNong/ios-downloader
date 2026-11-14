@@ -13,6 +13,7 @@ import 'app_log.dart';
 import 'background_task.dart';
 import 'file_names.dart';
 import 'hls_manager.dart';
+import 'local_media_path.dart';
 import 'm3u8_convert.dart';
 import 'native_bg_downloader.dart';
 
@@ -300,7 +301,60 @@ class DownloadManager extends ChangeNotifier {
       final tb = b['savedAt'] as String? ?? '';
       return tb.compareTo(ta);
     });
+    await _repairSavedPaths(result);
     return result;
+  }
+
+  /// 把元数据里失效的绝对路径按当前容器重新定位，命中就地回写 `<id>.json`。
+  ///
+  /// `localPath` 记的是**下载那一刻**的绝对路径，里面的数据容器 UUID 并不保证
+  /// 跨安装稳定 —— 换签名身份、删掉重装（sideload 的常态）之后，文件跟着
+  /// Documents 一起换了容器，元数据却还指着老 UUID。表现就是整库历史视频
+  /// 同时「打不开」，而 AVFoundation 只回一句不分成因的 OSStatus，
+  /// 看上去跟「文件损坏」一模一样（可文件在系统「文件」App 里照常能播）。
+  ///
+  /// 只在原路径 stat 不到时才走重定位，稳态下每条多一次 existsSync。
+  Future<void> _repairSavedPaths(List<Map<String, dynamic>> saved) async {
+    if (saved.isEmpty) return;
+    ContainerRelocator? relocator;
+    for (final m in saved) {
+      final stored = (m['localPath'] as String?) ?? '';
+      final id = (m['id'] as String?) ?? '';
+      if (stored.isEmpty || id.isEmpty) continue;
+      // HLS 离线包（.movpkg）不在 Documents 下、由系统按任务寻址，
+      // 按文件名回查只可能撞上同名的别的条目
+      if ((m['hls'] as bool?) ?? false) continue;
+      // 路径还指得到东西（文件或目录，分片包是目录）：正常条目，不动
+      if (pathExists(stored)) continue;
+      if (relocator == null) {
+        try {
+          relocator = await ContainerRelocator.current();
+        } catch (e) {
+          // 路径通道不可用（没注册插件的执行环境）：判不了就不猜，原样交回
+          AppLog.instance
+              .warn('download', '取不到当前 Documents 目录，跳过路径重定位', e);
+          return;
+        }
+      }
+      // null = 按当前容器也认不出这个文件（交给起播前的检查说清楚）
+      final hit = relocator?.relocate(stored);
+      // 前面已排除了活路径，same 理论上不会出现，出现也当无需处理
+      if (hit == null || hit.kind == Relocation.same) continue;
+      m['localPath'] = hit.path;
+      AppLog.instance.info(
+        'download',
+        '元数据路径已按当前容器重新定位（${hit.kind.name}）: $stored → ${hit.path}',
+      );
+      try {
+        final dl = await downloadsDir();
+        final meta = File(p.join(dl.path, '$id.json'));
+        if (await meta.exists()) {
+          await meta.writeAsString(jsonEncode(m));
+        }
+      } catch (e) {
+        AppLog.instance.warn('download', '重新定位后的元数据回写失败: $id', e);
+      }
+    }
   }
 
   Future<void> download(VideoInfo v) async {

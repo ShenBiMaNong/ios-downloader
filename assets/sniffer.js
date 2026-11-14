@@ -22,6 +22,55 @@
 (function () {
   var CHANNEL = 'videoFound';
 
+  // ── 诊断元数据（不参与判定）──────────────────────────────────────────
+  // 用户报「有时嗅到、有时嗅不到」时，必须能回答四个问题：
+  //   ① 脚本真的装进当前文档了吗（injects / via / epoch）
+  //   ② 装得早还是晚（hook.readyState：complete = 页面脚本已经跑完，可能已缓存原生 fetch）
+  //   ③ 钩子还在吗（站点可能又把 window.fetch / XHR.open 覆盖回去）
+  //   ④ 各采集通道到底跑没跑、候选池最后是什么状态（stats / counts / events）
+  // 这些字段只被 __vdlSniff.diag() 读取，不影响 best/list 的判定。
+  var VERSION = 'sniff-2.4';
+  var BOOT_AT = Date.now();
+  window.__vdlSniffVersion = VERSION;
+  window.__vdlSniffLastInjectAt = BOOT_AT;
+  window.__vdlSniffInjectCount = (window.__vdlSniffInjectCount || 0) + 1;
+  if (!window.__vdlSniffInstalledAt) window.__vdlSniffInstalledAt = BOOT_AT;
+  // 首次装进文档的来源（early=WKUserScript / dart=导航回调补注入）。之后同一文档再被
+  // 补注入时 __vdlSniffVia 会被改写，所以单独留一份「安装时」的来源给面板判断。
+  window.__vdlSniffLastVia = window.__vdlSniffVia || '';
+  if (!window.__vdlSniffInstalledVia && window.__vdlSniffVia) {
+    window.__vdlSniffInstalledVia = window.__vdlSniffVia;
+  }
+
+  var stats = {
+    collect: 0, attr: 0, perf: 0, script: 0,
+    fetch: 0, xhr: 0, anchor: 0, probe: 0, click: 0
+  };
+  var EVENTS = [];
+  var MAX_EVENTS = 120;
+
+  function evUrl(u) {
+    try {
+      var s = String(u || '');
+      return s.length > 140 ? s.slice(0, 128) + '…' + s.slice(-8) : s;
+    } catch (e) { return ''; }
+  }
+
+  // 候选生命周期事件：只记「创建 / 判死 / 状态升级 / 分数升级 / 播放锚定」，
+  // 属性扫描每 2s 对同一条重复 offer 不会写事件（它只刷 ts），否则时间线会被刷爆。
+  function ev(type, r, extra) {
+    try {
+      var e = {
+        t: Date.now(), ev: type,
+        u: evUrl(r && r.u), k: (r && r.k) || '',
+        sc: (r && r.sc) || 0, st: (r && r.st) || '', src: (r && r.src) || ''
+      };
+      if (extra) e.x = String(extra);
+      EVENTS.push(e);
+      if (EVENTS.length > MAX_EVENTS) EVENTS.splice(0, EVENTS.length - MAX_EVENTS);
+    } catch (e2) {}
+  }
+
   var HLS_EXT = /\.m3u8([?#]|$)/i;
   var DASH_EXT = /\.mpd([?#]|$)/i;
   var FILE_EXT = /\.(mp4|mov|webm|mkv|flv|f4v|m4v|ts|m2ts|mts|mpg|mpeg|avi|wmv|asf|3gp|3g2|ogv|ogm|rm|rmvb)([?#]|$)/i;
@@ -241,25 +290,36 @@
         if (urls.length > MAX) prune();
         r.posted = 1;
         post(r);
+        ev('new', r);
       } else if (fk && r.k === 'other') {
         r.k = fk;
       }
 
+      var prevSt = r.st;
+      var prevSc = r.sc;
       var upd = false;
       if (state === 'dead') {
         // 普通 dead（一次请求失败）不推翻已有 ok/播放证据 —— 站点可能只是该次被限流；
         // 但内容级 dead（hard，读到了响应体且不是清单）是确定性结论，必须推翻状态码级的 ok。
         // 唯一例外：正在播放的源永远不被判死。
         if (!r.play && (hard || r.st !== 'ok')) {
-          if (r.st !== 'dead') { r.st = 'dead'; upd = true; }
+          if (r.st !== 'dead') {
+            r.st = 'dead';
+            upd = true;
+            ev('dead', r, hard ? 'hard' : 'soft');
+          }
           r.sc = S_DEAD;
         }
       } else {
         if (r.st === 'dead') { r.st = 'ok'; upd = true; }
         else if (state === 'ok' && r.st !== 'ok') { r.st = 'ok'; upd = true; }
         if (score > r.sc) { r.sc = score; upd = true; }
-        // 播放锚定：每次播放都要刷新时间戳（多条都锚定时按最近一次播放决胜）
-        if (score >= S_PLAY) { r.play = 1; r.ts = Date.now(); }
+        // 播放锚定：每次播放都要刷新时间戳（多条都锚定时按最近一次播放决胜）。
+        // 事件只记 0→1 那一次：checkPlaying 每 2s 会对正在播的元素重复锚定。
+        if (score >= S_PLAY) {
+          if (!r.play) { r.play = 1; ev('play', r); }
+          r.ts = Date.now();
+        }
       }
 
       if (upd) {
@@ -267,6 +327,9 @@
         if (src) r.src = src;
         // 升级成 ok 时补报一次（Dart 侧/调试页可据此刷新列表）
         if (r.st === 'ok' && !r.postedOk) { r.postedOk = 1; post(r); }
+        // 状态/分数真的变了才落时间线；重复 offer 不写
+        if (r.st === 'ok' && prevSt !== 'ok') ev('ok', r);
+        else if (r.sc !== prevSc) ev('up', r, prevSc + '>' + r.sc);
       }
       // 属性证据的「现在性」由 DOM 决定：值还挂在元素上就说明它此刻仍然有效，
       // 每轮扫描都要刷新时间戳，否则 30s 后会被 pickForPlayback 的时效窗口排除掉。
@@ -372,6 +435,7 @@
 
   function collect() {
     if (!docOk()) return;
+    stats.collect++;
     var els = document.querySelectorAll('video, source');
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
@@ -429,6 +493,7 @@
 
   function attrScan() {
     if (!docOk()) return;
+    stats.attr++;
     try {
       var els = document.querySelectorAll(ATTR_SEL);
       for (var i = 0; i < els.length; i++) {
@@ -473,6 +538,7 @@
 
   function scanScripts() {
     if (!docOk()) return;
+    stats.script++;
     try {
       var ss = document.querySelectorAll('script');
       if (ss.length === _lastScriptCount) return; // 脚本没变就不重复扫
@@ -517,6 +583,7 @@
   function collectPerf() {
     try {
       if (!window.performance || !performance.getEntriesByType) return;
+      stats.perf++;
       if (performance.setResourceTimingBufferSize) {
         try { performance.setResourceTimingBufferSize(2000); } catch (e) {}
       }
@@ -591,6 +658,7 @@
   function anchorFrom(v) {
     try {
       if (!v || v.tagName !== 'VIDEO') return;
+      stats.anchor++;
       // 广告/预览小窗（几百像素的宣传片）不参与锚定，避免把主播放源的分数顶掉
       var r = v.getBoundingClientRect ? v.getBoundingClientRect() : null;
       if (r && (r.width < 160 || r.height < 90)) return;
@@ -638,7 +706,8 @@
     window.__vdlFetchHooked = 1;
     var origFetch = window.fetch;
     window.__vdlRawFetch = origFetch;
-    window.fetch = function (input, init) {
+    var wrappedFetch = function (input, init) {
+      stats.fetch++;
       var u = (typeof input === 'string') ? input : (input && input.url) || '';
       var self = this, args = arguments;
       // 请求刚发出：还什么都不知道，只登记为猜测
@@ -702,6 +771,10 @@
       }
       return p;
     };
+    // 打上标记：diag() 用它判断「站点有没有在注入后把 fetch 覆盖回去」。
+    // 覆盖回去 = 之后的请求一个都看不到，正是「有时嗅不到」的一条硬成因。
+    wrappedFetch.__vdlWrapped = 1;
+    window.fetch = wrappedFetch;
   }
 
   // ── G. 钩住 XMLHttpRequest ────────────────────────────────────────────
@@ -710,7 +783,8 @@
   if (!window.__vdlXhrHooked) {
     window.__vdlXhrHooked = 1;
     var origOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function (m, u) {
+    var wrappedOpen = function (m, u) {
+      stats.xhr++;
       var xhr = this;
       var url = String(u || '');
       if (url) offer(url, S_GUESS, 'guess', 'xhr');
@@ -751,6 +825,19 @@
         }, false);
       } catch (e) {}
       return origOpen.apply(this, arguments);
+    };
+    wrappedOpen.__vdlWrapped = 1;
+    XMLHttpRequest.prototype.open = wrappedOpen;
+  }
+
+  // 记录「挂钩发生在文档的哪个阶段」：complete 说明是 onPageFinished 之后的兜底注入，
+  // 页面脚本很可能已经缓存了原生 fetch / XHR.open —— 之后的请求全部绕过钩子。
+  // 只记第一次：后续重复注入不该把「其实是早注入」改写成「晚注入」。
+  if (!window.__vdlSniffHookInfo) {
+    window.__vdlSniffHookInfo = {
+      at: Date.now(),
+      readyState: (typeof document !== 'undefined' && document && document.readyState) || '',
+      via: window.__vdlSniffVia || ''
     };
   }
 
@@ -794,6 +881,7 @@
   //   404/410/5xx、2xx 但内容不是清单、2xx+text/html  → dead（确定性结论）
   //   401/403、fetch 被拒（无 CORS 头/证书/断连）      → unknown（探测失败 ≠ 链接坏）
   function probeOne(u) {
+    stats.probe++;
     var k = kindOf(u);
     PROBED[u] = Date.now();
     var unknown = { url: u, state: 'unknown', code: 0, via: 'fetch' };
@@ -939,6 +1027,56 @@
       if (r.exp === undefined) r.exp = parseExp(u);
       return r.exp || 0;
     },
+    version: VERSION,
+    // 现场诊断快照（「嗅探诊断」面板每秒调一次）。只读，不改候选池。
+    diag: function () {
+      var now = Date.now();
+      var arr = ranked('');
+      var counts = { all: arr.length, ok: 0, dead: 0, guess: 0, play: 0 };
+      var out = [];
+      for (var i = 0; i < arr.length && i < 60; i++) {
+        var r = arr[i];
+        counts[r.st] = (counts[r.st] || 0) + 1;
+        if (r.play) counts.play++;
+        out.push({
+          u: r.u, k: r.k, sc: r.sc, st: r.st, src: r.src,
+          age: Math.max(0, Math.round((now - r.ts) / 1000)),
+          code: r.code || 0,
+          play: r.play ? 1 : 0,
+          dur: r.dur || 0,
+          exp: r.exp || 0,
+          expired: staleOf(r),
+          soon: soonOf(r)
+        });
+      }
+      return {
+        v: VERSION,
+        bootAt: BOOT_AT,
+        injects: window.__vdlSniffInjectCount || 1,
+        lastInjectAt: window.__vdlSniffLastInjectAt || 0,
+        installedAt: window.__vdlSniffInstalledAt || 0,
+        via: window.__vdlSniffInstalledVia || window.__vdlSniffVia || '',
+        lastVia: window.__vdlSniffVia || '',
+        epoch: (window.__vdlViewEpoch === undefined ? null : window.__vdlViewEpoch),
+        href: location.href,
+        top: window === window.top,
+        readyState: (typeof document !== 'undefined' && document && document.readyState) || '',
+        hook: window.__vdlSniffHookInfo || null,
+        // 钩子还在不在：站点在注入后重新赋值 window.fetch / XHR.open 就会变 false
+        fetchHooked: !!(window.fetch && window.fetch.__vdlWrapped === 1),
+        xhrHooked: !!(window.XMLHttpRequest &&
+          XMLHttpRequest.prototype.open && XMLHttpRequest.prototype.open.__vdlWrapped === 1),
+        rawFetchKept: !!window.__vdlRawFetch,
+        stats: {
+          collect: stats.collect, attr: stats.attr, perf: stats.perf,
+          script: stats.script, fetch: stats.fetch, xhr: stats.xhr,
+          anchor: stats.anchor, probe: stats.probe, click: stats.click
+        },
+        counts: counts,
+        cands: out,
+        events: EVENTS.slice(-60)
+      };
+    },
     // 调试用
     dump: function () {
       return ranked('').map(function (r) {
@@ -991,6 +1129,7 @@
   // 把角标出现时间压到 2s 轮询之前；后续变化仍由 fetch/XHR 钩子实时接住。
   var CLICK_SCAN_DELAYS = [60, 400, 1200, 3000];
   document.addEventListener('click', function () {
+    stats.click++;
     // forEach 给每次迭代独立闭包；用 for + var 会让所有定时器都读到循环结束后的 i
     CLICK_SCAN_DELAYS.forEach(function (delay) {
       setTimeout(function () {

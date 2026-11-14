@@ -7,12 +7,13 @@ import 'package:video_player/video_player.dart';
 
 import '../models/playable_item.dart';
 import '../services/app_log.dart';
+import '../services/local_media_path.dart';
 import '../services/playback_progress.dart';
 import '../services/player_settings.dart';
 import 'settings_page.dart';
 
 /// 本地视频播放页：播放列表 + 手势控制
-/// 点按暂停 / 双击左右半边快退快进 / 按住左半边快退、右半边加速
+/// 点按暂停 / 双击左右半边快退快进 / 长按任意位置加速播放
 /// 左右拖动：跟手快退快进（拖动中实时预览目标时间）
 /// 上下拖动：上一个 / 下一个（带滑动入场动画）
 /// 支持本地文件 / 网络源（边播边缓存本地代理 URL、直连 URL），
@@ -34,6 +35,8 @@ class _PlayerPageState extends State<PlayerPage>
   bool _initFailed = false;
   bool _completionHandled = false;
   bool _errorReported = false;
+  /// 本地文件起播前实测出的具体成因（null = 未检出 / 网络源，用通用文案）
+  String? _failureHint;
 
   // 进度记忆状态
   Timer? _saveTimer;
@@ -41,8 +44,7 @@ class _PlayerPageState extends State<PlayerPage>
   bool _fallbackUsed = false;
 
   // 手势状态
-  bool? _holdLeft; // true=按住左半边快退，false=按住右半边快进，null=未按住
-  Timer? _holdTimer;
+  bool _holding = false; // 长按加速中
   bool _holdWasPlaying = false;
   double? _doubleTapDx;
 
@@ -52,6 +54,11 @@ class _PlayerPageState extends State<PlayerPage>
   Duration _hDragOrigin = Duration.zero;
   Duration _hDragTarget = Duration.zero;
   DateTime _lastLiveSeek = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // 底部进度条拖动（触控区比视觉轨道大得多）
+  Duration? _scrubTarget;
+  bool _scrubWasPlaying = false;
+  DateTime _lastScrubSeek = DateTime.fromMillisecondsSinceEpoch(0);
 
   // 上下拖动：上一个 / 下一个
   bool _vDragging = false;
@@ -83,7 +90,6 @@ class _PlayerPageState extends State<PlayerPage>
 
   @override
   void dispose() {
-    _holdTimer?.cancel();
     _saveTimer?.cancel();
     _slideCtrl.dispose();
     _saveProgressNow();
@@ -95,6 +101,17 @@ class _PlayerPageState extends State<PlayerPage>
     _completionHandled = false;
     _errorReported = false;
     final item = widget.playlist[_index];
+    final isLocal = (item.playUrl ?? item.url) == null;
+    _failureHint =
+        isLocal ? localIssueText(preflightLocalFile(item.path ?? '')) : null;
+    if (isLocal && _failureHint != null) {
+      // 播放器给的那句 OSStatus 不分成因，这里把实测到的判据一并留进日志，
+      // 事后能从日志直接分清「路径失联」还是「字节不是 MP4」
+      AppLog.instance.warn(
+        'player',
+        '本地文件预检不通过: ${item.path} → $_failureHint',
+      );
+    }
     // 主源：playUrl（缓存代理）→ url（直连）；兜底后改用 fallbackUrl
     final play = _fallbackUsed
         ? (item.fallbackUrl ?? item.playUrl ?? item.url)
@@ -213,12 +230,11 @@ class _PlayerPageState extends State<PlayerPage>
   /// 切换到指定条目；[slideDir] 非空时播放滑动入场动画
   /// （1 = 下一个，从右侧滑入；-1 = 上一个，从左侧滑入）
   void _goTo(int i, {double? slideDir}) {
-    _holdTimer?.cancel();
-    _holdTimer = null;
-    _holdLeft = null;
+    _holding = false;
     _hDragging = false;
     _vDragging = false;
     _vDragDy = 0;
+    _scrubTarget = null;
     _saveProgressNow();
     _controller.removeListener(_onValueChanged);
     _controller.dispose();
@@ -244,6 +260,61 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   bool get _canSwitch => widget.playlist.length > 1;
+
+  // ---- 底部进度条：拖动 / 点按定位 ----
+
+  Duration _ratioToDuration(Duration duration, double ratio) {
+    final r = ratio.clamp(0.0, 1.0);
+    return Duration(milliseconds: (duration.inMilliseconds * r).round());
+  }
+
+  /// 点进度条任意位置直接跳转
+  void _scrubTap(double dx, double width) {
+    final v = _controller.value;
+    if (!v.isInitialized || v.duration <= Duration.zero || width <= 0) return;
+    _controller.seekTo(_ratioToDuration(v.duration, dx / width));
+  }
+
+  void _scrubStart(double dx, double width) {
+    final v = _controller.value;
+    if (!v.isInitialized || v.duration <= Duration.zero || width <= 0) return;
+    // 拖动期间先暂停，松手后恢复到原来的播放状态，避免画面边拖边跑
+    _scrubWasPlaying = v.isPlaying;
+    if (_scrubWasPlaying) _controller.pause();
+    _scrubTarget = _ratioToDuration(v.duration, dx / width);
+    _lastScrubSeek = DateTime.now();
+    _controller.seekTo(_scrubTarget!);
+    setState(() {});
+  }
+
+  void _scrubUpdate(double dx, double width) {
+    final v = _controller.value;
+    if (_scrubTarget == null ||
+        !v.isInitialized ||
+        v.duration <= Duration.zero ||
+        width <= 0) {
+      return;
+    }
+    final target = _ratioToDuration(v.duration, dx / width);
+    _scrubTarget = target;
+    setState(() {});
+    // 跟手 seek：节流 100ms，兼顾画面预览与解码开销
+    final now = DateTime.now();
+    if (now.difference(_lastScrubSeek).inMilliseconds >= 100) {
+      _lastScrubSeek = now;
+      _controller.seekTo(target);
+    }
+  }
+
+  void _scrubEnd() {
+    final target = _scrubTarget;
+    if (target == null) return;
+    _scrubTarget = null;
+    _controller.seekTo(target);
+    if (_scrubWasPlaying) _controller.play();
+    _scrubWasPlaying = false;
+    setState(() {});
+  }
 
   // ---- 左右拖动：快退 / 快进 ----
 
@@ -353,31 +424,21 @@ class _PlayerPageState extends State<PlayerPage>
     _seekBy(Duration(seconds: dx < width / 2 ? -s.seekSeconds : s.seekSeconds));
   }
 
-  void _startHold(bool left) {
+  /// 长按任意位置：按倍速加速播放，松开恢复
+  void _startHold() {
     if (!_controller.value.isInitialized) return;
     _holdWasPlaying = _controller.value.isPlaying;
-    _holdLeft = left;
+    _holding = true;
     _controller.play();
-    if (left) {
-      // 按住左半边：按倍速持续快退
-      final s = PlayerSettings.instance;
-      _holdTimer = Timer.periodic(const Duration(milliseconds: 300), (_) {
-        _seekBy(Duration(milliseconds: -(300 * s.holdSpeed).round()));
-      });
-    } else {
-      // 按住右半边：加速播放
-      _controller.setPlaybackSpeed(PlayerSettings.instance.holdSpeed);
-    }
+    _controller.setPlaybackSpeed(PlayerSettings.instance.holdSpeed);
     setState(() {});
   }
 
   void _endHold() {
-    if (_holdLeft == null) return;
-    _holdTimer?.cancel();
-    _holdTimer = null;
+    if (!_holding) return;
     _controller.setPlaybackSpeed(1.0);
     if (!_holdWasPlaying) _controller.pause();
-    _holdLeft = null;
+    _holding = false;
     setState(() {});
   }
 
@@ -422,9 +483,15 @@ class _PlayerPageState extends State<PlayerPage>
 
   Widget _body() {
     if (_initFailed) {
-      return const Center(
-        child: Text('播放失败（文件可能损坏或格式不支持）',
-            style: TextStyle(color: Colors.white)),
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Text(
+            _failureHint ?? '播放失败（文件可能损坏或格式不支持）',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white),
+          ),
+        ),
       );
     }
     if (!_controller.value.isInitialized) {
@@ -450,9 +517,8 @@ class _PlayerPageState extends State<PlayerPage>
                 // 双击左/右半边：按设置秒数快退/快进
                 onDoubleTapDown: (d) => _doubleTapDx = d.localPosition.dx,
                 onDoubleTap: () => _seekByTap(width),
-                // 按住左/右半边：加速快退/快进
-                onLongPressStart: (d) =>
-                    _startHold(d.localPosition.dx < width / 2),
+                // 长按任意位置：加速播放
+                onLongPressStart: (_) => _startHold(),
                 onLongPressEnd: (_) => _endHold(),
                 onLongPressCancel: _endHold,
                 // 左右拖动：跟手快退 / 快进
@@ -481,7 +547,7 @@ class _PlayerPageState extends State<PlayerPage>
                       ),
                       if (_hDragging) _seekIndicator(),
                       if (_vDragging) _switchIndicator(),
-                      if (_holdLeft != null) _holdIndicator(),
+                      if (_holding) _holdIndicator(),
                     ],
                   ),
                 ),
@@ -569,7 +635,6 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   Widget _holdIndicator() {
-    final isLeft = _holdLeft == true;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       decoration: BoxDecoration(
@@ -579,13 +644,10 @@ class _PlayerPageState extends State<PlayerPage>
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(isLeft ? Icons.fast_rewind : Icons.fast_forward,
-              color: Colors.white),
+          const Icon(Icons.fast_forward, color: Colors.white),
           const SizedBox(width: 8),
           Text(
-            isLeft
-                ? '按住快退 ×${_fmtSpeed(PlayerSettings.instance.holdSpeed)}'
-                : '按住快进 ×${_fmtSpeed(PlayerSettings.instance.holdSpeed)}',
+            '按住快进 ×${_fmtSpeed(PlayerSettings.instance.holdSpeed)}',
             style: const TextStyle(color: Colors.white),
           ),
         ],
@@ -599,8 +661,27 @@ class _PlayerPageState extends State<PlayerPage>
       builder: (context, v, _) {
         final s = PlayerSettings.instance;
         final canNavigate = widget.playlist.length > 1;
+        final scrubbing = _scrubTarget != null;
+        final shown = _scrubTarget ?? v.position;
         return Column(
           children: [
+            // 进度条单独占一行：左右只剩快退快进按钮，把可拖动宽度尽量放大
+            Row(
+              children: [
+                _seekButton(
+                  forward: false,
+                  seconds: s.seekSeconds,
+                  onPressed: () =>
+                      _seekBy(Duration(seconds: -s.seekSeconds)),
+                ),
+                Expanded(child: _seekbar(v)),
+                _seekButton(
+                  forward: true,
+                  seconds: s.seekSeconds,
+                  onPressed: () => _seekBy(Duration(seconds: s.seekSeconds)),
+                ),
+              ],
+            ),
             Row(
               children: [
                 IconButton(
@@ -614,26 +695,13 @@ class _PlayerPageState extends State<PlayerPage>
                           )
                       : null,
                 ),
-                _seekButton(
-                  forward: false,
-                  seconds: s.seekSeconds,
-                  onPressed: () =>
-                      _seekBy(Duration(seconds: -s.seekSeconds)),
-                ),
-                Expanded(
-                  child: VideoProgressIndicator(
-                    _controller,
-                    allowScrubbing: true,
-                    colors: const VideoProgressColors(
-                      playedColor: Colors.indigoAccent,
-                      bufferedColor: Colors.white24,
-                    ),
+                IconButton(
+                  icon: Icon(
+                    v.isPlaying ? Icons.pause : Icons.play_arrow,
+                    color: Colors.white,
                   ),
-                ),
-                _seekButton(
-                  forward: true,
-                  seconds: s.seekSeconds,
-                  onPressed: () => _seekBy(Duration(seconds: s.seekSeconds)),
+                  tooltip: '播放 / 暂停',
+                  onPressed: _togglePlay,
                 ),
                 IconButton(
                   icon: const Icon(Icons.skip_next, color: Colors.white),
@@ -646,21 +714,15 @@ class _PlayerPageState extends State<PlayerPage>
                           )
                       : null,
                 ),
-              ],
-            ),
-            Row(
-              children: [
-                IconButton(
-                  icon: Icon(
-                    v.isPlaying ? Icons.pause : Icons.play_arrow,
-                    color: Colors.white,
-                  ),
-                  tooltip: '播放 / 暂停',
-                  onPressed: _togglePlay,
-                ),
+                const SizedBox(width: 2),
                 Text(
-                  _fmt(v.position),
-                  style: const TextStyle(color: Colors.white70, fontSize: 12),
+                  _fmt(shown),
+                  style: TextStyle(
+                    color: scrubbing ? Colors.indigoAccent : Colors.white70,
+                    fontSize: 12,
+                    fontWeight:
+                        scrubbing ? FontWeight.w600 : FontWeight.normal,
+                  ),
                 ),
                 const SizedBox(width: 4),
                 Text(
@@ -681,6 +743,49 @@ class _PlayerPageState extends State<PlayerPage>
               ],
             ),
           ],
+        );
+      },
+    );
+  }
+
+  /// 加大可操作性的进度条：40 高的触控区 + 加粗轨道 + 常显滑块，
+  /// 点按任意位置跳转，横向拖动跟手预览
+  Widget _seekbar(VideoPlayerValue v) {
+    final totalMs = v.duration.inMilliseconds;
+    final shown = _scrubTarget ?? v.position;
+    final progress = totalMs > 0
+        ? (shown.inMilliseconds / totalMs).clamp(0.0, 1.0).toDouble()
+        : 0.0;
+    var buffered = 0.0;
+    if (totalMs > 0) {
+      for (final r in v.buffered) {
+        final end = r.end.inMilliseconds / totalMs;
+        if (end > buffered) buffered = end;
+      }
+    }
+    if (buffered < progress) buffered = progress;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (d) => _scrubTap(d.localPosition.dx, width),
+          onHorizontalDragStart: (d) =>
+              _scrubStart(d.localPosition.dx, width),
+          onHorizontalDragUpdate: (d) =>
+              _scrubUpdate(d.localPosition.dx, width),
+          onHorizontalDragEnd: (_) => _scrubEnd(),
+          onHorizontalDragCancel: _scrubEnd,
+          child: SizedBox(
+            height: 40,
+            child: CustomPaint(
+              painter: _SeekBarPainter(
+                progress: progress,
+                buffered: buffered.clamp(0.0, 1.0).toDouble(),
+                scrubbing: _scrubTarget != null,
+              ),
+            ),
+          ),
         );
       },
     );
@@ -720,4 +825,78 @@ class _PlayerPageState extends State<PlayerPage>
     if (h > 0) return '${h.toString().padLeft(2, '0')}:$m:$s';
     return '$m:$s';
   }
+}
+
+/// 底部进度条：加粗轨道 + 常显圆形滑块，拖动时整体再放大一档。
+/// 触控高度由外层 SizedBox 提供（40），两端留出滑块半径的余量避免被裁切
+class _SeekBarPainter extends CustomPainter {
+  _SeekBarPainter({
+    required this.progress,
+    required this.buffered,
+    required this.scrubbing,
+  });
+
+  final double progress;
+  final double buffered;
+  final bool scrubbing;
+
+  static const double _thumbInset = 8;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final cy = size.height / 2;
+    final trackHeight = scrubbing ? 7.0 : 5.0;
+    final left = _thumbInset;
+    final right = size.width - _thumbInset;
+    if (right <= left) return;
+    final width = right - left;
+    final radius = Radius.circular(trackHeight / 2);
+
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(left, cy - trackHeight / 2, width, trackHeight),
+        radius,
+      ),
+      Paint()..color = Colors.white24,
+    );
+    if (buffered > 0) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(
+              left, cy - trackHeight / 2, width * buffered, trackHeight),
+          radius,
+        ),
+        Paint()..color = Colors.white38,
+      );
+    }
+    if (progress > 0) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(
+              left, cy - trackHeight / 2, width * progress, trackHeight),
+          radius,
+        ),
+        Paint()..color = Colors.indigoAccent,
+      );
+    }
+
+    final thumbX = left + width * progress;
+    final thumbR = scrubbing ? 8.5 : 6.5;
+    canvas.drawCircle(
+      Offset(thumbX, cy),
+      thumbR + 2,
+      Paint()..color = Colors.black38,
+    );
+    canvas.drawCircle(
+      Offset(thumbX, cy),
+      thumbR,
+      Paint()..color = Colors.white,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_SeekBarPainter oldDelegate) =>
+      oldDelegate.progress != progress ||
+      oldDelegate.buffered != buffered ||
+      oldDelegate.scrubbing != scrubbing;
 }

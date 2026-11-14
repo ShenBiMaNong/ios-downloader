@@ -1,6 +1,6 @@
 # 嗅探判定 / 播放接管 回归测试（jsdom）
 
-四个测试，都跑在 jsdom 里，不参与 App 构建：
+八个测试（`npm test` 串联执行），都跑在 jsdom 里，不参与 App 构建：
 
 - `test_ab.js`：验证 `assets/sniffer.js` 在「站点多线路试探」场景下能否挑出**真正能用**的那条 m3u8，并与 `baseline/sniffer_v1.js`（冻结的 v1）做 A-B 对照。
 - `test_hijack.js`：验证 `assets/no_autoplay.js` 的「点播放即接管」——该接管时接管，该放行时必须放行（不能出现「点了没反应」）。
@@ -9,6 +9,7 @@
 - `test_marker_lazy.js`：验证「角标什么时候该出来」——站点懒赋 `src`（点播放才给地址）时，只要嗅探器拿得到候选就必须**不点也出角标**；什么都没有时主播放器立中性角标，地址一到卡片自动升级；小窗尺寸不给角标。
 - `test_marker_early.js`：验证「刷新后角标不出、开关关→开就有了」这条链路——极早注入（`<body>` 尚未创建）后页面解析出 `<video>` 必须自动出角标；shadow root 内的 `<video>`（自绘播放器）与 `video.srcObject`（`src` 全空）不能漏；同源 iframe 内的 `<video>` 由主帧收集且坐标要换算 iframe 偏移；`__vdlBadge` 残留（指向已脱离文档的 badge）不能挡住重建；`__vdlCleanup` 后重新注入必须重建角标。
 - `test_swipe.js`：验证左右滑动手势（`browser_swipe.js`）——右滑=back、左滑=forward 且一次手势只发一条消息（脚本幂等）；输入框/contenteditable、文本选区、双指、慢速拖拽、纵向主导、位移不足、横向滚动容器未到边界一律不触发；触发后合成 click 被吞掉、正常点击不受影响。
+- `test_diag.js`：验证**诊断本身不骗人**（对应 App 内「更多 → 嗅探诊断（当前页）」面板）——嗅探快照带版本/注入元信息/钩子标记/统计/事件；站点覆盖 `window.fetch` 后必须报 `fetchHooked=false`；角标开关关闭时仍留最小快照（能区分「关了」与「没注入」）；`badged` / `skipped:no-src-small` / `hidden:offscreen` / `hidden:zero-size` 四种状态逐个可辨；`markerDiag` 上报必须带原因串与候选统计。
 
 ## 跑法
 
@@ -48,6 +49,16 @@ H 场景做过 A-B 对照：把时长比对去掉（等价改前逻辑）后，�
 
 另外 A 里对同一页面连续注入两次 `sniffer.js`，验证幂等（Dart 在
 `onPageStarted` + `onPageFinished` 各注入一次，不会重复包装 fetch/XHR）。
+
+## 诊断面板（test_diag.js）
+
+| 编号 | 输入 | 期望 |
+|---|---|---|
+| 诊1 | 正常注入后发 2 个 fetch（1 个 `#EXTM3U`、1 个 404） | 快照有版本/注入次数/`hook.readyState`；`fetchHooked`/`xhrHooked` 均为真；`stats.fetch=2`；候选 `ok=1`、`dead=1`；事件含 `new/ok/dead` |
+| 诊2 | 注入后站点重新赋值 `window.fetch` | `fetchHooked=false`（面板据此标「钩子丢失」，而不是继续报正常） |
+| 诊3 | `__vdlMarkEnabled=false` | 仍能调 `__vdlMarkerDiag()`，返回 `installed=false / enabled=false / videos=-1`，页面无角标 |
+| 诊4 | 4 个 video：正常大播放器 / 160×90 无地址 / 视口外 / 0 尺寸 | 角标 3 个；状态依次为 `badged`、`skipped:no-src-small`、`hidden:offscreen`、`hidden:zero-size`；事件含对应 `skip`/`hide` |
+| 诊5 | 同上，等 2.5s 的 boot 上报 | `markerDiag` 带 `items` 原因串、`cands/hooks/injects` 字段 |
 
 ## 接管场景（test_hijack.js）
 

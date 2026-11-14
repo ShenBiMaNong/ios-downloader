@@ -127,7 +127,7 @@ class SettingsPage extends StatelessWidget {
               _section(
                 context,
                 '按住加速倍速',
-                '按住视频右半边以该倍速快进，按住左半边持续快退，松开恢复',
+                '长按视频任意位置以该倍速加速播放，松开恢复',
                 SegmentedButton<double>(
                   segments: const [
                     ButtonSegment(value: 1.5, label: Text('1.5×')),
