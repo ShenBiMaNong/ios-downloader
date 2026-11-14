@@ -1179,7 +1179,9 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
     } else {
       next = "paused"
     }
-    guard let st2 = updateState(jobId, { s in
+    // 这里是 if let 而不是 guard let：拿到状态才记账并回 true，拿不到走 else 回 false。
+    // 写成 guard 会直接编译不过——guard 的条件后必须紧跟 else。
+    if let st2 = updateState(jobId, { s in
       s["done"] = onDisk.done
       s["finished"] = onDisk.done
       s["failed"] = 0
