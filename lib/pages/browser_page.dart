@@ -1524,7 +1524,7 @@ class _SniffDiagSheetState extends State<_SniffDiagSheet> {
       String? native;
       try {
         native = await widget.controller
-            .getUrl()
+            .currentUrl()
             .timeout(const Duration(milliseconds: 800));
       } catch (_) {}
       if (!mounted) return;
@@ -1600,7 +1600,7 @@ class _SniffDiagSheetState extends State<_SniffDiagSheet> {
     b.writeln('视频下载器 · 嗅探诊断');
     b.writeln('采集时间：${_at?.toIso8601String() ?? '（未采集）'}');
     b.writeln('当前页：${widget.currentUrl}');
-    b.writeln('WebView.getUrl()：${_nativeUrl ?? '（未读到）'}');
+    b.writeln('WebView.currentUrl()：${_nativeUrl ?? '（未读到）'}');
     b.writeln('WebView 代次：${widget.viewEpoch}');
     if (_error != null) b.writeln('读取错误：$_error');
     b.writeln();
