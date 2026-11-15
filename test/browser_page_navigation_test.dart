@@ -9,6 +9,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:webview_flutter_platform_interface/webview_flutter_platform_interface.dart';
@@ -151,6 +152,11 @@ void main() {
     AppSettings.instance.browserStartPage = BrowserStartPage.blank;
     AppData.instance.lastUrl = '';
     AppData.instance.blockAutoplayEnabled = true;
+    // rootBundle 是全局 CachingAssetBundle，loadString 的 Future 会被缓存。
+    // 前面的用例触发注入后直接结束，没等那些 Future 走完；它们停在已销毁的
+    // fake-async zone 里永远不会完成，下一个用例若命中同一条缓存，注入就挂死
+    // （CI 上「加载页面时注入手势脚本本体」时好时坏就是这么来的）。每个用例清一次。
+    rootBundle.clear();
     // 资产改为同步读盘（mock 'flutter/assets' 通道）：真实资产 IO 在 fake-async
     // zone 里的完成时机不稳定，v0.3.8 起脚本变大后 CI 上出现过「脚本等不到注入」。
     // 同步读盘让 loadString 只排一个 microtask，pump 一次就绪，断言不再赌时机。
@@ -182,12 +188,13 @@ void main() {
   }
 
   /// 注入脚本要读 asset（真实异步 IO），pumpAndSettle 不会推进这类 Future，
-  /// 用 runAsync 让出事件循环轮询到条件成立
+  /// 用 runAsync 让出事件循环轮询到条件成立；同时用带时长的 pump 推进注入链
+  /// 里的定时器（自愈看门狗、250ms 重导航），别让断言只等微任务。
   Future<void> waitFor(WidgetTester tester, bool Function() ready) async {
-    for (var i = 0; i < 25; i++) {
+    for (var i = 0; i < 100; i++) {
       if (ready()) return;
       await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 20)));
-      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 20));
     }
   }
 
