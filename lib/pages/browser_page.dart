@@ -104,6 +104,8 @@ class BrowserPageState extends State<BrowserPage> {
           _syncAddress(url);
           _handledRedirects.clear();
           AppData.instance.setLastUrl(url);
+          // 新导航：早期注入若因平台视图晚建而超限放弃过，这里再给一次机会
+          if (!_earlySnifferInstalled) _earlySnifferTries = 0;
           _injectSniffer();
           _installEarlyScripts(); // 已装则秒回；未装（如 WebView 重建）再试一次
           _injectMarker();
@@ -111,12 +113,20 @@ class BrowserPageState extends State<BrowserPage> {
           _injectNoAutoplay();
           _injectSwipe();
           if (AppData.instance.adBlockEnabled) _injectAdBlock();
+          // 本次导航可能一直停在 interactive（等不到 onPageFinished），由自愈补脚本
+          _scheduleInjectWatchdog();
         },
         // SPA 路由变化（history.pushState / 页内锚点）不会触发 onPageStarted，
         // 只有 onUrlChange 能拿到 —— 否则单页应用里地址栏永远停在首屏地址
         onUrlChange: (change) {
           final url = change.url;
-          if (url != null && url.isNotEmpty) _syncAddress(url);
+          if (url != null && url.isNotEmpty) {
+            _syncAddress(url);
+            // 新文档提交/SPA 路由都会走到这里。真机上有页面 TTFB 很长，onPageStarted
+            // 之后好几秒才提交新文档，按导航起点排的检查可能全部打在旧文档上 ——
+            // 以「地址真正变了」为起点再排一轮，晚提交的文档也能被补上脚本。
+            if (url.startsWith('http')) _scheduleInjectWatchdog();
+          }
         },
         onPageFinished: (url) async {
           _syncAddress(url);
@@ -180,6 +190,8 @@ class BrowserPageState extends State<BrowserPage> {
 
   @override
   void dispose() {
+    _watchdogSeq++; // 作废还在执行中的检查
+    _watchdogTimer?.cancel(); // 并取消还没触发的那一拍
     AppData.instance.removeListener(_onAppDataChanged);
     _urlFocus.dispose();
     _urlController.dispose();
@@ -214,12 +226,110 @@ class BrowserPageState extends State<BrowserPage> {
       final tail = '\nwindow.__vdlSniffSource=${jsonEncode(js)};\n'
           'if (window.__vdlSniffPropagate) window.__vdlSniffPropagate(window.__vdlSniffSource);';
       await _controller.runJavaScript(head + js + tail);
+      _lastSniffInjectAt = DateTime.now();
+      _lastSniffInjectError = null;
       AppLog.instance.debug(
           'browser', '注入嗅探脚本 via=dart epoch=$_viewEpoch $_currentUrl');
     } catch (e, st) {
+      _lastSniffInjectError = '$e';
       AppLog.instance.warn('browser', '注入嗅探脚本失败', e, st);
     }
   }
+
+  /// 导航后的脚本自愈（iOS/Android 通用）。
+  /// `readyState=interactive` 的页面可能永远等不到 onPageFinished（长连接/广告帧拖住 load），
+  /// 而 onPageStarted 阶段的 runJavaScript 又常打在**旧文档**上 —— 新文档就会一段脚本都没有，
+  /// 正是「视频在播、没角标、诊断面板全空」那种现场。这里隔几拍查一次：
+  /// 当前文档缺哪段就补哪段；读不到（页面假死 / 正在换文档）就跳过，绝不硬塞。
+  void _scheduleInjectWatchdog() {
+    final seq = ++_watchdogSeq;
+    // 用可取消的 Timer（而不是 await Future.delayed）：新导航/重置/dispose 时能把
+    // 还在等待的那一拍直接取消。否则 widget 测试收尾会因 pending timer 失败。
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+    if (!mounted) return;
+    // 绝对时间点 0.4/1.2/2.6/5/9/15/25 秒；相邻两拍的间隔便于用单个 Timer 串联
+    const gaps = <int>[400, 800, 1400, 2400, 4000, 6000, 10000];
+    var i = 0;
+    void tick() {
+      if (!mounted || seq != _watchdogSeq) return;
+      _watchdogTimer = Timer(Duration(milliseconds: gaps[i]), () async {
+        if (!mounted || seq != _watchdogSeq) return;
+        if (_currentUrl.startsWith('http')) {
+          final missing = await _scriptsMissing();
+          if (!mounted || seq != _watchdogSeq) return;
+          if (missing != null) {
+            AppLog.instance.warn('browser',
+                '脚本自愈：当前文档缺$missing，已补注入（第 ${i + 1} 次检查） $_currentUrl');
+            await _injectSniffer();
+            await _injectMarker();
+            await _injectRedirectGuard();
+            await _injectNoAutoplay();
+            await _injectSwipe();
+            if (AppData.instance.adBlockEnabled) await _injectAdBlock();
+          }
+        }
+        if (!mounted || seq != _watchdogSeq) return;
+        i++;
+        // 查到「已装」也继续走完后几拍：400ms 时 JS 可能还打在旧文档上（也有脚本），
+        // 真正的新文档要等它接管后再确认一次。
+        if (i < gaps.length) tick();
+      });
+    }
+
+    tick();
+  }
+
+  /// 当前文档缺哪些脚本：'嗅探脚本' / '标记脚本' / '嗅探+标记脚本'；两者都在 → null；
+  /// 读不到（超时/异常）也返回 null —— 不能把「查不了」当成「缺」来反复注入。
+  Future<String?> _scriptsMissing() async {
+    try {
+      final raw = await _controller.runJavaScriptReturningResult(
+        '(function(){var s=!!window.__vdlSniffInstalled,m=!!window.__vdlMarkerInstalled;'
+        'return s&&m?"":(s?"marker":(m?"sniff":"both"));})()',
+      ).timeout(const Duration(milliseconds: 1200));
+      final v = '$raw'.replaceAll('"', '');
+      if (v.isEmpty) return null;
+      if (v == 'sniff') return '嗅探脚本';
+      if (v == 'marker') return '标记脚本';
+      if (v == 'both') return '嗅探+标记脚本';
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 诊断面板的「立即补注入」：补当前文档 + 再试一次早期注入（影响后续文档）。
+  Future<void> _repairScripts() async {
+    try {
+      if (!_earlySnifferInstalled) {
+        _earlySnifferTries = 0;
+        await _installEarlyScripts();
+      }
+      await _injectSniffer();
+      await _injectMarker();
+      await _injectRedirectGuard();
+      await _injectNoAutoplay();
+      await _injectSwipe();
+      if (AppData.instance.adBlockEnabled) await _injectAdBlock();
+      AppLog.instance.info('browser', '诊断面板：手动补注入完成 $_currentUrl');
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '诊断面板：手动补注入失败', e, st);
+    }
+  }
+
+  /// 面板 / 报告用：App 侧（非页内）的注入状态。
+  Map<String, dynamic> _diagAppState() => <String, dynamic>{
+        'viewEpoch': _viewEpoch,
+        'currentUrl': _currentUrl,
+        'earlyInstalled': _earlySnifferInstalled,
+        'earlyChannelMissing': _earlyChannelMissing,
+        'earlyTries': _earlySnifferTries,
+        'lastSniffAt': _lastSniffInjectAt?.toIso8601String(),
+        'sniffError': _lastSniffInjectError,
+        'lastMarkerAt': _lastMarkerInjectAt?.toIso8601String(),
+        'markerError': _lastMarkerInjectError,
+      };
 
   /// iOS 早期注入：把脚本注册为 WKUserScript（atDocumentStart + 全帧含跨域）。
   /// 相比 onPageFinished 注入的两个优势：
@@ -229,11 +339,33 @@ class BrowserPageState extends State<BrowserPage> {
   /// 非 iOS（无此原生通道）或 WebView 尚未创建时静默跳过/重试，不影响 Android。
   static const _sniffBridge = MethodChannel('video_downloader/sniffer');
   bool _earlySnifferInstalled = false;
+  bool _earlyChannelMissing = false;
+  bool _earlyInstallInFlight = false;
   int _earlySnifferTries = 0;
 
+  /// 最近一次 Dart 侧注入的结果（诊断面板 / 报告用）。
+  DateTime? _lastSniffInjectAt;
+  String? _lastSniffInjectError;
+  DateTime? _lastMarkerInjectAt;
+  String? _lastMarkerInjectError;
+
+  /// 导航后的脚本自愈：页面还在加载（readyState=interactive）时 onPageFinished 尚未触发，
+  /// onPageStarted 的 runJavaScript 又可能打在旧文档上 —— 新文档会一段脚本都没有。
+  /// 表现就是「页面在播、没有角标，诊断面板全空」。隔几拍查一次，缺了就补。
+  /// 序号用于作废「已在执行中」的旧序列（Timer 只能取消还没触发的那一拍）。
+  int _watchdogSeq = 0;
+
+  /// 当前待触发的自愈检查（可取消；dispose / 新导航 / 强制重置时取消）。
+  Timer? _watchdogTimer;
+
   Future<void> _installEarlyScripts() async {
-    if (_earlySnifferInstalled || _earlySnifferTries > 12) return;
+    // 重试次数只用于「平台视图还没建好」的短时轮询；每次新导航会把计数清零
+    //（冷启动时平台视图可能晚于 6 秒，旧逻辑一超限就整场会话都不再尝试早期注入）。
+    if (_earlySnifferInstalled || _earlyInstallInFlight) return;
+    if (_earlySnifferTries > 12) return;
     _earlySnifferTries++;
+    _earlyInstallInFlight = true;
+    var retry = false;
     try {
       // 开关快照要取已加载的持久化值（initState 时 AppData 可能还没读完文件）
       await AppData.instance.ensureLoaded();
@@ -259,20 +391,25 @@ class BrowserPageState extends State<BrowserPage> {
           false;
       if (ok) {
         _earlySnifferInstalled = true;
+        _earlyChannelMissing = false;
         AppLog.instance.info('browser',
             'iOS 早期注入成功（WKUserScript 全帧：自动播放拦截 + 嗅探 + 视频标记）');
         return;
       }
+      retry = true; // WebView 平台视图尚未创建 → 稍后重试
     } on MissingPluginException {
+      _earlyChannelMissing = true;
       return; // Android / 桌面：无此通道，走 onPageStarted/onPageFinished 注入
-    } on PlatformException {
-      return;
+    } on PlatformException catch (e) {
+      AppLog.instance.warn('browser', 'iOS 早期注入通道报错', e);
+      retry = true;
     } catch (e, st) {
       AppLog.instance.warn('browser', 'iOS 早期注入异常', e, st);
-      return;
+      retry = true;
+    } finally {
+      _earlyInstallInFlight = false;
     }
-    // WebView 平台视图尚未创建 → 稍后重试
-    if (mounted) {
+    if (retry && mounted) {
       Future<void>.delayed(const Duration(milliseconds: 500), _installEarlyScripts);
     }
   }
@@ -365,7 +502,10 @@ class BrowserPageState extends State<BrowserPage> {
             'window.__vdlMarkerSource=null; if (window.__vdlCleanup) window.__vdlCleanup();');
       }
       _lastMarkerApplied = AppData.instance.videoMarkEnabled;
+      _lastMarkerInjectAt = DateTime.now();
+      _lastMarkerInjectError = null;
     } catch (e, st) {
+      _lastMarkerInjectError = '$e';
       AppLog.instance.warn('browser', '注入视频标记脚本失败', e, st);
     }
   }
@@ -685,6 +825,8 @@ class BrowserPageState extends State<BrowserPage> {
       _handledRedirects.clear();
       _frameDiags.clear();
       _markerChain = null;
+      _watchdogSeq++; // 旧实例的检查序列作废（新实例起来后会重新排）
+      _watchdogTimer?.cancel();
       setState(() {
         _viewEpoch++;
         _controller = _newController();
@@ -862,6 +1004,8 @@ class BrowserPageState extends State<BrowserPage> {
         viewEpoch: _viewEpoch,
         currentUrl: _currentUrl,
         frameDiags: () => List<Map<String, dynamic>>.unmodifiable(_frameDiags),
+        appState: _diagAppState,
+        onRepair: _repairScripts,
       ),
     );
   }
@@ -1283,12 +1427,21 @@ class _SniffDiagSheet extends StatefulWidget {
     required this.viewEpoch,
     required this.currentUrl,
     required this.frameDiags,
+    required this.appState,
+    required this.onRepair,
   });
 
   final WebViewController controller;
   final int viewEpoch;
   final String currentUrl;
   final List<Map<String, dynamic>> Function() frameDiags;
+
+  /// App 侧注入状态（早期注入是否成功、上一次 Dart 注入的时间/错误）。
+  /// 页内快照全空时，只有这些字段能区分「脚本没装」「脚本装错 WebView」「页面还没加载完」。
+  final Map<String, dynamic> Function() appState;
+
+  /// 手动补注入：面板发现当前文档缺脚本时由用户触发，成功后重新拉快照。
+  final Future<void> Function() onRepair;
 
   @override
   State<_SniffDiagSheet> createState() => _SniffDiagSheetState();
@@ -1317,7 +1470,17 @@ class _SniffDiagSheetState extends State<_SniffDiagSheet> {
     sniff: (window.__vdlSniff && window.__vdlSniff.diag)
       ? safe(function () { return window.__vdlSniff.diag(); }) : null,
     marker: window.__vdlMarkerDiag
-      ? safe(function () { return window.__vdlMarkerDiag(); }) : null
+      ? safe(function () { return window.__vdlMarkerDiag(); }) : null,
+    // 页内脚本全没装时，至少要知道「当前文档是不是用户看的那一页」：
+    // videos>0 说明页面对了、只是脚本没进来；全 0 说明读到的是旧/空白文档。
+    page: safe(function () { return {
+      videos: document.querySelectorAll('video').length,
+      iframes: document.querySelectorAll('iframe').length,
+      body: !!document.body,
+      title: String(document.title || '').slice(0, 120),
+      visibility: document.visibilityState || '',
+      isTop: window === window.top
+    }; })
   });
 })()
 ''';
@@ -1327,6 +1490,14 @@ class _SniffDiagSheetState extends State<_SniffDiagSheet> {
   DateTime? _at;
   Timer? _timer;
   bool _busy = false;
+  bool _repairing = false;
+
+  /// WebView 自己认为的当前地址（与 _currentUrl 可能不同：后者来自导航回调）。
+  /// 页内 location.href 跟它对不上，才是「读到旧文档」的硬证据。
+  String? _nativeUrl;
+
+  /// 缺脚本日志的节流时间（面板每秒刷新，不能每秒刷一条 WARN）。
+  DateTime? _lastMissingLogAt;
 
   @override
   void initState() {
@@ -1350,12 +1521,41 @@ class _SniffDiagSheetState extends State<_SniffDiagSheet> {
           .runJavaScriptReturningResult(_diagJs)
           .timeout(const Duration(seconds: 3));
       final map = _asDiagMapOrNull(raw);
+      String? native;
+      try {
+        native = await widget.controller
+            .getUrl()
+            .timeout(const Duration(milliseconds: 800));
+      } catch (_) {}
       if (!mounted) return;
       setState(() {
         _snap = map;
+        _nativeUrl = native;
         _error = map == null ? '页面没有返回可解析的诊断数据' : null;
         _at = DateTime.now();
       });
+      // 面板打开期间发现「当前文档缺脚本」就留一条证据（20s 内不重复），
+      // 用户直接关掉面板也能在系统日志里回看当时的状态。
+      if (map != null) {
+        final f = _asDiagMap(map['flags']);
+        final p = _asDiagMap(map['page']);
+        final missing = f['sniffInstalled'] != true ||
+            (f['markerInstalled'] != true && f['markEnabled'] != false);
+        final last = _lastMissingLogAt;
+        if (missing &&
+            (last == null ||
+                DateTime.now().difference(last) > const Duration(seconds: 20))) {
+          _lastMissingLogAt = DateTime.now();
+          AppLog.instance.warn(
+            'browser',
+            '诊断面板：当前文档缺脚本 sniff=${f['sniffInstalled']} '
+                'marker=${f['markerInstalled']} enabled=${f['markEnabled']} '
+                'readyState=${f['readyState']} 页内视频=${p['videos']} '
+                'iframe=${p['iframes']} 标题=${p['title']} '
+                'href=${f['href']} webview=${_nativeUrl ?? '?'}',
+          );
+        }
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -1367,13 +1567,45 @@ class _SniffDiagSheetState extends State<_SniffDiagSheet> {
     }
   }
 
+  /// 快照里没有脚本时，由用户点一下：补注入 → 等页面执行 → 重新拉快照。
+  Future<void> _repair() async {
+    if (_repairing) return;
+    setState(() => _repairing = true);
+    try {
+      await widget.onRepair();
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      await _refresh();
+      if (!mounted) return;
+      final flags = _asDiagMap(_snap?['flags']);
+      final fixed = flags['sniffInstalled'] == true &&
+          (flags['markerInstalled'] == true || flags['markEnabled'] == false);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(fixed
+            ? '已补注入：当前文档的脚本就位'
+            : '补注入已发出，但当前文档仍读不到脚本（详见下方与系统日志）'),
+        duration: const Duration(seconds: 3),
+      ));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('补注入失败：$e')),
+      );
+    } finally {
+      if (mounted) setState(() => _repairing = false);
+    }
+  }
+
   String _reportText() {
     final b = StringBuffer();
     b.writeln('视频下载器 · 嗅探诊断');
     b.writeln('采集时间：${_at?.toIso8601String() ?? '（未采集）'}');
     b.writeln('当前页：${widget.currentUrl}');
+    b.writeln('WebView.getUrl()：${_nativeUrl ?? '（未读到）'}');
     b.writeln('WebView 代次：${widget.viewEpoch}');
     if (_error != null) b.writeln('读取错误：$_error');
+    b.writeln();
+    b.writeln('=== App 侧注入状态 ===');
+    b.writeln(const JsonEncoder.withIndent('  ').convert(widget.appState()));
     b.writeln();
     b.writeln('=== 主框架快照 ===');
     b.writeln(const JsonEncoder.withIndent('  ').convert(_snap ?? <String, dynamic>{}));
@@ -1488,9 +1720,11 @@ class _SniffDiagSheetState extends State<_SniffDiagSheet> {
     final flags = _asDiagMap(snap['flags']);
     final sniff = _asDiagMap(snap['sniff']);
     final marker = _asDiagMap(snap['marker']);
+    final page = _asDiagMap(snap['page']);
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
       children: [
+        _missingScriptBanner(flags, page),
         _section(context, '脚本与钩子', _flagSection(context, flags, sniff)),
         _section(context, '采集计数', _statsSection(context, sniff)),
         _section(context, '视频 / 角标', _markerSection(context, marker)),
@@ -1512,6 +1746,124 @@ class _SniffDiagSheetState extends State<_SniffDiagSheet> {
           Text(title, style: Theme.of(context).textTheme.titleSmall),
           const SizedBox(height: 6),
           child,
+        ],
+      ),
+    );
+  }
+
+  /// 页内一段脚本都没有时的「定位 + 自救」横幅。
+  /// 旧面板在这里只能看到 flags 全空，分不清是没注入、注入到旧文档、还是页面没加载完；
+  /// 现在把 App 侧的注入状态并排摆出来，并给一个明确的补注入入口。
+  Widget _missingScriptBanner(
+    Map<String, dynamic> flags,
+    Map<String, dynamic> page,
+  ) {
+    final markEnabled = flags['markEnabled'];
+    final missSniff = flags['sniffInstalled'] != true;
+    // 标记开关关着时脚本主动退出，不算「没注入」
+    final missMarker = flags['markerInstalled'] != true && markEnabled != false;
+    if (!missSniff && !missMarker) return const SizedBox.shrink();
+
+    final app = widget.appState();
+    final early = app['earlyInstalled'] == true;
+    final channelMissing = app['earlyChannelMissing'] == true;
+    final tries = _asDiagInt(app['earlyTries']);
+    final ready = '${flags['readyState'] ?? '?'}';
+    final loading = ready == 'loading' || ready == 'interactive';
+    final href = '${flags['href'] ?? ''}';
+    final address = _nativeUrl ?? widget.currentUrl;
+    final urlDiff = href.isNotEmpty && address.isNotEmpty && href != address;
+    final lastSniffAt = DateTime.tryParse('${app['lastSniffAt'] ?? ''}');
+    final lastMarkerAt = DateTime.tryParse('${app['lastMarkerAt'] ?? ''}');
+    final missing = <String>[
+      if (missSniff) '嗅探',
+      if (missMarker) '标记',
+    ].join(' + ');
+
+    return Container(
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFEF2F2),
+        border: Border.all(color: const Color(0xFFFCA5A5)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '当前文档没有装$missing脚本',
+            style: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: Color(0xFF991B1B),
+            ),
+          ),
+          const SizedBox(height: 4),
+          if (loading)
+            Text(
+              '页面还在加载（readyState=$ready），onPageFinished 的兜底注入尚未执行 —— '
+              '这类页面常常因为长连接/广告帧一直停在 interactive。',
+              style: const TextStyle(fontSize: 12, height: 1.35),
+            )
+          else
+            const Text(
+              '页面已加载完仍读不到脚本：导航回调的注入很可能打在了正在卸载的旧文档上。',
+              style: TextStyle(fontSize: 12, height: 1.35),
+            ),
+          if (!early && !channelMissing)
+            Text(
+              '早期注入未成功（第 $tries 次尝试）；WebView 刚创建时平台视图可能还没就绪。',
+              style: const TextStyle(fontSize: 12, height: 1.35),
+            ),
+          if (channelMissing)
+            const Text(
+              '无早期注入通道（Android 正常，全部走 Dart 注入）。',
+              style: TextStyle(fontSize: 12, height: 1.35),
+            ),
+          if (urlDiff)
+            Text(
+              '页内地址：$href\n'
+              '页内标题：${page['title'] ?? ''}\n'
+              'WebView 地址：$address\n'
+              '两者不一致，读到的可能不是当前页面。',
+              style: const TextStyle(fontSize: 11.5, height: 1.35),
+            ),
+          const SizedBox(height: 4),
+          Text(
+            '页面本身：<video> ${_asDiagInt(page['videos'])} 个 · '
+            'iframe ${_asDiagInt(page['iframes'])} 个 · '
+            'body ${page['body'] == true ? '已创建' : '未创建'}'
+            '${page['isTop'] == false ? ' · 不是主框架' : ''}'
+            ' —— 视频数大于 0 说明页面对了，只是脚本没进来。',
+            style: const TextStyle(fontSize: 11.5, height: 1.35),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 10,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              FilledButton.tonalIcon(
+                onPressed: _repairing ? null : _repair,
+                icon: _repairing
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.build_circle_outlined, size: 18),
+                label: Text(_repairing ? '正在补注入…' : '立即补注入'),
+              ),
+              Text(
+                'App 侧：早期注入${early ? '成功' : (channelMissing ? '通道不可用' : '未成功')}'
+                ' · 代次 ${widget.viewEpoch}'
+                '${lastSniffAt == null ? '' : ' · Dart 嗅探 ${_diagHms(lastSniffAt)}'}'
+                '${lastMarkerAt == null ? '' : ' · Dart 标记 ${_diagHms(lastMarkerAt)}'}',
+                style: const TextStyle(fontSize: 11, color: Color(0xFF64748B)),
+              ),
+            ],
+          ),
         ],
       ),
     );
@@ -1550,6 +1902,17 @@ class _SniffDiagSheetState extends State<_SniffDiagSheet> {
     final via = sniff.isNotEmpty ? '${sniff['via'] ?? ''}' : flagsVia;
     final lastVia = sniff.isNotEmpty ? '${sniff['lastVia'] ?? ''}' : '';
     final markVia = '${flags['markVia'] ?? ''}';
+    final app = widget.appState();
+    final early = app['earlyInstalled'] == true;
+    final channelMissing = app['earlyChannelMissing'] == true;
+    chips.add(_tag(
+      context,
+      early
+          ? '早期注入：成功'
+          : (channelMissing ? '早期注入：通道不可用' : '早期注入：未成功'),
+      ok: early,
+      bad: !early && !channelMissing,
+    ));
     chips.add(_tag(context, '嗅探注入 ${via.isEmpty ? '未知' : via}'));
     // 安装来源与最近一次补注入不同（典型：early 装上了，Dart 兜底又补了一次）——
     // 这说明注入链路本身没问题，不用再怀疑「脚本没装」。
@@ -1558,13 +1921,14 @@ class _SniffDiagSheetState extends State<_SniffDiagSheet> {
     }
     chips.add(_tag(context, '标记注入 ${markVia.isEmpty ? '未知' : markVia}'));
     chips.add(_tag(context, '文档 ${flags['readyState'] ?? '?'}'));
-    // 导航竞态的一条硬证据：脚本读到的 location 和地址栏不是同一个文档
+    // 导航竞态的一条硬证据：脚本读到的 location 和 WebView 地址不是同一个文档
     //（onPageStarted 的 runJavaScript 可能打在正在卸载的旧文档上）。
     final jsHref = '${flags['href'] ?? ''}';
+    final addr = _nativeUrl ?? widget.currentUrl;
     if (jsHref.isNotEmpty &&
-        widget.currentUrl.isNotEmpty &&
-        jsHref != widget.currentUrl) {
-      chips.add(_tag(context, '脚本文档≠地址栏（可能打在旧文档）'));
+        addr.isNotEmpty &&
+        jsHref != addr) {
+      chips.add(_tag(context, '脚本文档≠WebView 地址（可能打在旧文档）'));
     }
     if (sniff.isNotEmpty) {
       final fetchHooked = sniff['fetchHooked'] == true;
@@ -1915,6 +2279,9 @@ class _SniffDiagSheetState extends State<_SniffDiagSheet> {
       'unbadged：本该出角标却没建，下一秒自愈逻辑会再试。',
       '候选 ok=拿到 2xx/内容证据，dead=确认失效，guess=还没被请求验证。',
       '挂钩时=complete/interactive：嗅探脚本晚于页面脚本，站点缓存过原生 fetch/XHR 时会抓不到请求。',
+      '顶部红框=当前文档一段脚本都没有：先看 readyState 与「页面本身」的 video 数，'
+          '再点「立即补注入」；补完仍为空说明读到的不是当前页/页面拒绝脚本。',
+      '脚本自愈=每次导航后按 0.4/1.2/2.6/5/9/15/25 秒各查一次，缺脚本就自动补，系统日志里记 WARN。',
     ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
