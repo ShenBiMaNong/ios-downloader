@@ -54,19 +54,29 @@ class AppData extends ChangeNotifier {
   /// 跳转拦截开关：网站自动跳转时先询问是否跳转（默认开）
   bool redirectGuardEnabled = true;
 
-  /// 页面视频标记开关：嗅探到的 <video> 直接描边 + 角标展示（默认开）
+  /// 页面视频标记开关：嗅探到的 `<video>` 直接描边 + 角标展示（默认开）
   bool videoMarkEnabled = true;
 
   /// 禁止视频自动播放：页面自己开始的播放一律拦下（默认开）
   bool blockAutoplayEnabled = true;
 
+  /// 点播放即接管：用户点页面播放器时，若拿到 http(s) 直链就不让页面自己播，
+  /// 直接交给 App 播放器（默认关 —— 它会改变页面的播放行为，需要用户主动开）
+  bool playHijackEnabled = false;
+
   /// 上次打开的页面（供「浏览器启动页 = 上次打开页」恢复）
   String lastUrl = '';
-  bool _loaded = false;
 
-  Future<void> ensureLoaded() async {
-    if (_loaded) return;
-    _loaded = true;
+  /// 加载中的 Future，而不是「已开始加载」的 bool：
+  /// 浏览器页 initState 里 `_installEarlyScripts` 与 `_initStartPage` 会并发调用
+  /// 本方法，若第二个调用者一看到标记就返回，它读到的是尚未落盘的 [lastUrl]
+  /// （空串）→ 启动页回落到默认首页 bilibili，并且随后的 onPageStarted
+  /// 还会把 bilibili 当成「上次打开页」覆盖存档，于是每次启动都停在 bilibili。
+  Future<void>? _loading;
+
+  Future<void> ensureLoaded() => _loading ??= _load();
+
+  Future<void> _load() async {
     try {
       final f = await _file();
       if (await f.exists()) {
@@ -82,6 +92,7 @@ class AppData extends ChangeNotifier {
           redirectGuardEnabled = (j['redirectGuard'] as bool?) ?? true;
           videoMarkEnabled = (j['videoMark'] as bool?) ?? true;
           blockAutoplayEnabled = (j['blockAutoplay'] as bool?) ?? true;
+          playHijackEnabled = (j['playHijack'] as bool?) ?? false;
           lastUrl = (j['lastUrl'] as String?) ?? '';
           notifyListeners();
         }
@@ -108,6 +119,7 @@ class AppData extends ChangeNotifier {
         'redirectGuard': redirectGuardEnabled,
         'videoMark': videoMarkEnabled,
         'blockAutoplay': blockAutoplayEnabled,
+        'playHijack': playHijackEnabled,
         'lastUrl': lastUrl,
       }));
     } catch (e, st) {
@@ -181,8 +193,18 @@ class AppData extends ChangeNotifier {
     await _save();
   }
 
+  Future<void> setPlayHijack(bool v) async {
+    if (v == playHijackEnabled) return;
+    playHijackEnabled = v;
+    notifyListeners();
+    await _save();
+  }
+
   /// 记录最近打开的页面（页面开始加载时调用）
   Future<void> setLastUrl(String url) async {
+    // 只记真实网页：选「空白页」启动时 WebView 会加载 about:blank，
+    // 记下来会让「上次打开页」下次去加载 https://about:blank 这种废地址
+    if (!url.startsWith('http://') && !url.startsWith('https://')) return;
     if (url == lastUrl) return;
     lastUrl = url;
     notifyListeners();

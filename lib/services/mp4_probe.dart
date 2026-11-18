@@ -42,6 +42,37 @@ bool? faststartFromHead(List<int> head) {
   return sawMoov ? true : null;
 }
 
+/// 本地字节是否为 ISO-BMFF（mp4/mov 系）容器：看头 8 字节的 box 类型。
+///
+/// 为什么需要它：AVFoundation 打不开文件时给的那句 OSStatus 不区分成因 ——
+/// 「路径已经指不到这个文件」和「文件真的不是视频」在播放器眼里是同一个错。
+/// 起播前先看一眼头部 box，才能把两种情况分成两条不同的提示，
+/// 而不是统统写成「文件可能损坏」（用户据此去重下一个其实好好的文件）。
+///
+/// 只认头部第一个 box 的类型、不校验长度：够把 HTML 错误页（`<` 开头）、
+/// zip 包这类非 mp4 产物挡掉，代价是极端情况下会放过畸形文件 —— 放过是对的，
+/// 预检只负责说清已确定的成因，不该拦下本来能播的东西。
+bool looksLikeMp4Head(List<int> head) {
+  if (head.length < 8) return false;
+  const magicBoxes = {
+    'ftyp', // 绝大多数 mp4/mov 的开头
+    'moov', // 少数工具直接以 moov 起头
+    'mdat', // 丢了 ftyp 的流式产物仍是 ISO-BMFF 字节
+    'free',
+    'skip',
+    'wide',
+    'uuid',
+    'jumb',
+    'pnot',
+  };
+  final type = String.fromCharCodes(head.sublist(4, 8));
+  if (magicBoxes.contains(type)) return true;
+  // 头 4 字节全 0 是「box 长度未知/超大」的畸形写法，后面若跟着可打印
+  // fourcc 也当 ISO-BMFF 处理（这类文件 AVFoundation 一般能读）
+  final size = head[0] | head[1] | head[2] | head[3];
+  return size == 0 && RegExp(r'^[a-zA-Z0-9]{4}$').hasMatch(type);
+}
+
 /// 网络探测：Range 读源文件头 8KB 判断 faststart。
 /// 探测失败返回 null（由调用方降级为网络直连播放）。
 Future<bool?> probeFaststart(String url, {String? referer}) async {

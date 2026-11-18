@@ -13,6 +13,7 @@ import WebKit
   private var shareBridge: ShareBridge?
   private var thumbnailBridge: ThumbnailBridge?
   private var snifferBridge: SnifferBridge?
+  private var nativeSegBridge: NativeSegmentBridge?
 
   /// 其他 App 分享/打开的视频文件队列（已拷贝进本 App 沙盒 tmp）
   private var pendingShareFiles: [(path: String, name: String)] = []
@@ -71,6 +72,32 @@ import WebKit
     return files
   }
 
+  /// 后台 URLSession 事件的入口。工程启用了 UIApplicationSceneManifest / SceneDelegate，
+  /// 但 background session 事件仍由 UIApplicationDelegate 交付（没有对应的 scene 回调）。
+  /// 🔴 需在真机上验证冷启动唤醒时该回调确实到达 AppDelegate。
+  /// 非本桥接的 identifier（如 HlsBridge 的 AVAssetDownloadURLSession）必须转交
+  /// FlutterAppDelegate 的 lifecycleDelegate：直接调 completionHandler() 会让系统
+  /// 认为事件已处理完，可能吞掉尚未交付的 HLS 回调，破坏已有的离线下载链。
+  override func application(
+    _ application: UIApplication,
+    handleEventsForBackgroundURLSession identifier: String,
+    completionHandler: @escaping () -> Void
+  ) {
+    guard identifier == NativeSegmentBridge.sessionIdentifier else {
+      super.application(
+        application,
+        handleEventsForBackgroundURLSession: identifier,
+        completionHandler: completionHandler)
+      return
+    }
+    if let bridge = nativeSegBridge {
+      bridge.storeCompletion(identifier, handler: completionHandler)
+    } else {
+      // 冷启动时引擎还没起来，先暂存；bridge init 会取走并按同 identifier 重建 session
+      NativeSegmentBridge.pendingCompletion[identifier] = completionHandler
+    }
+  }
+
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "HlsBridge") {
@@ -102,6 +129,11 @@ import WebKit
       let bridge = SnifferBridge()
       bridge.register(with: registrar.messenger())
       snifferBridge = bridge
+    }
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "NativeSegmentBridge") {
+      let bridge = NativeSegmentBridge()
+      bridge.register(with: registrar.messenger())
+      nativeSegBridge = bridge
     }
   }
 }
@@ -192,7 +224,7 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
         result(FlutterError(code: "bad_args", message: "url/title 缺失", details: nil))
         return
       }
-      let asset = AVURLAsset(url: urlObj)
+      let asset = makeAsset(urlObj, headers: headersOf(args))
       let downloadConfig = AVAssetDownloadConfiguration(asset: asset, title: title)
       let task = session.makeAssetDownloadTask(downloadConfiguration: downloadConfig)
       // taskId 优先沿用 Dart 侧生成的 id（让首帧进度事件就能对上资源库条目），
@@ -218,8 +250,17 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
     case "playOffline":
       guard
         let args = call.arguments as? [String: Any],
-        let taskId = args["taskId"] as? String,
-        let localUrl = localUrls[taskId]
+        let taskId = args["taskId"] as? String
+      else {
+        result(false)
+        return
+      }
+      // App 重启后内存里的 localUrls 已清空，但 willDownloadTo 已把 .movpkg
+      // 路径持久化到 HlsLocalStore（缩略图用的就是它）。这里回退一次并校验落地，
+      // 否则历史离线条目播放必然失败，表现为「播放失败：本地缓存不存在」。
+      guard
+        let localUrl = localUrls[taskId] ?? HlsLocalStore.shared.url(for: taskId),
+        FileManager.default.fileExists(atPath: localUrl.path)
       else {
         result(false)
         return
@@ -294,7 +335,7 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
         result(false)
         return
       }
-      let asset = AVURLAsset(url: urlObj)
+      let asset = makeAsset(urlObj, headers: headersOf(args))
       let downloadConfig = AVAssetDownloadConfiguration(asset: asset, title: title)
       let task = session.makeAssetDownloadTask(downloadConfiguration: downloadConfig)
       taskIds[taskId] = task
@@ -304,6 +345,27 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
     default:
       result(FlutterMethodNotImplemented)
     }
+  }
+
+  /// 从方法参数里取请求头（Dart 侧只有防盗链站才传，通常只有 Referer）
+  private func headersOf(_ args: [String: Any]) -> [String: String] {
+    if let h = args["headers"] as? [String: String] { return h }
+    return [:]
+  }
+
+  /// 带 HTTP 头的 AVURLAsset。
+  ///
+  /// AVAssetDownloadTask 走的是独立的 URLSession，没有 WKWebView 的页面会话：
+  /// 不带 Referer / UA 时，防盗链源站会直接 403 —— 表现就是「页面里能播、
+  /// 嗅探也 ok，一点离线下载就失败」。AVFoundation 至今没有公开的「给下载任务
+  /// 加请求头」API，只能靠 AVURLAssetHTTPHeaderFieldsKey（私有 key，但这是
+  /// AVAssetDownloadTask 唯一可行的途径，AVPlayer 生态里广泛使用）。
+  private func makeAsset(_ url: URL, headers: [String: String]) -> AVURLAsset {
+    if headers.isEmpty { return AVURLAsset(url: url) }
+    return AVURLAsset(
+      url: url,
+      options: ["AVURLAssetHTTPHeaderFieldsKey": headers]
+    )
   }
 
   private func playOffline(localUrl: URL) {
@@ -358,7 +420,9 @@ class HlsBridge: NSObject, AVAssetDownloadDelegate {
     // 切「静音 / 显示进度」时还有任务在跑：等全部结束再换 session
     if taskIds.isEmpty && pendingRebuild {
       pendingRebuild = false
-      session = Self.makeSession(silent: silent, delegate: self)
+      // 此方法的 session 参数（URLSession，隐式 let）会遮蔽同名实例属性，
+      // 必须写 self.session 才能给属性重新赋值。
+      self.session = Self.makeSession(silent: silent, delegate: self)
     }
   }
 }
@@ -697,8 +761,70 @@ class SnifferBridge: NSObject {
         return
       }
       result(install(scripts))
+    case "resetWebsiteData":
+      resetWebsiteData(call, result: result)
     default:
       result(FlutterMethodNotImplemented)
+    }
+  }
+
+  /// 「强制重置浏览器状态」用：注销 ServiceWorker + 清 HTTP 缓存（保留 Cookie）。
+  /// Dart 侧等这个回调结束才重建 WebView —— 否则新实例起来第一件事又是命中同一份坏缓存。
+  ///
+  /// 三步：
+  /// 0) stopLoading —— 还挂在半截的导航会一直占着连接，新文档加载就是被它拖死的；
+  /// 1) 页内跑 Dart 传进来的脚本（注销本站 ServiceWorker + 删光 CacheStorage）。
+  ///    脚本返回值是 Promise，evaluateJavaScript 会等它落定再回调；页面假死时可能永远不回，
+  ///    所以 2s 后不管结果直接进第二步。CacheStorage 只能这样按源清 —— 它没有对应的
+  ///    WKWebsiteDataType，而「ServiceWorker 用 cache-first 把半截响应喂给每个新文档」
+  ///    正是刷新修不好的那一类成因。
+  /// 2) 清内存/磁盘缓存、离线应用缓存、ServiceWorker 注册。
+  ///    有意不清 Cookies / LocalStorage / IndexedDB：一个自救按钮不该把已登录的站点全登出。
+  ///
+  /// 回包是给 App 日志看的状态串（sw=页内那步的结果，cache=清缓存），便于事后区分
+  /// 「脚本没跑成」和「缓存根本没清」。
+  private func resetWebsiteData(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let scripts = call.arguments as? [String], let js = scripts.first, !js.isEmpty else {
+      result(FlutterError(code: "bad_args", message: "js 缺失", details: nil))
+      return
+    }
+    let cacheTypes: Set<String> = [
+      WKWebsiteDataTypeMemoryCache,
+      WKWebsiteDataTypeDiskCache,
+      WKWebsiteDataTypeOfflineWebApplicationCache,
+      WKWebsiteDataTypeServiceWorkerRegistrations,
+    ]
+    var swStatus = "skipped"
+    var settled = false
+    // 页内脚本回包与 2s 超时竞速，谁先到算谁；两者都在主线程，不需要加锁
+    let proceed: () -> Void = {
+      if settled { return }
+      settled = true
+      if swStatus == "pending" { swStatus = "timeout" }
+      WKWebsiteDataStore.default().removeData(
+        ofTypes: cacheTypes, modifiedSince: Date.distantPast
+      ) {
+        DispatchQueue.main.async { result("sw=\(swStatus) cache=cleared") }
+      }
+    }
+    if let webView = findWKWebView() {
+      // 半截导航不停掉，它会继续占着连接
+      webView.stopLoading()
+      swStatus = "pending"
+      webView.evaluateJavaScript(js) { value, error in
+        if error != nil {
+          swStatus = "err"
+        } else {
+          // 脚本自己 Promise.all 成功后回 1；拿不到 1 说明要么站内清理失败，
+          // 要么这份 WebKit 没有等 Promise（两种都值得知道）
+          swStatus = (value as? NSNumber)?.int64Value == 1 ? "ok" : "partial"
+        }
+        proceed()
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: proceed)
+    } else {
+      // 找不到 WebView（还没建好或正在拆）：页内那步跳过，缓存照清
+      proceed()
     }
   }
 
@@ -734,6 +860,847 @@ class SnifferBridge: NSObject {
     if let wv = view as? WKWebView { return wv }
     for sub in view.subviews {
       if let found = findWKWebView(in: sub) { return found }
+    }
+    return nil
+  }
+}
+
+// MARK: - 原生后台分片下载（background URLSession，作业化）
+// 方法通道: video_downloader/native_seg  (submit / cancel / listJobs / markRemuxed)
+// 事件通道: video_downloader/native_seg/events
+//
+// 与 HlsBridge（AVAssetDownloadTask → .movpkg）完全不同：这里下的是清单里的
+// 原始分片，落到 App 自己的目录，产物可导出 / 可进 PlayerPage / 有大小与缩略图。
+// Apple《Downloading files in the background》的硬约束：
+// 1) 必须是 URLSessionDownloadTask（data task 不支持后台）；
+// 2) didFinishDownloadingTo 返回前必须把临时文件搬走；
+// 3) 全部 task 一次性提交，绝不能「批 4 个 → 下完再提交下一批」，否则系统
+//    rate limiter 会随每次唤醒递增延迟，几百个分片基本下不完；
+// 4) 后台传输的重定向始终跟随，willPerformHTTPRedirection 不会被调用；
+// 5) 用户从多任务界面强杀 App → 系统取消 session 全部传输且不再自动重启。
+//
+// 状态以 Documents/NativeSegJobs/<jobId>/state.json 为准。后台期间 eventSink
+// 可能根本不存在（Flutter 引擎未启动），所以事件只用于前台刷新，正确性靠
+// Dart 冷启动 / 回前台调用 listJobs() 对账保证。
+
+final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterStreamHandler {
+  static let methodChannelName = "video_downloader/native_seg"
+  static let eventChannelName = "video_downloader/native_seg/events"
+  static let sessionIdentifier = "video_downloader.native_seg.bg"
+
+  /// 冷启动时 handleEventsForBackgroundURLSession 可能早于 Flutter 引擎初始化，
+  /// 先静态暂存 completionHandler，bridge 建好后取走。
+  static var pendingCompletion: [String: () -> Void] = [:]
+
+  private lazy var session: URLSession = {
+    let cfg = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
+    cfg.sessionSendsLaunchEvents = true
+    // 前台发起时不要让系统择机（否则复现「点了半天 0%」）。
+    // 后台发起的任务系统仍会强制按 discretionary 处理，这个标志改不了。
+    cfg.isDiscretionary = false
+    cfg.httpMaximumConnectionsPerHost = 6
+    return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+  }()
+
+  private var eventSink: FlutterEventSink?
+  private var completionHandlers: [String: () -> Void] = [:]
+  private let lock = NSLock()
+
+  /// 在途 task 的字节计数（taskIdentifier → 已写/预期），仅内存态。
+  /// didWriteData 只在 App 运行时（前台）被调用，后台期间不更新，所以它只用于
+  /// 「前台真实字节进度」；正确性仍以磁盘分片 + state.json 为准。
+  private struct LiveBytes {
+    var jobId: String
+    var written: Int64 = 0
+    var expected: Int64 = 0
+  }
+  private var live: [Int: LiveBytes] = [:]
+  /// jobId → 已落盘分片的字节数（缓存；缺失时扫盘重建）
+  private var diskBytes: [String: Int64] = [:]
+  /// taskIdentifier → jobId（taskDescription 在后台重启后可能丢失，兜底缓存）
+  private var taskJob: [Int: String] = [:]
+  /// 事件节流：每个作业最多每 0.5s 推一次（几百个 task 每个都写 state.json 会把 IO 打满）
+  private var lastEmitAt: [String: Date] = [:]
+  private static let emitInterval: TimeInterval = 0.5
+
+  override init() {
+    super.init()
+    // 必须用同一 identifier 重建 session，才能接管系统代跑的 task（含冷启动唤醒）。
+    _ = session
+    for (id, handler) in Self.pendingCompletion {
+      completionHandlers[id] = handler
+    }
+    Self.pendingCompletion.removeAll()
+  }
+
+  func register(with messenger: FlutterBinaryMessenger) {
+    let channel = FlutterMethodChannel(
+      name: Self.methodChannelName, binaryMessenger: messenger)
+    channel.setMethodCallHandler { [weak self] call, result in
+      self?.handle(call, result: result)
+    }
+    let events = FlutterEventChannel(
+      name: Self.eventChannelName, binaryMessenger: messenger)
+    events.setStreamHandler(self)
+  }
+
+  func storeCompletion(_ identifier: String, handler: @escaping () -> Void) {
+    guard identifier == Self.sessionIdentifier else { return }
+    completionHandlers[identifier] = handler
+    _ = session
+  }
+
+  // MARK: - 方法通道
+
+  private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "submit":
+      result(submit(call.arguments))
+    case "cancel":
+      result(cancelJob(call.arguments))
+    case "pause":
+      pauseJob(call.arguments, result: result)
+    case "resume":
+      resumeJob(call.arguments, result: result)
+    case "listJobs":
+      // 必须走 getAllTasks：单文件作业在下载期间磁盘上一直没有增量，
+      // 在途字节数只有系统那份计数知道（冷启动/后台唤醒后内存态 live 还是空的）
+      listJobs(result: result)
+    case "markRemuxed":
+      result(clearJob(call.arguments))
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  /// 一次性提交整个作业：写状态文件 + 批量建 task + 全部 resume。
+  /// 已存在且非空的分片直接跳过（断点续传），不重复建 task。
+  private func submit(_ arguments: Any?) -> Bool {
+    guard
+      let args = arguments as? [String: Any],
+      let jobId = args["jobId"] as? String, !jobId.isEmpty,
+      let workDir = args["workDir"] as? String, !workDir.isEmpty,
+      let rawParts = args["parts"] as? [[String: Any]]
+    else { return false }
+
+    var headers = [String: String]()
+    if let rawHeaders = args["headers"] as? [String: Any] {
+      for (k, v) in rawHeaders {
+        if let s = v as? String { headers[k] = s }
+      }
+    }
+    let playlistPath = args["playlistPath"] as? String ?? ""
+    // 单文件作业（mp4 直链）：parts 只有一项，落盘的文件本身就是产物，
+    // 不涉及清单与合成。total=1 让 finalizeIfNeeded 的判断保持不变。
+    let single = (args["singleFile"] as? Bool) ?? false
+
+    // 只接受可解析的绝对 URL，避免无效项让 finished 永远追不上 total
+    let parts: [[String: Any]] = rawParts.compactMap { part in
+      guard let u = part["url"] as? String, let n = part["name"] as? String,
+        !u.isEmpty, !n.isEmpty, URL(string: u) != nil
+      else { return nil }
+      return ["url": u, "name": n]
+    }
+    guard !parts.isEmpty else { return false }
+
+    let fm = FileManager.default
+    do {
+      try fm.createDirectory(atPath: workDir, withIntermediateDirectories: true)
+    } catch {
+      return false
+    }
+
+    let base = URL(fileURLWithPath: workDir)
+    var pending = [[String: Any]]()
+    var skipped = 0
+    var skippedBytes: Int64 = 0
+    for part in parts {
+      let name = part["name"] as? String ?? ""
+      let path = base.appendingPathComponent(name).path
+      if hasNonEmptyFile(path) {
+        skipped += 1
+        skippedBytes += fileSize(path)
+      } else {
+        pending.append(part)
+      }
+    }
+
+    var state: [String: Any] = [
+      "jobId": jobId,
+      "workDir": workDir,
+      "playlistPath": playlistPath,
+      "parts": parts,
+      "headers": headers,
+      "single": single,
+      "state": "downloading",
+      "done": skipped,
+      "finished": skipped,
+      "failed": 0,
+      "total": parts.count,
+      "bytes": Int(skippedBytes),
+    ]
+    saveState(jobId, state)
+    lock.lock()
+    diskBytes[jobId] = skippedBytes
+    lastEmitAt.removeValue(forKey: jobId)
+    lock.unlock()
+
+    if pending.isEmpty {
+      state["state"] = "ready"
+      saveState(jobId, state)
+      emit(state)
+      return true
+    }
+
+    for part in pending {
+      startTask(jobId: jobId, part: part, headers: headers)
+    }
+    return true
+  }
+
+  /// 建 task 并立即开始。给了 [resumeData] 就走系统断点续传（请求头与原始请求
+  /// 一起被编码在 resumeData 里，不用再拼），否则按 part 的 URL + 当前头新建请求。
+  @discardableResult
+  private func startTask(jobId: String, part: [String: Any], headers: [String: String],
+    resumeData: Data? = nil
+  ) -> Bool {
+    guard let name = part["name"] as? String, !name.isEmpty else { return false }
+    let task: URLSessionDownloadTask
+    if let data = resumeData, !data.isEmpty {
+      task = session.downloadTask(withResumeData: data)
+    } else {
+      guard let urlString = part["url"] as? String, let url = URL(string: urlString) else {
+        return false
+      }
+      var req = URLRequest(url: url)
+      for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+      task = session.downloadTask(with: req)
+    }
+    // 后台 relaunch 后 taskDescription 不保证保留，didFinish 里另有 URL 查表兜底
+    task.taskDescription = "\(jobId)|\(name)"
+    lock.lock()
+    taskJob[task.taskIdentifier] = jobId
+    live[task.taskIdentifier] = LiveBytes(jobId: jobId)
+    lock.unlock()
+    task.resume()
+    return true
+  }
+
+  /// 主动暂停：取消在途 task 但保留系统断点，作业标 `paused`。
+  /// 与 `cancelJob` 的分别是「之后还要继续」—— 清掉状态记录就没法续传了。
+  private func pauseJob(_ arguments: Any?, result: @escaping FlutterResult) {
+    guard let args = arguments as? [String: Any],
+      let jobId = args["jobId"] as? String, !jobId.isEmpty,
+      loadState(jobId) != nil
+    else {
+      result(false)
+      return
+    }
+    session.getAllTasks { [weak self] tasks in
+      guard let self else { result(false); return }
+      let mine = tasks.filter {
+        self.jobId(of: $0) == jobId && ($0.state == .running || $0.state == .suspended)
+      }
+      if mine.isEmpty {
+        self.finishPause(jobId)
+        result(true)
+        return
+      }
+      var left = mine.count
+      for t in mine {
+        guard let dt = t as? URLSessionDownloadTask else {
+          left -= 1
+          if left <= 0 { self.finishPause(jobId) }
+          continue
+        }
+        // 断点在 completion 里给；didCompleteWithError 随后以 -999 到达，
+        // 那条路径认得「取消不是失败」，不会把作业误记成 failed
+        dt.cancel(byProducingResumeData: { data in
+          if let data, !data.isEmpty { self.storeResume(task: dt, data: data) }
+          left -= 1
+          if left <= 0 { self.finishPause(jobId) }
+        })
+      }
+      result(true)
+    }
+  }
+
+  private func finishPause(_ jobId: String) {
+    guard let st = updateState(jobId, { $0["state"] = "paused" }) else { return }
+    emit(st)
+  }
+
+  /// 继续一个 paused/failed 作业：有系统断点就按断点续，没有就按（可能已换签名的）
+  /// URL 重新下。传 [url] 时替换全部 part 的地址并丢掉旧断点 —— 断点里绑的是
+  /// 发起续传时的那个 URL，签名换了它只会再拿一次 403。
+  private func resumeJob(_ arguments: Any?, result: @escaping FlutterResult) {
+    guard let args = arguments as? [String: Any],
+      let jobId = args["jobId"] as? String, !jobId.isEmpty,
+      let st = loadState(jobId),
+      let rawParts = st["parts"] as? [[String: Any]]
+    else {
+      result(false)
+      return
+    }
+    let headers = (st["headers"] as? [String: String]) ?? [:]
+    let workDir = st["workDir"] as? String ?? ""
+    var parts = rawParts
+    if (st["single"] as? Bool) ?? false,
+      let newUrl = args["url"] as? String, !newUrl.isEmpty {
+      for i in parts.indices { parts[i]["url"] = newUrl }
+      updateState(jobId) { s in
+        s["parts"] = parts
+        s.removeValue(forKey: "resume")
+      }
+    }
+    let resume = (st["resume"] as? [String: String]) ?? [:]
+    let base = URL(fileURLWithPath: workDir)
+    var restarted = 0
+    for part in parts {
+      guard let name = part["name"] as? String else { continue }
+      if hasNonEmptyFile(base.appendingPathComponent(name).path) { continue }
+      let data = resume[name].flatMap { Data(base64Encoded: $0) }
+      if startTask(jobId: jobId, part: part, headers: headers, resumeData: data) {
+        restarted += 1
+      }
+    }
+    // 计数按磁盘重建：上一轮失败会把这片记进 finished/failed，不清掉的话
+    // finalizeIfNeeded 会在新一轮还没下完时就把作业判成 ready
+    let onDisk = scanDone(workDir, parts: parts)
+    let total = st["total"] as? Int ?? 0
+    // 重新拉起任务 → downloading；一片没拉起但磁盘已齐 → ready；
+    // 剩下的就是「还有片没下完且拉不起来」（比如 URL 已失效）→ paused，
+    // 让用户看到可继续的状态而不是错误
+    let next: String
+    if restarted > 0 {
+      next = "downloading"
+    } else if onDisk.done >= total {
+      next = "ready"
+    } else {
+      next = "paused"
+    }
+    // 这里是 if let 而不是 guard let：拿到状态才记账并回 true，拿不到走 else 回 false。
+    // 写成 guard 会直接编译不过——guard 的条件后必须紧跟 else。
+    if let st2 = updateState(jobId, { s in
+      s["done"] = onDisk.done
+      s["finished"] = onDisk.done
+      s["failed"] = 0
+      s["bytes"] = Int(onDisk.bytes)
+      s.removeValue(forKey: "error")
+      s["state"] = next
+    }) {
+      lock.lock()
+      diskBytes[jobId] = onDisk.bytes
+      lastEmitAt.removeValue(forKey: jobId)
+      lock.unlock()
+      emit(st2)
+      result(true)
+    } else {
+      result(false)
+    }
+  }
+
+  /// 磁盘上已完成分片数与字节数（续传轮次重建计数用）
+  private func scanDone(_ workDir: String, parts: [[String: Any]])
+    -> (done: Int, bytes: Int64)
+  {
+    var done = 0
+    var bytes: Int64 = 0
+    for part in parts {
+      let name = part["name"] as? String ?? ""
+      guard !name.isEmpty else { continue }
+      let path = (workDir as NSString).appendingPathComponent(name)
+      if hasNonEmptyFile(path) {
+        done += 1
+        bytes += fileSize(path)
+      }
+    }
+    return (done, bytes)
+  }
+
+  /// 把系统断点存进作业状态（按分片名索引），供 pause→resume 续传
+  private func storeResume(task: URLSessionTask, data: Data) {
+    guard let resolved = resolve(task: task) else { return }
+    let jobId = resolved.0
+    let name = resolved.1
+    updateState(jobId) { s in
+      var r = (s["resume"] as? [String: String]) ?? [:]
+      r[name] = data.base64EncodedString()
+      s["resume"] = r
+    }
+  }
+
+  /// 定位 task 属于哪个作业：先读 taskDescription，丢了再按原始请求 URL 查状态表
+  private func jobId(of task: URLSessionTask) -> String? {
+    if let id = Self.jobIdOf(task) { return id }
+    guard let urlString = task.originalRequest?.url?.absoluteString else { return nil }
+    for (jobId, st) in allStates() {
+      guard let parts = st["parts"] as? [[String: Any]] else { continue }
+      if parts.contains(where: { ($0["url"] as? String) == urlString }) { return jobId }
+    }
+    return nil
+  }
+
+  private func cancelJob(_ arguments: Any?) -> Bool {
+    guard let args = arguments as? [String: Any],
+      let jobId = args["jobId"] as? String, !jobId.isEmpty
+    else { return false }
+    session.getAllTasks { tasks in
+      for t in tasks where (t.taskDescription ?? "").hasPrefix("\(jobId)|") {
+        t.cancel()
+      }
+    }
+    dropCaches(jobId)
+    clearJob(arguments)
+    return true
+  }
+
+  /// Dart 侧 mp4 合成成功后清状态；分片目录由 ConvertManager._finishMp4 删除。
+  @discardableResult
+  private func clearJob(_ arguments: Any?) -> Bool {
+    guard let args = arguments as? [String: Any],
+      let jobId = args["jobId"] as? String, !jobId.isEmpty
+    else { return false }
+    let dir = stateURL(jobId).deletingLastPathComponent()
+    try? FileManager.default.removeItem(at: dir)
+    dropCaches(jobId)
+    return true
+  }
+
+  /// 清掉内存态计数，避免作业被删后还留着字节数
+  private func dropCaches(_ jobId: String) {
+    lock.lock()
+    defer { lock.unlock() }
+    let ids = live.filter { $0.value.jobId == jobId }.map { $0.key }
+    for tid in ids {
+      live.removeValue(forKey: tid)
+      taskJob.removeValue(forKey: tid)
+    }
+    diskBytes.removeValue(forKey: jobId)
+    lastEmitAt.removeValue(forKey: jobId)
+  }
+
+  private func listJobs(result: @escaping FlutterResult) {
+    let base = allStates()
+    guard !base.isEmpty else {
+      result([[String: Any]]())
+      return
+    }
+    // 在途 task 的字节数只有系统那份计数知道：内存态 live 在冷启动 / 后台唤醒后
+    // 是空的，而单文件作业在下载期间磁盘上恒为 0（文件只在完成那一刻整体落盘）。
+    session.getAllTasks { [weak self] tasks in
+      guard let self else {
+        result([[String: Any]]())
+        return
+      }
+      var inflow: [String: (written: Int64, expected: Int64)] = [:]
+      for t in tasks where t.state == .running || t.state == .suspended {
+        guard let jobId = self.jobId(of: t) else { continue }
+        var e = inflow[jobId] ?? (written: 0, expected: 0)
+        if t.countOfBytesReceived > 0 { e.written += t.countOfBytesReceived }
+        if t.countOfBytesExpectedToReceive > 0 { e.expected += t.countOfBytesExpectedToReceive }
+        inflow[jobId] = e
+      }
+      result(base.map { self.jobPayload($0.0, $0.1, inflow: inflow) })
+    }
+  }
+
+  /// 单个作业的上报体 = 磁盘/内存态进度 + 系统侧在途字节。
+  /// 两者对分片作业是「已落盘 + 在途」相加（不重叠）；单文件作业的在途量就是全部
+  /// 已下量，Content-Length 由系统给出，不再需要估算标记。
+  private func jobPayload(_ jobId: String, _ st: [String: Any],
+    inflow: [String: (written: Int64, expected: Int64)]
+  ) -> [String: Any] {
+    let p = progress(for: jobId, state: st)
+    var bytes = p.bytes
+    var total = p.total
+    var estimated = p.estimated
+    let single = (st["single"] as? Bool) ?? false
+    if let f = inflow[jobId] {
+      if single {
+        if f.written > bytes { bytes = f.written }
+        if f.expected > 0 {
+          total = f.expected
+          estimated = false
+          persistTotalHint(jobId, state: st, expected: f.expected)
+        }
+      } else {
+        let disk = diskBaseline(jobId, st)
+        if disk + f.written > bytes { bytes = disk + f.written }
+        if f.expected > 0, disk + f.expected > total { total = disk + f.expected }
+      }
+    } else if single, let hint = st["bytesTotalHint"] as? Int, Int64(hint) > total {
+      // 暂停 / 断网后在途 task 不在了，没有这个分母进度条就只剩「已下 x」
+      total = Int64(hint)
+    }
+    if total < bytes { total = bytes }
+    return [
+      "jobId": st["jobId"] as? String ?? "",
+      "state": st["state"] as? String ?? "downloading",
+      "workDir": st["workDir"] as? String ?? "",
+      "done": st["done"] as? Int ?? 0,
+      "total": st["total"] as? Int ?? 0,
+      "bytes": Int(bytes),
+      "bytesTotal": Int(total),
+      "bytesEstimated": estimated,
+      "single": single,
+      "error": st["error"] as? String ?? "",
+    ]
+  }
+
+  /// 已落盘字节（带缓存，冷启动扫盘重建）。progress() 内部用的是同一份缓存，
+  /// 单独取一次是为了把「磁盘 + 系统报的在途量」相加。
+  private func diskBaseline(_ jobId: String, _ st: [String: Any]) -> Int64 {
+    lock.lock()
+    defer { lock.unlock() }
+    if diskBytes[jobId] == nil {
+      diskBytes[jobId] = scanBytes(st["workDir"] as? String ?? "")
+    }
+    return diskBytes[jobId] ?? 0
+  }
+
+  /// 把系统给的 Content-Length 写进状态文件，供在途 task 消失后继续给出总量
+  private func persistTotalHint(_ jobId: String, state: [String: Any], expected: Int64) {
+    if let stored = state["bytesTotalHint"] as? Int, Int64(stored) == expected { return }
+    updateState(jobId) { $0["bytesTotalHint"] = Int(expected) }
+  }
+
+  // MARK: - 字节进度
+
+  /// 已下字节 = 已落盘分片 + 在途 task 已写字节；总量在拿不到 Content-Length
+  /// 的分片上按已知分片均值外推（estimated=true 时 Dart 侧标 ≈）。
+  private func progress(for jobId: String, state: [String: Any])
+    -> (bytes: Int64, total: Int64, estimated: Bool)
+  {
+    let workDir = state["workDir"] as? String ?? ""
+    lock.lock()
+    if diskBytes[jobId] == nil { diskBytes[jobId] = scanBytes(workDir) }
+    let disk = diskBytes[jobId] ?? 0
+    var written: Int64 = 0
+    var knownExp: Int64 = 0
+    var knownCnt = 0
+    var unknownCnt = 0
+    for (_, c) in live where c.jobId == jobId {
+      written += c.written
+      if c.expected > 0 {
+        knownExp += c.expected
+        knownCnt += 1
+      } else {
+        unknownCnt += 1
+      }
+    }
+    lock.unlock()
+
+    let bytes = disk + written
+    // 一个 Content-Length 都还没拿到时（全部 task 排队中）不给总量：
+    // 返回 bytes 会让 Dart 算出「已下 == 总量 == 100%」，正是要避免的假进度。
+    var total: Int64 = 0
+    if knownCnt > 0 {
+      total = disk + knownExp
+      if unknownCnt > 0 {
+        total += Int64(Double(knownExp) / Double(knownCnt) * Double(unknownCnt))
+      }
+      if total < bytes { total = bytes }
+    }
+    return (bytes, total, unknownCnt > 0)
+  }
+
+  /// 目录内实际落盘字节（冷启动接管系统代跑 task 时用它重建基线）
+  private func scanBytes(_ workDir: String) -> Int64 {
+    guard !workDir.isEmpty else { return 0 }
+    let fm = FileManager.default
+    guard
+      let names = try? fm.contentsOfDirectory(atPath: workDir)
+    else { return 0 }
+    var sum: Int64 = 0
+    for n in names {
+      // playlist.m3u8 也在同一目录，几 KB，忽略不影响进度
+      if n.hasSuffix(".m3u8") { continue }
+      sum += fileSize((workDir as NSString).appendingPathComponent(n))
+    }
+    return sum
+  }
+
+  private func fileSize(_ path: String) -> Int64 {
+    let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+    return (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+  }
+
+  /// 节流判定（同时记录本次推送时间）
+  private func shouldEmit(_ jobId: String) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    let now = Date()
+    if let last = lastEmitAt[jobId], now.timeIntervalSince(last) < Self.emitInterval {
+      return false
+    }
+    lastEmitAt[jobId] = now
+    return true
+  }
+
+  // MARK: - URLSessionDownloadDelegate
+
+  /// 前台实时字节进度。后台期间系统不会调用（App 被挂起），所以这里只用于
+  /// 「亮屏时的真实速度」，回前台/冷启动的进度由 listJobs() 扫盘重建。
+  func urlSession(
+    _ session: URLSession,
+    downloadTask: URLSessionDownloadTask,
+    didWriteData bytesWritten: Int64,
+    totalBytesWritten: Int64,
+    totalBytesExpectedToWrite: Int64
+  ) {
+    let tid = downloadTask.taskIdentifier
+    lock.lock()
+    let jobId = taskJob[tid] ?? Self.jobIdOf(downloadTask)
+    if let jobId {
+      var c = live[tid] ?? LiveBytes(jobId: jobId)
+      c.written = totalBytesWritten
+      if totalBytesExpectedToWrite > 0 { c.expected = totalBytesExpectedToWrite }
+      live[tid] = c
+      taskJob[tid] = jobId
+    }
+    lock.unlock()
+    guard let jid = jobId, shouldEmit(jid), let st = loadState(jid) else { return }
+    emit(st)
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    downloadTask: URLSessionDownloadTask,
+    didFinishDownloadingTo location: URL
+  ) {
+    guard let resolved = resolve(task: downloadTask) else { return }
+    let jobId = resolved.0
+    let name = resolved.1
+    let st = resolved.2
+    let workDir = st["workDir"] as? String ?? ""
+    let dest = URL(fileURLWithPath: workDir).appendingPathComponent(name)
+    let fm = FileManager.default
+    var ok = false
+    // 后台 session 会把 403/404 的响应体也当「下载成功」交给 delegate，
+    // 不校验状态码就会把错误页当成 .ts 落盘，最后 ffmpeg 才报错且无法定位。
+    let httpOk = (downloadTask.response as? HTTPURLResponse)
+      .map { (200...299).contains($0.statusCode) } ?? true
+    if httpOk {
+      try? fm.removeItem(at: dest)
+      do {
+        // 官方：临时文件只在 delegate 方法返回前有效，必须同步搬走
+        try fm.moveItem(at: location, to: dest)
+        ok = hasNonEmptyFile(dest.path)
+      } catch {
+        ok = false
+      }
+    }
+    // 这一片的实际大小计入磁盘基线，同时清掉在途计数（避免同一片被算两次）
+    let tid = downloadTask.taskIdentifier
+    lock.lock()
+    if ok { diskBytes[jobId, default: 0] += fileSize(dest.path) }
+    live.removeValue(forKey: tid)
+    taskJob.removeValue(forKey: tid)
+    let diskNow = diskBytes[jobId] ?? 0
+    lock.unlock()
+
+    let httpStatus = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
+    if let updated = updateState(jobId, { state in
+      state["finished"] = (state["finished"] as? Int ?? 0) + 1
+      if ok {
+        state["done"] = (state["done"] as? Int ?? 0) + 1
+        state["bytes"] = Int(diskNow)
+      } else {
+        state["failed"] = (state["failed"] as? Int ?? 0) + 1
+        if state["error"] == nil {
+          // 直链单文件作业要的是「为什么没下来」——HTTP 码是唯一能据此归因
+          // （防盗链 / 签名过期）的信息，Dart 侧按它翻成用户能行动的文案
+          state["error"] = ((state["single"] as? Bool) ?? false)
+            ? "HTTP \(httpStatus)"
+            : "分片落盘失败: \(name)（HTTP \(httpStatus)）"
+        }
+      }
+      self.finalizeIfNeeded(&state)
+    }) {
+      emit(updated)
+    }
+  }
+
+  func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    let tid = task.taskIdentifier
+    lock.lock()
+    live.removeValue(forKey: tid)
+    taskJob.removeValue(forKey: tid)
+    lock.unlock()
+    // 成功路径已在 didFinishDownloadingTo 里计过 finished，这里只补失败
+    guard let error else { return }
+    let ns = error as NSError
+    // 主动暂停 / 取消（-999）不是失败：计入 failed 会把「已暂停」的作业标成
+    // 失败态，用户回来看到的就不是「已暂停」而是错误，且 finalize 会提前把
+    // 整个作业判成 failed
+    if ns.domain == NSURLErrorDomain, ns.code == NSURLErrorCancelled {
+      // 这里也不写 resume：pauseJob 走 cancel(byProducingResumeData:)，系统保证
+      // 那条回调先于本回调，断点已经存过了；再存一次会和「删除作业」的 clearJob
+      // 打架（删除后又被这条路径把 state.json 写回来）
+      return
+    }
+    // 真失败：留下断点，用户点「继续」时按断点续传
+    if let data = ns.userInfo[NSURLSessionDownloadTaskResumeData] as? Data, !data.isEmpty {
+      storeResume(task: task, data: data)
+    }
+    guard let resolved = resolve(task: task) else { return }
+    let jobId = resolved.0
+    if let updated = updateState(jobId, { state in
+      state["finished"] = (state["finished"] as? Int ?? 0) + 1
+      state["failed"] = (state["failed"] as? Int ?? 0) + 1
+      if state["error"] == nil { state["error"] = error.localizedDescription }
+      self.finalizeIfNeeded(&state)
+    }) {
+      emit(updated)
+    }
+  }
+
+  func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      let handler = self.completionHandlers.removeValue(forKey: Self.sessionIdentifier)
+      handler?()
+    }
+  }
+
+  // MARK: - FlutterStreamHandler
+
+  func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink)
+    -> FlutterError?
+  {
+    eventSink = events
+    return nil
+  }
+
+  func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    eventSink = nil
+    return nil
+  }
+
+  // MARK: - 状态文件
+
+  private func jobsRoot() -> URL {
+    let fm = FileManager.default
+    let base = fm.urls(for: .documentDirectory, in: .userDomainMask).first
+      ?? fm.temporaryDirectory
+    let dir = base.appendingPathComponent("NativeSegJobs", isDirectory: true)
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+  }
+
+  private func stateURL(_ jobId: String) -> URL {
+    let safe = String(jobId.map { $0.isLetter || $0.isNumber ? $0 : "_" })
+    return jobsRoot()
+      .appendingPathComponent(safe, isDirectory: true)
+      .appendingPathComponent("state.json")
+  }
+
+  private func loadState(_ jobId: String) -> [String: Any]? {
+    guard let data = try? Data(contentsOf: stateURL(jobId)),
+      let obj = try? JSONSerialization.jsonObject(with: data),
+      let j = obj as? [String: Any]
+    else { return nil }
+    return j
+  }
+
+  private func saveState(_ jobId: String, _ state: [String: Any]) {
+    let url = stateURL(jobId)
+    try? FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    guard let data = try? JSONSerialization.data(withJSONObject: state) else { return }
+    try? data.write(to: url, options: .atomic)
+  }
+
+  private func allStates() -> [(String, [String: Any])] {
+    let fm = FileManager.default
+    guard
+      let dirs = try? fm.contentsOfDirectory(
+        at: jobsRoot(), includingPropertiesForKeys: nil)
+    else { return [] }
+    var out: [(String, [String: Any])] = []
+    for d in dirs {
+      let f = d.appendingPathComponent("state.json")
+      guard let data = try? Data(contentsOf: f),
+        let obj = try? JSONSerialization.jsonObject(with: data),
+        let j = obj as? [String: Any]
+      else { continue }
+      out.append(((j["jobId"] as? String) ?? d.lastPathComponent, j))
+    }
+    return out
+  }
+
+  @discardableResult
+  private func updateState(
+    _ jobId: String, _ mutate: (inout [String: Any]) -> Void
+  ) -> [String: Any]? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard var st = loadState(jobId) else { return nil }
+    mutate(&st)
+    saveState(jobId, st)
+    return st
+  }
+
+  private func finalizeIfNeeded(_ state: inout [String: Any]) {
+    let total = state["total"] as? Int ?? 0
+    let finished = state["finished"] as? Int ?? 0
+    guard total > 0, finished >= total,
+      (state["state"] as? String ?? "downloading") == "downloading"
+    else { return }
+    let failed = state["failed"] as? Int ?? 0
+    state["state"] = failed > 0 ? "failed" : "ready"
+  }
+
+  private func emit(_ state: [String: Any]) {
+    let jobId = state["jobId"] as? String ?? ""
+    // 事件体与 listJobs 用同一个构造函数：两条路给 Dart 的字段必须一致，
+    // 否则「前台靠事件、后台靠对账」的进度会在回前台那一刻跳成另一套口径。
+    // 在途字节这里传空：progress() 已经从内存态 live 拿到本次写入量。
+    let empty: [String: (written: Int64, expected: Int64)] = [:]
+    let payload = jobPayload(jobId, state, inflow: empty)
+    DispatchQueue.main.async { [weak self] in
+      self?.eventSink?(payload)
+    }
+  }
+
+  /// 从 taskDescription（`<jobId>|<name>`）取 jobId；后台重启后可能为空
+  private static func jobIdOf(_ task: URLSessionTask) -> String? {
+    guard let desc = task.taskDescription,
+      let range = desc.range(of: "|")
+    else { return nil }
+    let id = String(desc[desc.startIndex..<range.lowerBound])
+    return id.isEmpty ? nil : id
+  }
+
+  private func hasNonEmptyFile(_ path: String) -> Bool {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+      let size = attrs[.size] as? NSNumber
+    else { return false }
+    return size.intValue > 0
+  }
+
+  /// 定位回调属于哪个作业 / 哪个文件。taskDescription 在后台重启后可能丢失，
+  /// 因此再用 originalRequest.url 去所有 state.json 的 parts 里查一遍。
+  private func resolve(task: URLSessionTask) -> (String, String, [String: Any])? {
+    if let desc = task.taskDescription,
+      let range = desc.range(of: "|"),
+      let st = loadState(String(desc[desc.startIndex..<range.lowerBound]))
+    {
+      let jobId = String(desc[desc.startIndex..<range.lowerBound])
+      let name = String(desc[range.upperBound...])
+      if !jobId.isEmpty && !name.isEmpty { return (jobId, name, st) }
+    }
+    guard let urlString = task.originalRequest?.url?.absoluteString else { return nil }
+    for (jobId, st) in allStates() {
+      guard let parts = st["parts"] as? [[String: Any]] else { continue }
+      for part in parts {
+        if let u = part["url"] as? String, u == urlString,
+          let name = part["name"] as? String
+        {
+          return (jobId, name, st)
+        }
+      }
     }
     return nil
   }

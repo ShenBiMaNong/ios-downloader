@@ -153,7 +153,7 @@ class PlaybackCacher extends ChangeNotifier {
       } catch (e, st) {
         // 建流失败 → 降级直连
         task.failed = true;
-        task.error = '无法建立本地缓存通道';
+        task.error = '缓存通道失败';
         AppLog.instance.error('cacher', '建立缓存流失败: $url', e, st);
         notifyListeners();
         return PlayableItem(
@@ -237,6 +237,7 @@ class PlaybackCacher extends ChangeNotifier {
       (state) {
         if (t.done) return;
         t.progress = state.progress ?? 0;
+        _sampleBytes(t);
         notifyListeners();
       },
       onError: (Object e) {
@@ -246,6 +247,41 @@ class PlaybackCacher extends ChangeNotifier {
         notifyListeners();
       },
     );
+  }
+
+  /// 从暂存文件补出字节口径的进度：http_cache_stream 的 CacheState 只给比例，
+  /// 但缓存文件就是最终产物，长度即真实已下字节 —— 采样差值就是真实下载速度。
+  void _sampleBytes(CacheTask t) {
+    final path = t.stagingPath;
+    if (path == null || path.isEmpty) return;
+    int len;
+    try {
+      len = File(path).lengthSync();
+    } catch (_) {
+      return;
+    }
+    if (len <= 0) return;
+    final now = DateTime.now();
+    final prevAt = t.bytesSampledAt;
+    if (prevAt != null && len > t.bytesDone) {
+      final dt = now.difference(prevAt).inMilliseconds / 1000.0;
+      // 采样间隔太短除出尖峰，太长（后台回来）不是当前速度
+      if (dt >= 0.4 && dt <= 5.0) {
+        final inst = (len - t.bytesDone) / dt;
+        t.speed = t.speed <= 0 ? inst : t.speed * 0.55 + inst * 0.45;
+      }
+    }
+    t.bytesDone = len;
+    t.bytesSampledAt = now;
+    final ratio = t.progress;
+    if (ratio >= 0.999) {
+      t.bytesTotal = len;
+    } else if (ratio > 0.02) {
+      t.bytesTotal = (len / ratio).round();
+    }
+    if (t.speed > 0 && t.bytesTotal > len) {
+      t.eta = Duration(seconds: ((t.bytesTotal - len) / t.speed).ceil());
+    }
   }
 
   void _onCacheDone(HttpCacheStream stream, File completedFile) {
@@ -262,7 +298,7 @@ class PlaybackCacher extends ChangeNotifier {
       final ok = await stream.validateCache();
       if (ok == false) {
         t.failed = true;
-        t.error = '缓存校验失败，请重试';
+        t.error = '校验失败';
         AppLog.instance.error('cacher', '缓存校验失败: ${t.title}');
         notifyListeners();
         return;
@@ -291,7 +327,7 @@ class PlaybackCacher extends ChangeNotifier {
       AppLog.instance.info('cacher', '边播边缓存完成: ${t.title}（$finalPath）');
     } catch (e, st) {
       t.failed = true;
-      t.error = '缓存就位失败';
+      t.error = '入库失败';
       AppLog.instance.error('cacher', '缓存就位失败: ${t.title}', e, st);
     }
     notifyListeners();
@@ -345,6 +381,14 @@ class CacheTask {
   String? stagingPath;
   String? localPath; // 最终资源库路径（完成时设置）
   double progress = 0;
+  /// 已缓存字节（直接 stat 暂存文件：缓存文件就是最终产物，长度即已下量）
+  int bytesDone = 0;
+  /// 总字节。http_cache_stream 只给比例，这里按 bytesDone/progress 反推，
+  /// 因此是估算值（UI 会带 ≈）。
+  int bytesTotal = 0;
+  double speed = 0; // 字节/秒，按暂存文件长度增量采样
+  Duration? eta;
+  DateTime? bytesSampledAt;
   bool done = false;
   bool failed = false;
   String? error;

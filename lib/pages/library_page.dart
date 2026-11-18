@@ -4,6 +4,7 @@ import 'package:material_ui/material_ui.dart';
 
 import '../models/library_item.dart';
 import '../models/playable_item.dart';
+import '../models/video_info.dart';
 import '../services/app_settings.dart';
 import '../services/download_manager.dart';
 import '../services/files_bridge.dart';
@@ -75,7 +76,7 @@ class _LibraryPageState extends State<LibraryPage> {
       return;
     }
     ConvertManager.instance.convertLocal(path);
-    _toast('已开始本地 m3u8 → mp4 转换，进度见列表');
+    _toast('已开始转换');
   }
 
   void _toast(String msg) {
@@ -108,8 +109,10 @@ class _LibraryPageState extends State<LibraryPage> {
         failed: failed,
         paused: t.status == DownloadStatus.paused,
         progress: t.progress,
-        speedText: active ? formatSpeed(t.speed) : null,
-        etaText: active ? formatEta(t.eta) : null,
+        speed: active ? t.speed : 0,
+        eta: active ? t.eta : null,
+        bytesDone: active ? t.bytesDone : 0,
+        bytesTotal: active ? t.bytesTotal : 0,
         localPath: t.localPath,
         url: t.url,
         error: t.error,
@@ -129,6 +132,12 @@ class _LibraryPageState extends State<LibraryPage> {
         active: active,
         failed: t.failed,
         progress: t.progress,
+        speed: active ? t.speed : 0,
+        eta: active ? t.eta : null,
+        bytesDone: active ? t.bytesDone : 0,
+        bytesTotal: active ? t.bytesTotal : 0,
+        // http_cache_stream 只给比例，总量由「已缓存字节 / 比例」反推 → 估算值
+        bytesEstimated: true,
         localPath: t.localPath,
         url: t.url,
         error: t.error,
@@ -146,7 +155,7 @@ class _LibraryPageState extends State<LibraryPage> {
         failed: t.failed,
         paused: t.paused,
         progress: t.progress,
-        etaText: t.done || t.failed ? null : formatEta(t.eta),
+        eta: t.done || t.failed ? null : t.eta,
         hlsTaskId: t.taskId,
         url: t.url,
         error: t.error,
@@ -165,15 +174,21 @@ class _LibraryPageState extends State<LibraryPage> {
         active: active,
         failed: t.failed,
         progress: t.progress,
-        speedText: active && t.progress < 1 ? formatSpeed(t.speed) : null,
-        etaText: active && t.progress < 1 ? formatEta(t.eta) : null,
+        speed: active && t.progress < 1 ? t.speed : 0,
+        eta: active && t.progress < 1 ? t.eta : null,
         localPath: t.localPath,
         url: t.url,
         error: t.error,
         doneSegments: t.doneSegments,
         totalSegments: t.totalSegments,
+        bytesDone: t.bytes,
+        bytesTotal: t.bytesTotal,
+        bytesEstimated: t.bytesEstimated,
         resumable: t.resumable,
+        failedSegments: t.failedSegments,
+        canForceMerge: t.canForceMerge,
         folder: folderById[t.id] ?? '',
+        stage: t.stage.isEmpty ? null : t.stage,
       ));
     }
 
@@ -206,14 +221,45 @@ class _LibraryPageState extends State<LibraryPage> {
     return LibraryItem.sort(items, _field, _desc);
   }
 
+  /// 目录大小按路径缓存：m3u8 分片包可能有数百个分片，
+  /// 不该在列表每次刷新时都重新 stat 一遍。
+  final Map<String, int> _sizeCache = {};
+
+  /// 已完成产物大小：mp4 直接取文件长度；m3u8 分片包是目录，递归累加。
+  /// 系统 .movpkg 是 Apple 私有 bundle（元数据 hls=true），官方禁止遍历内部文件，
+  /// 这类条目在 _saved 映射里直接置 0，不会走到这里。
   int _fileSize(String? path) {
     if (path == null || path.isEmpty) return 0;
+    final cached = _sizeCache[path];
+    if (cached != null) return cached;
     try {
-      final f = File(path);
-      return f.existsSync() ? f.lengthSync() : 0;
+      int total;
+      final dir = Directory(path);
+      if (dir.existsSync()) {
+        total = _dirSize(dir);
+      } else {
+        final f = File(path);
+        total = f.existsSync() ? f.lengthSync() : 0;
+      }
+      _sizeCache[path] = total;
+      return total;
     } catch (_) {
       return 0;
     }
+  }
+
+  static int _dirSize(Directory dir) {
+    var total = 0;
+    try {
+      for (final e in dir.listSync(followLinks: false)) {
+        if (e is File) {
+          total += e.lengthSync();
+        } else if (e is Directory) {
+          total += _dirSize(e);
+        }
+      }
+    } catch (_) {}
+    return total;
   }
 
   @override
@@ -284,13 +330,13 @@ class _LibraryPageState extends State<LibraryPage> {
                     ? const Center(child: CircularProgressIndicator())
                     : items.isEmpty
                         ? const Center(
-                            child: Text('暂无内容，去浏览器里找找视频吧'),
+                            child: Text('暂无视频'),
                           )
                         : sections.every((s) => s.items.isEmpty)
                             ? Center(
                                 child: Text(_folder == LibraryFolders.reservedName
-                                    ? '还没有分享进来的视频'
-                                    : '此文件夹暂无视频'),
+                                    ? '暂无分享'
+                                    : '此文件夹为空'),
                               )
                             : RefreshIndicator(
                                 onRefresh: _refresh,
@@ -486,7 +532,7 @@ class _LibraryPageState extends State<LibraryPage> {
         _playHlsCaching(it);
       case 'convert':
         ConvertManager.instance.convertLocal(it.localPath!);
-        _toast('已开始本地 m3u8 → mp4 转换');
+        _toast('已开始转换');
       case 'move':
         _moveSheet(it);
       case 'rename':
@@ -496,12 +542,17 @@ class _LibraryPageState extends State<LibraryPage> {
       case 'cancel':
         if (it.id.startsWith(PlaybackCacher.idPrefix)) {
           PlaybackCacher.instance.cancel(it.id);
+        } else if (it.kind == 'convert') {
+          // 原来 convert 类会误落到 HlsManager.cancel，点「取消」毫无反应；
+          // 原生后台作业还要一并取消系统代跑的 task。
+          ConvertManager.instance.cancel(it.id);
         } else if (it.kind == 'mp4') {
           DownloadManager.instance.cancel(it.id);
         } else {
           HlsManager.instance.cancel(it.hlsTaskId ?? it.id);
         }
       case 'pause':
+        // 手动暂停：保留断点（.part / 原生 resumeData），可继续下载
         if (it.kind == 'mp4') {
           DownloadManager.instance.pause(it.id);
         } else if (it.kind == 'm3u8') {
@@ -515,8 +566,61 @@ class _LibraryPageState extends State<LibraryPage> {
         } else {
           DownloadManager.instance.resume(it.id);
         }
+      case 'forcemerge':
+        _confirmForceMerge(it);
       case 'detail':
         _showError(it);
+      case 'reconvert':
+        _reconvertHls(it);
+    }
+  }
+
+  /// 已完成的系统 HLS 离线缓存（.movpkg 私有格式）无法导出为 mp4：
+  /// 用元数据里保存的原始 m3u8 地址重新拉一遍分片并转封装。
+  /// 代价是会重新下载一次分片，但产物是可分享/可导出的通用 mp4。
+  void _reconvertHls(LibraryItem it) {
+    final url = it.url ?? '';
+    if (!url.startsWith('http')) {
+      _toast('缺少原始 m3u8 地址');
+      return;
+    }
+    ConvertManager.instance.convert(VideoInfo(
+      url: url,
+      frameUrl: '',
+      pageTitle: it.sortName,
+    ));
+    _toast(Platform.isIOS ? '已重新下载，锁屏后继续' : '已开始重新下载');
+  }
+
+  /// 「仍要合成」确认框：缺片出片是一次性决定，代价必须先说清
+  Future<void> _confirmForceMerge(LibraryItem it) async {
+    final missing = it.failedSegments;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('仍要合成？'),
+        content: Text(
+          missing > 0
+              ? '缺少 $missing 个分片，合成后的视频会缺失对应片段（时长偏短、可能黑屏跳跃）。\n\n'
+                  '注意：合成后本次下载即完成，已下分片会被清理，无法再续传补齐缺失部分。\n'
+                  '加密流（AES-128）从缺失位置起可能解密失败。'
+              : '将用已下载的分片合成视频。\n\n'
+                  '注意：合成后本次下载即完成，无法再续传补片。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('仍要合成'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      await ConvertManager.instance.mergeAnyway(it.id);
     }
   }
 
@@ -526,10 +630,10 @@ class _LibraryPageState extends State<LibraryPage> {
     showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('「${it.sortName}」失败原因'),
+        title: Text('失败原因'),
         content: SingleChildScrollView(
           child: SelectableText(
-            raw.isEmpty ? '未知错误（可查看设置页的日志）' : raw,
+            raw.isEmpty ? '未知错误' : raw,
             style: const TextStyle(fontSize: 13),
           ),
         ),
@@ -561,6 +665,15 @@ class _LibraryPageState extends State<LibraryPage> {
         const PopupMenuItem(value: 'hlsplay', child: Text('边下边看')),
       if (m3u8Pkg)
         const PopupMenuItem(value: 'convert', child: Text('本地转 MP4')),
+      // 系统 HLS 离线缓存（.movpkg）不能导出：用条目里保存的原始 m3u8 重新拉一遍
+      if (it.kind == 'm3u8' &&
+          it.hlsTaskId != null &&
+          !it.active &&
+          !it.failed &&
+          !it.paused &&
+          (it.url ?? '').startsWith('http'))
+        const PopupMenuItem(
+            value: 'reconvert', child: Text('重新下载并转 MP4')),
       // 下载中：手动暂停（边播边缓存任务没有暂停概念，只提供取消）
       if (it.active && it.kind != 'convert') ...[
         if (!isCache)
@@ -570,11 +683,19 @@ class _LibraryPageState extends State<LibraryPage> {
           child: Text('取消下载', style: TextStyle(color: Colors.red)),
         ),
       ],
+      // 普通 convert 任务在跑的是 Dart 侧 ffmpeg，取消会留下不一致状态，故不开放；
+      // 原生后台作业（stage != null）则由系统托管，必须能取消在途 task。
+      if (it.active && it.kind == 'convert' && it.stage != null)
+        const PopupMenuItem(value: 'cancel', child: Text('取消')),
       // 已暂停：继续下载（放弃走下方「删除」）
       if (it.paused && it.resumable)
         const PopupMenuItem(value: 'resume', child: Text('继续下载')),
       if (it.failed && it.resumable)
         const PopupMenuItem(value: 'resume', child: Text('继续下载')),
+      if (it.failed && it.kind == 'convert' && it.canForceMerge)
+        PopupMenuItem(
+            value: 'forcemerge',
+            child: Text('仍要合成（缺 ${it.failedSegments} 片）')),
       if (it.failed)
         const PopupMenuItem(value: 'detail', child: Text('查看错误详情')),
       if (playable) const PopupMenuItem(value: 'rename', child: Text('重命名')),
@@ -604,22 +725,24 @@ class _LibraryPageState extends State<LibraryPage> {
           size: 40, color: scheme.onSurfaceVariant);
     } else if (it.active) {
       bg = scheme.primaryContainer;
-      if (it.kind == 'convert') {
-        content = Icon(Icons.transform, size: 36, color: scheme.onPrimaryContainer);
-      } else {
-        final pct = (it.progress * 100).clamp(0, 100);
-        content = Stack(
-          alignment: Alignment.center,
-          children: [
-            SizedBox(
-              width: 46,
-              height: 46,
-              child: CircularProgressIndicator(
-                value: it.progress.clamp(0.0, 1.0),
-                strokeWidth: 3.5,
-                color: scheme.primary,
-              ),
+      // 所有进行中条目统一显示进度环（原来 convert / 分片包只给一个静态图标，
+      // 宫格视图里看不到任何进度）。progress 还是 0 时用不确定态转圈，
+      // 避免系统 HLS 缓存（按媒体时长报进度、且酌情下载会择机启动）显示成卡住的 0%。
+      final hasProgress = it.progress > 0;
+      final pct = (it.progress * 100).clamp(0, 100);
+      content = Stack(
+        alignment: Alignment.center,
+        children: [
+          SizedBox(
+            width: 46,
+            height: 46,
+            child: CircularProgressIndicator(
+              value: hasProgress ? it.progress.clamp(0.0, 1.0) : null,
+              strokeWidth: 3.5,
+              color: scheme.primary,
             ),
+          ),
+          if (hasProgress)
             Text(
               '${pct.toStringAsFixed(0)}%',
               style: TextStyle(
@@ -628,9 +751,8 @@ class _LibraryPageState extends State<LibraryPage> {
                 color: scheme.primary,
               ),
             ),
-          ],
-        );
-      }
+        ],
+      );
     } else {
       switch (it.kind) {
         case 'm3u8':
@@ -709,7 +831,7 @@ class _LibraryPageState extends State<LibraryPage> {
       return Row(mainAxisSize: MainAxisSize.min, children: [play, secondary]);
     }
     if ((it.paused || it.failed) && it.resumable) {
-      return _smallFab(Icons.play_arrow, '继续下载', () {
+      final resume = _smallFab(Icons.play_arrow, '继续下载', () {
         if (it.kind == 'convert') {
           ConvertManager.instance.retry(it.id);
         } else if (it.kind == 'm3u8') {
@@ -718,6 +840,20 @@ class _LibraryPageState extends State<LibraryPage> {
           DownloadManager.instance.resume(it.id);
         }
       });
+      // 分片部分失败的 convert 任务：多给一个「仍要合成」入口
+      if (it.kind == 'convert' && it.canForceMerge) {
+        return Row(mainAxisSize: MainAxisSize.min, children: [
+          _smallFab(Icons.merge_type, '仍要合成（缺 ${it.failedSegments} 片）',
+              () => _confirmForceMerge(it)),
+          resume,
+        ]);
+      }
+      return resume;
+    }
+    // 失败但不可续传（如清单已丢）：只要工作目录里还有清单和分片，仍可强合
+    if (it.failed && it.kind == 'convert' && it.canForceMerge) {
+      return _smallFab(Icons.merge_type, '仍要合成（缺 ${it.failedSegments} 片）',
+          () => _confirmForceMerge(it));
     }
     if (it.kind == 'm3u8' &&
         it.hlsTaskId == null &&
@@ -725,7 +861,7 @@ class _LibraryPageState extends State<LibraryPage> {
         it.localPath!.isNotEmpty) {
       return _smallFab(Icons.transform, '本地转 MP4', () {
         ConvertManager.instance.convertLocal(it.localPath!);
-        _toast('已开始本地 m3u8 → mp4 转换');
+        _toast('已开始转换');
       });
     }
     // 已完成条目：点按卡片即播放，无需播放按钮
@@ -1155,7 +1291,7 @@ class _LibraryPageState extends State<LibraryPage> {
     final it = all[index];
     if (it.kind == 'm3u8') {
       if (it.hlsTaskId == null) {
-        _toast('m3u8 分片包请先「本地转 MP4」');
+        _toast('请先转 MP4');
         return;
       }
       _playHls(it);
@@ -1214,8 +1350,8 @@ class _LibraryPageState extends State<LibraryPage> {
     if (!mounted) return;
     if (!ok) {
       _toast(whileDownloading
-          ? '无法边下边看：原生下载任务不存在，可取消后重新下载'
-          : '播放失败：本地缓存不存在或已被系统清理');
+          ? '任务不存在，请重新下载'
+          : '缓存已失效');
     }
   }
 
@@ -1315,39 +1451,46 @@ class _LibraryPageState extends State<LibraryPage> {
       final pct = '${(it.progress * 100).toStringAsFixed(0)}%';
       return '已暂停 · 已下载 $pct';
     }
-    if (it.failed) {
-      final s = _shortError(it.error);
-      return (s.startsWith('失败') || s.startsWith('已')) ? s : '失败：$s';
-    }
+    if (it.failed) return _shortError(it.error);
     if (it.active) {
-      final pct = '${(it.progress * 100).toStringAsFixed(0)}%';
-      if (it.kind == 'convert') {
-        final seg = it.progress >= 1
-            ? '转封装中…'
-            : '分片 ${it.doneSegments}/${it.totalSegments}';
-        return [seg, it.speedText, it.etaText].whereType<String>().join(' · ');
+      // 合成阶段没有下行量，单独文案（否则会显示上一阶段的残留字节）
+      switch (it.stage) {
+        case 'ready':
+          return '待合成';
+        case 'remuxing':
+          return '合成中';
       }
-      return [pct, it.speedText, it.etaText].whereType<String>().join(' · ');
+      // 系统 HLS 缓存在起步前不报进度，显示成 0% 会让人以为卡住
+      if (it.kind == 'm3u8' && it.hlsTaskId != null && it.progress <= 0) {
+        return '系统下载中';
+      }
+      // 所有下载链路统一口径：速度 → 已下/总量 → 剩余时长 → 已下分片/总分片
+      final line = it.progressLine;
+      return line.isEmpty ? '准备中' : line;
     }
     final date = it.created.toLocal().toString().substring(0, 10);
-    // 分享导入的条目也只显示大小 + 日期，不再标来源
     if (it.kind == 'share') {
       final size = formatBytes(it.size);
       return size.isEmpty ? date : '$size · $date';
     }
-    if (it.kind == 'm3u8') return 'HLS 离线缓存 · $date';
+    if (it.kind == 'm3u8') {
+      // 系统 .movpkg 是私有 bundle，遍历不出大小
+      if (it.hlsTaskId != null) return '系统缓存 · $date';
+      final size = formatBytes(it.size);
+      return size.isEmpty ? '分片包 · $date' : '$size · 分片包 · $date';
+    }
     return '${formatBytes(it.size)} · $date';
   }
 
-  /// 把异常文本收敛成一行短摘要（压掉换行/去异常前缀/截断），
-  /// 保证列表行高稳定；完整内容走「查看错误详情」弹窗。
+  /// 把异常文本收敛成一行短摘要：只留可读部分，完整内容走「查看错误详情」
   static String _shortError(String? raw) {
     if (raw == null || raw.trim().isEmpty) return '失败';
     var s = raw.replaceAll(RegExp(r'\s+'), ' ').trim();
     s = s.replaceFirst(RegExp(r'^(Exception|DioException|Error)[:\s]+'), '');
-    const max = 48;
+    // 服务层文案常把「怎么处理」也写进去，列表行只留原因
+    s = s.replaceFirst(RegExp(r'[，,]\s*(请|可)[^，,。]*$'), '');
+    const max = 32;
     if (s.length > max) s = '${s.substring(0, max)}…';
-    if (s.isEmpty) return '失败';
-    return s;
+    return s.isEmpty ? '失败' : s;
   }
 }

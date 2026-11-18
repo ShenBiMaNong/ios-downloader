@@ -17,7 +17,7 @@ class PlayerSettings extends ChangeNotifier {
   /// 双击快进/快退的秒数
   int seekSeconds = 10;
 
-  /// 按住视频右半边加速播放的倍速
+  /// 长按视频加速播放的倍速
   double holdSpeed = 2.0;
 
   /// 播放顺序（顺序 / 乱序）

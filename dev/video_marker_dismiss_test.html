@@ -2,12 +2,12 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>角标弹层关闭测试</title>
+<title>角标弹层关闭 / 候选校验测试</title>
 <style>
   body { font-family: sans-serif; margin: 12px; }
   video { width: 200px; background: #000; }
   #blank { margin-top: 40px; height: 60px; background: #eef; }
-  #result { white-space: pre-wrap; font: 12px monospace; background: #0f172a; color: #a5f3fc; padding: 8px; }
+  #result { white-space: pre-wrap; font: 12px monospace; background: #0f172a; color:#a5f3fc; padding: 8px; }
 </style>
 </head>
 <body>
@@ -23,6 +23,45 @@
   }
   function cardCount() { return document.querySelectorAll('.vdl-card').length; }
   window.videoAction = { postMessage: function (s) { log('ACTION: ' + s); } };
+
+  // ── 候选池桩：模拟「页面自己从没请求过」的多线路 ──────────────────────
+  // 真机上这些来自 sniffer 的脚本/属性扫描（state=guess，没有任何状态码），
+  // 这里用状态表 + 可控的 verify 来复现「打开卡片后现场探测」的流程。
+  var VURLS = [
+    'https://cdn.example.com/live/a/index.m3u8',
+    'https://cdn.example.com/live/b/index.m3u8',
+    'https://cdn.example.com/live/c/index.m3u8'
+  ];
+  var stateMap = Object.create(null);
+  var verifyCalls = 0;
+  window.__vdlSniff = {
+    list: function () {
+      return VURLS.map(function (u) {
+        return {
+          url: u, kind: 'hls', score: 100, src: 'script',
+          state: stateMap[u] || 'guess', soon: false, expired: false, code: 0
+        };
+      });
+    },
+    best: function (kind) {
+      for (var i = 0; i < VURLS.length; i++) {
+        if ((stateMap[VURLS[i]] || '') === 'ok') {
+          return { url: VURLS[i], kind: kind || 'hls', state: 'ok' };
+        }
+      }
+      return null;
+    },
+    stateOf: function (u) { return stateMap[u] || ''; },
+    // 桩：a/b 可用(200)、c 失效(404)。三条都回调，表头才会从「校验中…」回到「点选切换」
+    verify: function (list, cb) {
+      verifyCalls++;
+      log('VERIFY called with ' + list.length + ' urls');
+      setTimeout(function () { stateMap[VURLS[0]] = 'ok'; cb({ url: VURLS[0], state: 'ok', code: 200 }); }, 40);
+      setTimeout(function () { stateMap[VURLS[1]] = 'ok'; cb({ url: VURLS[1], state: 'ok', code: 200 }); }, 60);
+      setTimeout(function () { stateMap[VURLS[2]] = 'dead'; cb({ url: VURLS[2], state: 'dead', code: 404 }); }, 80);
+      setTimeout(function () { cb(null); }, 110); // 「收工」信号：表头恢复
+    }
+  };
 </script>
 <script src="../assets/video_marker.js"></script>
 <script>
@@ -31,6 +70,12 @@
     return new Promise(function (resolve) {
       setTimeout(function () { fn(); setTimeout(resolve, 30); }, 30);
     });
+  }
+  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function marks() {
+    return Array.prototype.map.call(
+      document.querySelectorAll('.vdl-card .vdl-line .vdl-lm'),
+      function (m) { return m.textContent; }).join('');
   }
 
   (async function () {
@@ -56,12 +101,30 @@
     await step(function () { window.dispatchEvent(new Event('scroll')); });
     log('T5 页面滚动: card=' + cardCount() + '  expect 0');
 
+    // T5b：弹层内滑动（卡片自身 + 候选列表滚动）不应关闭 —— 用户要翻线路列表
     await step(function () { b.click(); });
+    await step(function () {
+      var card = document.querySelector('.vdl-card');
+      var lines = card.querySelector('.vdl-lines');
+      card.dispatchEvent(new Event('scroll'));
+      if (lines) lines.dispatchEvent(new Event('scroll'));
+    });
+    log('T5b 弹层内滚动: card=' + cardCount() + '  expect 1');
+
+    // T6：打开卡片后应自动对未验证候选发起校验，并把「?」改成 ✓/✗
+    log('T6 候选行初始标记: ' + marks() + '  expect ???');
+    await wait(220);
+    log('T6b 校验后标记: ' + marks() + '  expect ✓✓✗');
+    log('T6c verify 调用次数: ' + verifyCalls + '  expect ≥1（每条候选 20s 内只探一次）');
+    var head = document.querySelector('.vdl-card .vdl-lines-h');
+    log('T6d 表头: ' + (head ? head.textContent : '-') + '  expect 含「点选切换」');
+
+    // T7：点操作项关闭（此时弹层仍开着，先点 copy）
     await step(function () { document.querySelector('.vdl-card [data-a="copy"]').click(); });
-    log('T6 点操作项: card=' + cardCount() + '  expect 0');
+    log('T7 点操作项: card=' + cardCount() + '  expect 0');
 
     await step(function () { b.click(); });
-    log('T7 操作后仍能再次打开: card=' + cardCount() + '  expect 1');
+    log('T8 操作后仍能再次打开: card=' + cardCount() + '  expect 1');
 
     log('DONE');
   })();

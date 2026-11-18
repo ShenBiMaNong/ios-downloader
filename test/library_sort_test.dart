@@ -55,6 +55,48 @@ void main() {
     expect(formatSpeed(512 * 1024), '512 KB/s');
   });
 
+  test('下载进度行：字段顺序固定（速度 → 大小 → 剩余 → 分片）', () {
+    expect(
+      formatProgressLine(
+        speed: 1024 * 1024,
+        bytesDone: 100 * 1024 * 1024,
+        bytesTotal: 200 * 1024 * 1024,
+        eta: const Duration(seconds: 50),
+        doneSegments: 50,
+        totalSegments: 100,
+      ),
+      '1MB/s · 100MB/200MB · 剩余 50 秒 · 50/100',
+    );
+  });
+
+  test('下载进度行：缺失项自动跳过', () {
+    // mp4 直链：无分片
+    expect(
+      formatProgressLine(
+        speed: 512 * 1024,
+        bytesDone: 2 * 1024 * 1024,
+        bytesTotal: 8 * 1024 * 1024,
+        eta: const Duration(seconds: 12),
+      ),
+      '512KB/s · 2MB/8MB · 剩余 12 秒',
+    );
+    // 系统 HLS 缓存：只有比例和剩余时间 → 末尾补百分比
+    expect(
+      formatProgressLine(eta: const Duration(minutes: 2), progress: 0.42),
+      '剩余 2 分 · 42%',
+    );
+    // 总量未知：只给已下，不假造 x/y
+    expect(formatProgressLine(bytesDone: 3 * 1024 * 1024), '3MB');
+    // 外推总量标 ≈
+    expect(
+      formatProgressLine(
+          bytesDone: 1024 * 1024, bytesTotal: 4 * 1024 * 1024, bytesEstimated: true),
+      '1MB/≈4MB',
+    );
+    // 一个量化字段都没有 → 空串（调用方回落「准备中…」）
+    expect(formatProgressLine(), '');
+  });
+
   test('文件夹：默认未分组（folder 为空）', () {
     expect(_item('1', 'x', 1, base).folder, '');
   });

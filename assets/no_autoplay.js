@@ -2,6 +2,11 @@
 // 目标：页面自己开始的播放一律拦下 —— 打开网页不再自动出声、不再白跑流量；
 //       用户真正点播放器（点播放按钮 / 点视频本身）时照常播放。
 //
+// 本脚本同时承载「点播放即接管」（默认**关**，浏览器菜单可开）：
+// 用户点播放器时若拿到 http(s) 直链，就不让页面自己播，把链接交给 App 播放器
+// （复用 videoAction 通道的 action='play'）。拿不到直链（blob:/MSE、DRM、.mpd）
+// 一律放行给页面自己播 —— 必须保证「点了总有反应」，否则比不做还糟。
+//
 // 三层拦截，缺一层都会漏：
 //  ① 覆盖 HTMLMediaElement.prototype.play —— 站点 JS 主动 play()（含 setTimeout 延迟调用）
 //  ② 覆盖 autoplay 属性 setter —— 站点 new Video() 后设 autoplay = true
@@ -51,6 +56,18 @@
     window.__vdlNoAutoplayEnabled = defaultOn;
   }
 
+  // 「点播放即接管」开关：默认关。同样用 sessionStorage 兜底 ——
+  // atDocumentStart 阶段 Dart 还没注入，新页面第一次播放只能靠这里记住的值。
+  var hijackDefault = false;
+  try {
+    if (window.sessionStorage && window.sessionStorage.getItem('__vdlHijack') === '1') {
+      hijackDefault = true;
+    }
+  } catch (e) {}
+  if (typeof window.__vdlHijackEnabled !== 'boolean') {
+    window.__vdlHijackEnabled = hijackDefault;
+  }
+
   function enabled() {
     return window.__vdlNoAutoplayEnabled !== false;
   }
@@ -76,12 +93,18 @@
     return false;
   }
 
-  function allowed(el) {
-    if (!enabled()) return true;
+  // 用户意图判定（不含开关）：这是「这次播放是不是人点的」的唯一判据来源。
+  // 自动播放拦截与「点播放即接管」共用同一份，避免两处判据慢慢跑偏。
+  function userIntent(el) {
     if (activationActive()) return true;
     if (recentlyTapped(el)) return true;
     if (lastGestureTs && Date.now() - lastGestureTs <= GESTURE_ALLOW_MS) return true;
     return false;
+  }
+
+  function allowed(el) {
+    if (!enabled()) return true;
+    return userIntent(el);
   }
 
   // 坐标命中：点击落在哪个 video/audio 上（含压在 video 上的控件层与外扩区域）
@@ -174,13 +197,134 @@
     } catch (e) {}
   }
 
+  // ── 点播放即接管（默认关）─────────────────────────────────────────────
+  // 判据顺序不能反：先确认「是用户点的」，再看「有没有能交给 App 的直链」。
+  // 只要有一条不满足就返回 false → 走原来的放行/拦截逻辑，保证点了总有反应。
+  var HIJACK_MIN_W = 240;
+  var HIJACK_MIN_H = 135;
+  var HIJACK_RE =
+    /\.(mp4|m3u8|mov|webm|mkv|flv|f4v|m4v|ts|m2ts|mts|mpg|mpeg|avi|wmv|asf|3gp|3g2|ogv|ogm|rm|rmvb)([?#]|$)/i;
+  // 不是播放源本身：字幕 / 分片 / DASH 清单（App 侧播不了 .mpd）/ 密钥
+  var HIJACK_SKIP_RE = /\.(m4s|vtt|srt|ttml|dfxp|webvtt|mpd|key)([?#]|$)/i;
+  var HIJACK_REPOST_MS = 1500;
+
+  function hijackEnabled() {
+    return window.__vdlHijackEnabled === true;
+  }
+
+  // 相对地址补全：<source src="/a/b.m3u8"> 这种在 iframe 里很常见
+  function absUrl(s) {
+    s = String(s || '');
+    if (!s) return '';
+    if (s.indexOf('//') === 0) return location.protocol + s;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(s)) return s;
+    try {
+      return new URL(s, location.href).href;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function mediaSrc(el) {
+    var s = '';
+    try {
+      s = el.currentSrc || el.getAttribute('src') || el.src || '';
+    } catch (e) {}
+    if (!s && el.querySelectorAll) {
+      // video 自身没 src 时，源挂在 <source> 子元素上
+      var ss = el.querySelectorAll('source');
+      for (var i = 0; i < ss.length; i++) {
+        var u = ss[i].getAttribute && ss[i].getAttribute('src');
+        if (u) {
+          s = u;
+          break;
+        }
+      }
+    }
+    return absUrl(s);
+  }
+
+  function docTitle() {
+    try {
+      var og = document.querySelector('meta[property="og:title"]');
+      return String((og && og.content) || document.title || '').slice(0, 100);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function postHijack(el, src) {
+    el.__vdlHijacked = true;
+    el.__vdlHijackAt = Date.now();
+    el.__vdlHijackSrc = src;
+    try {
+      if (!el.paused && typeof el.pause === 'function') el.pause();
+    } catch (e) {}
+    try {
+      var payload = JSON.stringify({
+        action: 'play',
+        url: src,
+        title: docTitle(),
+        // 跨域 iframe 里的播放器必须用 iframe 自己的地址做 Referer，用主框架地址会 403
+        referer: String(location.href || ''),
+      });
+      var w = window.webkit;
+      if (w && w.messageHandlers && w.messageHandlers[CHANNEL]) {
+        w.messageHandlers[CHANNEL].postMessage(payload); // iOS WKWebView（含 iframe）
+      } else if (window[CHANNEL] && window[CHANNEL].postMessage) {
+        window[CHANNEL].postMessage(payload); // Android / 调试页
+      }
+    } catch (e) {}
+  }
+
+  // 返回 true = 已接管，调用方必须吞掉这次 play，不能让页面真的播起来（否则双声源）
+  function tryHijack(el) {
+    if (!hijackEnabled()) return false;
+    if (!isMedia(el) || el.tagName !== 'VIDEO') return false;
+    if (!userIntent(el)) return false; // 广告自动播 / 悬停预览 → 不接管
+    var src = mediaSrc(el);
+    // 已接管过且还是同一个源：重复点播放不重复上报，但继续吞掉
+    if (
+      el.__vdlHijacked &&
+      el.__vdlHijackSrc === src &&
+      Date.now() - (el.__vdlHijackAt || 0) < HIJACK_REPOST_MS
+    ) {
+      return true;
+    }
+    if (!/^https?:/i.test(src)) return false; // blob: / 空 → 交给页面自己播
+    if (HIJACK_SKIP_RE.test(src)) return false;
+    if (!HIJACK_RE.test(src)) return false; // 认不出来的（签名 URL 等）放行
+    var r = null;
+    try {
+      r = el.getBoundingClientRect();
+    } catch (e) {}
+    if (r && (r.width < HIJACK_MIN_W || r.height < HIJACK_MIN_H)) return false; // 小窗广告/预览
+    postHijack(el, src);
+    return true;
+  }
+
   // ① 站点 JS 调用 play()
-  proto.play = function () {
+  function hookedPlay() {
+    // 接管优先于自动播放判定：用户点了且有直链 → 页面不播，交给 App 播放器
+    if (tryHijack(this)) {
+      // 给站点 resolve 而不是 reject：拿到拒绝它可能弹「播放失败」或反复重试
+      if (typeof Promise === 'undefined') return undefined;
+      return Promise.resolve();
+    }
     if (allowed(this)) return origPlay.apply(this, arguments);
     block(this);
     if (typeof Promise === 'undefined') return undefined;
     return Promise.reject(notAllowedError());
-  };
+  }
+  proto.play = hookedPlay;
+
+  // 两个开关都关掉时原型会被还原成原生 play，之后若只把「接管」打开，
+  // 必须把钩子重新装回去，否则接管静默失效。
+  function installPlayHook() {
+    try {
+      if (proto.play !== hookedPlay) proto.play = hookedPlay;
+    } catch (e) {}
+  }
 
   // ② 站点设置 autoplay 属性（无手势时吞掉，同时记住站点意图，避免再被 fixMedia 放回来）
   if (autoplayDesc && autoplayDesc.set) {
@@ -341,6 +485,22 @@
       // 重新开启时需要把被还原的原型方法再装回去 → 最省事的做法是让 Dart 侧重新注入本脚本
       return;
     }
-    window.__vdlNoAutoplayRestore();
+    // 不能无条件还原原型：接管还开着的话，还原会把它的钩子一并摘掉。
+    // 两个开关都关着才真正还原成原生 play。
+    if (!hijackEnabled()) window.__vdlNoAutoplayRestore();
+  };
+
+  window.__vdlNoAutoplaySetHijack = function (on) {
+    window.__vdlHijackEnabled = !!on;
+    try {
+      if (window.sessionStorage) {
+        window.sessionStorage.setItem('__vdlHijack', on ? '1' : '0');
+      }
+    } catch (e) {}
+    if (on) {
+      installPlayHook(); // 可能之前已被还原成原生
+      return;
+    }
+    if (!enabled()) window.__vdlNoAutoplayRestore();
   };
 })();

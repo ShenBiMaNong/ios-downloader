@@ -5,6 +5,37 @@
 // 标记不限于主框架：同源 iframe 内的播放器也会被注入标记（跨域 iframe 受浏览器限制）
 // 操作经 videoAction 通道回传 Dart（下载 / 缓存m3u8 / 转MP4 / 复制 / 忽略）
 (function () {
+  // ── 诊断元数据（不参与展示逻辑）──────────────────────────────────────
+  // 「角标有时出不有时不出」必须能分清是脚本没装、开关关了、视频没被收集到、
+  // 还是角标建了但被隐藏/被遮挡。__vdlMarkerDiag() 把这些状态一次性摊开。
+  var MVERSION = 'marker-2.4';
+  var MBOOT = Date.now();
+  window.__vdlMarkerVersion = MVERSION;
+  window.__vdlMarkerLastInjectAt = MBOOT;
+  window.__vdlMarkerInjectCount = (window.__vdlMarkerInjectCount || 0) + 1;
+  if (!window.__vdlMarkerInstalledAt) window.__vdlMarkerInstalledAt = MBOOT;
+  // 安装时来源（early=WKUserScript / dart=窗口补注入），与「最近一次补注入」分开记：
+  // 同一文档里 Dart 侧的兜底注入会改写 __vdlMarkVia，混在一起就看不出谁先装上的。
+  window.__vdlMarkerLastVia = window.__vdlMarkVia || '';
+  if (!window.__vdlMarkerInstalledVia && window.__vdlMarkVia) {
+    window.__vdlMarkerInstalledVia = window.__vdlMarkVia;
+  }
+
+  var M_EVENTS = [];
+  var M_MAX_EVENTS = 100;
+  function mev(type, extra, url) {
+    try {
+      var e = { t: Date.now(), ev: type };
+      if (extra) e.x = String(extra);
+      if (url) e.u = String(url).slice(0, 140);
+      M_EVENTS.push(e);
+      if (M_EVENTS.length > M_MAX_EVENTS) M_EVENTS.splice(0, M_EVENTS.length - M_MAX_EVENTS);
+    } catch (e2) {}
+  }
+  function mEpoch() {
+    return (window.__vdlViewEpoch === undefined ? null : window.__vdlViewEpoch);
+  }
+
   function propagate(src) {
     // src == null → 通知子框架清理（开关关闭）；否则把标记脚本扩散到同源 iframe
     try {
@@ -29,8 +60,32 @@
   }
 
   if (window.__vdlMarkerInstalled) return;
+  // 开关：iOS 全帧 user script 里由 Dart 在脚本前写入 window.__vdlMarkEnabled。
+  // 关掉时连 iframe 帧也不启动（否则关掉开关后跨域播放器帧里还会冒角标）。
+  // 关闭态也要留一个「能解释自己」的最小快照 —— 否则面板只能看到 marker=null，
+  // 分不清「开关关了」和「脚本根本没注入」。
+  if (window.__vdlMarkEnabled === false) {
+    window.__vdlMarkerDiag = function () {
+      return {
+        v: MVERSION, installed: false, enabled: false,
+        href: location.href, top: window === window.top,
+        bootAt: MBOOT, lastInjectAt: window.__vdlMarkerLastInjectAt || 0,
+        injects: window.__vdlMarkerInjectCount || 1,
+        via: window.__vdlMarkVia || '', epoch: mEpoch(),
+        readyState: (document && document.readyState) || '',
+        videos: -1, marked: 0, shown: 0, hidden: 0, covered: 0,
+        items: [], events: M_EVENTS.slice(-20)
+      };
+    };
+    return;
+  }
+  // 这里**不能**再因为 `!document.documentElement` 就 return：iOS 的 WKUserScript 是
+  // atDocumentStart + 全帧注入，那个时刻 <html>/<head> 常常还没创建，而 user script 对每个
+  // 文档只执行一次 —— return 掉就等于这个文档（以及每个跨域 iframe 播放器帧）永远没有角标。
+  // 这正是「视频已经播起来了、角标一个都不出」的根因。样式表改为轮询补挂（见 mountStyle）。
   window.__vdlMarkerInstalled = true;
   window.__vdlMarkerPropagate = propagate;
+  mev('boot', (document && document.readyState) || '');
 
   var EXT_RE = /\.(mp4|m3u8|mov|webm|mkv|flv|f4v|m4v|ts|m2ts|mts|mpg|mpeg|avi|wmv|asf|3gp|3g2|ogv|ogm|rm|rmvb|mpd)([?#]|$)/i;
   var MIME_RE = /^video\/|x-mpegurl|vnd\.apple\.mpegurl|dash\+xml|mp2t/i;
@@ -46,7 +101,7 @@
   style.id = 'vdl-style';
   style.textContent =
     '.vdl-video{outline:2px dashed rgba(59,130,246,.75)!important;outline-offset:3px;}' +
-    '.vdl-badge{position:fixed;z-index:2147483000;background:rgba(15,23,42,.94);color:#fff;' +
+    '.vdl-badge{position:fixed;z-index:2147483647;background:rgba(15,23,42,.94);color:#fff;' +
     'font:12px/1 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;' +
     'padding:5px 9px;border-radius:13px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.4);' +
     'display:flex;align-items:center;gap:5px;user-select:none;-webkit-user-select:none;' +
@@ -65,7 +120,10 @@
     '.vdl-dash .vdl-ic{background:#0e7490;}' +
     '.vdl-mse .vdl-ic{background:#64748b;}' +
     '.vdl-tx{max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
-    '.vdl-card{position:fixed;z-index:2147483001;width:252px;max-height:360px;overflow:auto;' +
+    '.vdl-card{position:fixed;z-index:2147483647;width:252px;max-height:360px;overflow:auto;' +
+    // overscroll-behavior:contain：卡片内滚到底后不要「链式」带动页面上滚，
+    // 页面一滚 dismiss 逻辑就会把卡片关掉（旧版 iOS 不支持时另有 touch 手势兜底）
+    'overscroll-behavior:contain;-webkit-overflow-scrolling:touch;' +
     'background:#fff;color:#0f172a;border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.35);' +
     'font:13px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;}' +
     '.vdl-card-h{padding:10px 12px;background:#f8fafc;border-bottom:1px solid #e2e8f0;}' +
@@ -76,8 +134,44 @@
     '.vdl-btn{display:block;width:100%;text-align:left;padding:11px 12px;border:0;' +
     'border-top:1px solid #f1f5f9;background:#fff;color:#0f172a;font-size:13px;cursor:pointer;}' +
     '.vdl-btn:hover{background:#eff6ff;}' +
-    '.vdl-btn.hl{color:#1d4ed8;font-weight:600;}';
-  (document.head || document.documentElement).appendChild(style);
+    '.vdl-btn.hl{color:#1d4ed8;font-weight:600;}' +
+    // 多线路候选列表：站点把多条 m3u8 一起下发时，让用户能自己挑一条能用的
+    '.vdl-lines{max-height:132px;overflow:auto;overscroll-behavior:contain;' +
+    '-webkit-overflow-scrolling:touch;background:#f8fafc;border-top:1px solid #e2e8f0;}' +
+    '.vdl-lines-h{padding:6px 12px 4px;color:#64748b;font-size:11px;}' +
+    '.vdl-line{display:flex;align-items:center;gap:6px;width:100%;text-align:left;' +
+    'padding:6px 12px;border:0;border-top:1px solid #eef2f7;background:transparent;' +
+    'color:#0f172a;font-size:12px;cursor:pointer;}' +
+    '.vdl-line:hover{background:#eff6ff;}' +
+    '.vdl-line.on{background:#eff6ff;font-weight:600;}' +
+    '.vdl-line.dead{color:#94a3b8;}' +
+    '.vdl-lm{flex:none;font-weight:700;width:10px;}' +
+    '.vdl-line.on .vdl-lm{color:#16a34a;}' +
+    '.vdl-line.dead .vdl-lm{color:#dc2626;}' +
+    '.vdl-warn{color:#b45309;background:#fffbeb;border-radius:6px;padding:6px 8px;margin-top:6px;}' +
+    '.vdl-lu{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}';
+  // 样式表挂载：atDocumentStart 时 head 甚至 documentElement 都可能还没创建。
+  // 轮询补挂（10ms × 600 ≈ 6s）；挂不上期间角标仍然会创建（只是没样式），
+  // 绝不能因为挂不上就 return —— 那会让整个文档没有角标。
+  var styleTries = 0;
+  function mountStyle() {
+    if (style.parentNode) return;
+    var host = document.head || document.documentElement;
+    if (host) {
+      try { host.appendChild(style); } catch (e) {}
+    }
+    if (style.parentNode) return;
+    if (++styleTries > 600) return;
+    setTimeout(mountStyle, 10);
+  }
+  mountStyle();
+
+  // 角标/卡片的挂载点。用 documentElement 而不是 body：站点常给 body（或 #app 外壳）
+  // 加 transform/filter（页面切换动画），那会让 position:fixed 相对它定位而跑到屏幕外；
+  // 同时作为 html 的最后一个子节点，z-index 打平时也能压在站点浮层上（广告遮罩常用 2147483647）
+  function hostOf() {
+    return document.documentElement || document.body;
+  }
 
   function postAction(payload) {
     try {
@@ -134,6 +228,11 @@
 
   // video 的 src：元素自身 → <source> 子元素（URL 或 type MIME 命中视频）
   function srcOf(video) {
+    // 自绘播放器常见写法：video.srcObject = mediaSource（MSE 直挂对象）。
+    // 这时 src / currentSrc 全是空串 —— 不认这一条就会被当成「没有地址」，
+    // 旧版直接 continue 跳过，于是「视频明明在播、角标一个不出」。
+    // 返回一个固定的伪 blob:，让下游走 MSE（靠嗅探池找 m3u8）这条路。
+    if (video.srcObject) return 'blob:srcobject';
     var s = video.currentSrc ||
       (video.getAttribute && video.getAttribute('src')) || video.src || '';
     if (s) return s;
@@ -147,40 +246,88 @@
     return '';
   }
 
-  // blob:/MSE 无直链时，从嗅探器（sniffer.js 的 window.__vdlSniff）最近捕获的 URL 兜底
+  // blob:/MSE 没有直链时，向嗅探器要「当前最可信」的候选（而不是「最近一条」）：
+  // 站点逐个试探多条 m3u8 时，最近一条往往是失败的那条。
+  // 返回整个对象（含 state/soon/why），卡片需要区分「未验证」「已过期」「确认失效」。
   function capturedFor(video) {
     try {
       var s = window.__vdlSniff;
-      if (!s || !s.getLatest) return '';
-      if (kindOf(srcOf(video)) !== 'mse') return '';
-      var u = s.getLatest('hls');
-      if (u) return u;
-      u = s.getLatest('file');
-      return u;
+      if (!s || !s.best) return null;
+      // 元素地址缺失 / blob: / 非扩展名形式 → 三种情况都只能靠嗅探池；
+      // 之前只放过 blob:，于是「懒赋 src 的播放器」在赋 src 之前一个角标都不出
+      var k = kindOf(srcOf(video));
+      if (k !== 'mse' && k !== 'other') return null;
+      var b = s.best('hls') || s.best('dash') || s.best('file');
+      if (b && b.url) return b;
+      var u = s.getLatest ? (s.getLatest('hls') || s.getLatest('file')) : '';
+      return u ? { url: u, kind: kindOf(u), state: s.stateOf ? s.stateOf(u) : '' } : null;
+    } catch (e) { return null; }
+  }
+
+  function linesOf(kind) {
+    try {
+      var s = window.__vdlSniff;
+      if (!s || !s.list) return [];
+      return s.list(kind) || [];
+    } catch (e) { return []; }
+  }
+
+  function stateOfUrl(u) {
+    try {
+      var s = window.__vdlSniff;
+      if (!s || !s.stateOf) return '';
+      return s.stateOf(u) || '';
     } catch (e) { return ''; }
   }
 
   function infoOf(video) {
     var src = srcOf(video);
-    var kind = kindOf(src);
-    var captured = '';
-    if (kind === 'mse') {
-      captured = capturedFor(video);
-      if (captured) { src = captured; kind = kindOf(captured); }
+    var kind = src ? kindOf(src) : '';
+    var cap = null;
+    // 用户手动选了线路（多条候选里挑一条）→ 以他选的为准
+    var manual = video.__vdlLine || '';
+    if (manual) {
+      src = manual;
+      kind = kindOf(manual);
+      cap = { url: manual, kind: kind, state: stateOfUrl(manual) };
+    } else if (!src || kind === 'mse' || kind === 'other') {
+      // 元素拿不到地址（blob: / 懒赋 src / 不是扩展名形式）：地址只能来自嗅探器
+      // （元素句柄 / 容器 data-url / 网络证据 / 分片目录）
+      cap = capturedFor(video);
+      if (cap) { src = cap.url; kind = kindOf(cap.url); }
+    } else if (kind === 'hls' || kind === 'dash') {
+      // 元素直链一般是浏览器正在播的（原生 HLS），最可信；
+      // 但若它在候选表里被判死、而另有明确可用的候选，则改用可用的那条
+      if (stateOfUrl(src) === 'dead') {
+        var b = (window.__vdlSniff && window.__vdlSniff.best) ? window.__vdlSniff.best(kind) : null;
+        if (b && b.url && b.state === 'ok') { src = b.url; kind = kindOf(b.url); cap = b; }
+      }
     }
+    // 既没有元素地址、嗅探也没捞到东西 → 中性「视频」角标（入口先有，等地址到了再升级）
+    if (!src) kind = 'none';
     var t = (video.getAttribute && (video.getAttribute('title') || video.getAttribute('aria-label'))) || '';
+    var lines = (kind === 'hls' || kind === 'dash' || kind === 'file') ? linesOf(kind) : [];
     return {
       url: src,
       kind: kind,
       res: resOf(video),
       dur: fmtDur(video.duration),
-      title: String(t || pageTitle()).slice(0, 80)
+      title: String(t || pageTitle()).slice(0, 80),
+      state: stateOfUrl(src),
+      // 签名 URL 的时效：expired 表示本地已判定过期（服务端仍可能放行，但基本 403）
+      why: (cap && cap.why) || '',
+      soon: !!(cap && cap.soon),
+      expired: !!(cap && cap.why === 'expired'),
+      lines: lines
     };
   }
 
   function labelOf(info) {
-    if (info.kind === 'hls') return info.dur ? 'HLS · ' + info.dur : 'HLS';
-    if (info.kind === 'dash') return 'DASH';
+    // ✓ = 已确认可用（2xx + 内容校验 或 正在播放）；? = 未验证；✗ = 已确认失效
+    var mk = info.state === 'ok' ? ' ✓' : (info.state === 'dead' ? ' ✗' : ' ?');
+    if (info.kind === 'none') return '视频'; // 还没拿到地址：入口先立着，别让用户以为「没识别到」
+    if (info.kind === 'hls') return 'HLS' + mk + (info.dur ? ' · ' + info.dur : '');
+    if (info.kind === 'dash') return 'DASH' + mk;
     if (info.kind === 'mse') return '流';
     var f = fmtOf(info.url);
     if (info.res) return (f ? f + ' ' : '') + info.res;
@@ -215,27 +362,142 @@
       }
       toggleCard(video, b);
     });
-    document.body.appendChild(b);
+    // 挂到 documentElement（见 hostOf）：body 上有 transform 时，body 里的 fixed 元素
+    // 会跟着 body 一起偏出屏幕；挂 html 上不受影响
+    (hostOf() || document.body).appendChild(b);
     return b;
+  }
+
+  // 「主播放器」判据：没拿到地址的 <video> 只有够大才值得立角标（避免给广告位/小窗
+  // 预览视频都挂一个）；阈值与接管的小窗判据一致（240×135）
+  function isMainPlayer(video) {
+    var r = null;
+    try { r = video.getBoundingClientRect(); } catch (e) { return false; }
+    return !!(r && r.width >= 240 && r.height >= 135);
   }
 
   // 已标记视频登记表。必需：video 从 DOM 移除后 querySelectorAll 就查不到它了，
   // 只遍历现存 <video> 会漏掉这类元素 —— 预览视频关掉后角标会永久留在页面上，
   // 而且再没有任何代码更新它的坐标（表现为「视频没了角标还在、位置卡死不动」）。
   var marked = [];
+  // 诊断用：update() 跑了多少次、最后一次是什么时候。秒级轮询停了（页面冻结、
+  // 定时器被站点清掉）也能从这两个数看出来。
+  var ticks = 0;
+  var lastUpdateAt = 0;
+
+  // ── 视频元素收集：document + shadow root + 同源 iframe ─────────────────
+  // 1) 自绘播放器把 <video> 塞进 shadow root，`document.querySelectorAll('video')` 一个都
+  //    看不到 —— 现象就是「页面上视频在播、旁边没有角标」，而页面里随便一个广告 <video>
+  //    反而有角标。atDocumentStart 就钩住 attachShadow，之后创建的 shadow root 全部登记
+  //    （closed 模式拿不到，无法处理；主流播放器是 open）。
+  // 2) 同源 iframe 里的播放器直接遍历；跨域帧由全帧注入的 marker 在自己的帧里处理。
+  var shadowRoots = [];
+  try {
+    var EP = window.Element && window.Element.prototype;
+    if (EP && EP.attachShadow && !EP.__vdlAttachShadowHooked) {
+      var origAttachShadow = EP.attachShadow;
+      EP.attachShadow = function () {
+        var sr = origAttachShadow.apply(this, arguments);
+        try {
+          if (sr && sr.nodeType === 11 && shadowRoots.indexOf(sr) < 0) {
+            shadowRoots.push(sr);
+            mev('shadow+', '');
+            // 播放器刚挂上 → 立刻重扫（0ms 抓住首帧，300ms 兜住后续插入）
+            setTimeout(update, 0);
+            setTimeout(update, 300);
+          }
+        } catch (e) {}
+        return sr;
+      };
+      EP.__vdlAttachShadowHooked = true;
+    }
+  } catch (e) {}
+
+  // hook 装得比播放器晚时（注入时机不确定）已经创建好的 shadow root 只能靠扫。
+  // 5s 一次、只读属性，成本可忽略。
+  var lastShadowSweep = 0;
+  function sweepShadowRoots() {
+    var now = Date.now ? Date.now() : new Date().getTime();
+    if (now - lastShadowSweep < 5000) return;
+    lastShadowSweep = now;
+    var els;
+    try { els = document.querySelectorAll('*'); } catch (e) { return; }
+    for (var i = 0; i < els.length; i++) {
+      var sr = null;
+      try { sr = els[i].shadowRoot; } catch (e) {}
+      if (sr && sr.nodeType === 11 && shadowRoots.indexOf(sr) < 0) shadowRoots.push(sr);
+    }
+  }
+
+  function collectVideos() {
+    var out = [];
+    function take(root) {
+      if (!root || !root.querySelectorAll) return;
+      var vs;
+      try { vs = root.querySelectorAll('video'); } catch (e) { return; }
+      for (var i = 0; i < vs.length; i++) if (out.indexOf(vs[i]) < 0) out.push(vs[i]);
+    }
+    take(document);
+    for (var i = 0; i < shadowRoots.length; i++) take(shadowRoots[i]);
+    var fs;
+    try { fs = document.querySelectorAll('iframe'); } catch (e) { fs = []; }
+    for (var j = 0; j < fs.length; j++) {
+      try { take(fs[j].contentDocument); } catch (e) {}
+    }
+    return out;
+  }
+
+  // 元素在本帧视口里的矩形。视频在同源 iframe 里时，getBoundingClientRect 给的是
+  // 该 iframe 自己的坐标系，必须逐级加上各层 frameElement 的偏移，否则角标会画在
+  // 左上角/错位（用户看到的就是「角标位置莫名其妙」）。跨域帧拿不到 frameElement，
+  // 返回 null —— 那个帧里的视频由它自己的 marker 画。
+  function rectOf(video) {
+    var r;
+    try { r = video.getBoundingClientRect(); } catch (e) { return null; }
+    var out = {
+      left: r.left, top: r.top, width: r.width, height: r.height,
+      right: r.right, bottom: r.bottom
+    };
+    var w = null;
+    try { w = video.ownerDocument && video.ownerDocument.defaultView; } catch (e) {}
+    var guard = 0;
+    while (w && w !== window && guard++ < 8) {
+      var fe = null;
+      try { fe = w.frameElement; } catch (e) {}
+      if (!fe) return null;
+      var fr;
+      try { fr = fe.getBoundingClientRect(); } catch (e) { return null; }
+      out.left += fr.left; out.top += fr.top;
+      out.right += fr.left; out.bottom += fr.top;
+      w = (fe.ownerDocument && fe.ownerDocument.defaultView) || null;
+    }
+    return out;
+  }
 
   function place(badge, video) {
-    var r = video.getBoundingClientRect();
+    var r = rectOf(video);
     // 尺寸为 0 / 移出视口 / 被祖先 display:none 藏起来 → 不显示角标
-    if (
-      r.width < 10 || r.height < 10 ||
+    var hidden = '';
+    if (!r) hidden = 'rect-null';
+    else if (r.width < 10 || r.height < 10) hidden = 'zero-size';
+    else if (
       r.bottom <= 0 || r.top >= window.innerHeight ||
       r.right <= 0 || r.left >= window.innerWidth
-    ) {
+    ) hidden = 'offscreen';
+    if (hidden) {
       badge.style.display = 'none';
+      // 只在「隐藏原因变了」时记一条：scroll 时每帧都会调 place，不能刷屏
+      if (badge.__vdlHidden !== hidden) {
+        badge.__vdlHidden = hidden;
+        mev('hide', hidden);
+      }
       return;
     }
     badge.style.display = '';
+    if (badge.__vdlHidden) {
+      badge.__vdlHidden = '';
+      mev('show', '');
+    }
     var bw = badge.offsetWidth || 64;
     var left = r.left + r.width - bw - 6;
     if (left < 4) left = 4;
@@ -247,7 +509,13 @@
 
   var currentCard = null;
   var currentCardAnchor = null;
+  // 卡片对应的视频 + 打开时是否已经有地址：没有地址的卡片（占位态）在嗅探拿到地址后
+  // 要自动重绘一次，否则用户会一直看着「尚未捕获」的空卡片
+  var currentCardVideo = null;
+  var currentCardHasUrl = false;
   var cardDismissBound = false;
+  // 手势是否「起手在卡片内」：卡片内滑动被带动页面时不应该关掉卡片
+  var cardGesture = 0;
 
   // 点卡片外部 / 页面滚动 → 关闭操作卡（否则弹层只能靠再次点角标或选中某项关掉）
   function onDocClick(e) {
@@ -259,8 +527,16 @@
     closeCard();
   }
 
-  function onScrollClose() {
-    if (currentCard) closeCard();
+  function onScrollClose(e) {
+    if (!currentCard) return;
+    // 滚动事件在 window 上以捕获方式监听，卡片自身、卡片里的候选列表滚动同样会经过这里。
+    // 这两种都不是「页面在滚」，一律放过 —— 否则用户想翻候选列表，一滑就把卡片关掉了。
+    var t = e && (e.target || e.srcElement);
+    if (t && t.nodeType === 1 && (t === currentCard || currentCard.contains(t))) return;
+    // 旧版 iOS 不支持 overscroll-behavior：卡片内起手的滑动仍可能链式带动页面，
+    // 手势期间（touchend 后短暂保留）不算离开
+    if (cardGesture) return;
+    closeCard();
   }
 
   function closeCard() {
@@ -269,6 +545,9 @@
     }
     currentCard = null;
     currentCardAnchor = null;
+    currentCardVideo = null;
+    currentCardHasUrl = false;
+    cardGesture = 0;
     if (cardDismissBound) {
       cardDismissBound = false;
       document.removeEventListener('click', onDocClick, true);
@@ -341,6 +620,89 @@
     }
   }
 
+  // 候选 URL 的短显示：host / 末段文件名
+  function shortUrl(u) {
+    try {
+      var m = String(u).match(/^https?:\/\/([^\/?#]+)([^?#]*)/i);
+      if (!m) return String(u).slice(0, 46);
+      var seg = String(m[2] || '').split('/').filter(Boolean);
+      var tail = seg.length ? seg[seg.length - 1] : '';
+      var text = m[1] + (tail ? ' / ' + tail : '');
+      return text.length > 46 ? text.slice(0, 45) + '…' : text;
+    } catch (e) { return String(u).slice(0, 46); }
+  }
+
+  // ── 候选可用性：打开卡片时对「页面从没请求过」的线路补一次实测 ──────────
+  // 候选表里的 guess 是「脚本/属性里抄出来的地址」，页面自己一次都没请求过，
+  // 所以永远停在「?」—— 用户只能点下去才知道是 404。这里让嗅探器现场探一次。
+  function markLine(card, url, state, code) {
+    var btns = card.querySelectorAll('.vdl-line');
+    for (var i = 0; i < btns.length; i++) {
+      var b = btns[i];
+      if (b.getAttribute('data-line') !== url) continue;
+      var m = b.querySelector('.vdl-lm');
+      if (m) m.textContent = state === 'ok' ? '✓' : (state === 'dead' ? '✗' : '?');
+      // className 不整体重写：'.on' 是当前选中项，重建会丢
+      if (state === 'dead') b.classList.add('dead');
+      else b.classList.remove('dead');
+      if (code) {
+        b.title = 'HTTP ' + code;
+        var tail = b.querySelector('.vdl-lu');
+        if (tail && state === 'dead' && tail.textContent.indexOf(String(code)) < 0) {
+          tail.textContent = tail.textContent + ' · ' + code;
+        }
+      }
+      return;
+    }
+  }
+
+  function verifyCardLines(card, video, badge, info) {
+    try {
+      var s = window.__vdlSniff;
+      if (!s || !s.verify || info.kind === 'mse' || info.kind === 'none') return;
+      var need = [];
+      function push(u) {
+        if (!u || need.indexOf(u) >= 0) return;
+        need.push(u);
+      }
+      // 当前这条也要进去：它同样可能只是「脚本里抄来的」，页面一次都没请求过
+      if (info.state !== 'ok' && info.state !== 'dead') push(info.url);
+      for (var i = 0; i < (info.lines || []).length; i++) {
+        var it = info.lines[i];
+        if (it.state === 'ok' || it.state === 'dead') continue; // 已有实测结论，不必再探
+        push(it.url);
+      }
+      if (!need.length) return;
+      var head = card.querySelector('.vdl-lines-h');
+      var multi = !!(info.lines && info.lines.length > 1);
+      var headText = multi ? '共 ' + info.lines.length + ' 条候选 · ' : '';
+      if (head) head.textContent = headText + '校验中…';
+      s.verify(need, function (res) {
+        var alive = !!(card.parentNode && currentCard === card);
+        if (!res) {
+          // 整批探完（嗅探器的「收工」信号）：表头恢复，角标同步刷一次
+          if (alive) {
+            if (head) head.textContent = headText + '点选切换';
+            refreshBadge(badge, video);
+          }
+          return;
+        }
+        if (!alive) return;
+        markLine(card, res.url, res.state, res.code);
+        refreshBadge(badge, video); // 角标上的 ? 同步翻成 ✓ / ✗
+        // 当前这条被判死、而别处有实测可用的 → 自动切过去。
+        // 这是「嗅探到的恰好是打不开那条」的兜底：用户不必自己一条条试。
+        if (res.state === 'dead' && res.url === info.url) {
+          var b = s.best ? s.best(info.kind) : null;
+          if (b && b.url && b.url !== info.url && b.state === 'ok') {
+            video.__vdlLine = b.url;
+            toggleCard(video, badge);
+          }
+        }
+      });
+    } catch (e) {}
+  }
+
   function toggleCard(video, badge) {
     closeCard();
     var info = infoOf(video);
@@ -358,47 +720,109 @@
       '<div class="vdl-card-m">' + esc(meta) + '</div>';
     if (info.kind === 'mse') {
       html += '<div class="vdl-card-n">分段/加密流（blob:），未捕获到可下载直链，暂不支持离线下载。</div>';
+    } else if (info.kind === 'none') {
+      // 占位态：视频元素在、地址还没有（站点点播放才赋 src）。不说「没识别到」——
+      // 嗅探器一到地址这张卡会自己重绘成可下载状态
+      html += '<div class="vdl-card-n">尚未捕获可下载地址 · 点一下页面播放，1–2 秒后这里会自动出现下载项</div>';
     } else {
       html += '<div class="vdl-card-u">' + esc(info.url) + '</div>';
     }
+    // 签名 URL 有时效（本例 auth_key 就是半小时级的）：过期后再下必然 403，
+    // 与其让用户下到一半失败，不如提前说清「刷新页面重新嗅探」这条唯一出路
+    if (info.expired) {
+      html += '<div class="vdl-card-n vdl-warn">链接签名已过期 · 刷新页面并重新点一次播放，嗅探会拿到新地址</div>';
+    } else if (info.soon) {
+      html += '<div class="vdl-card-n vdl-warn">链接即将过期 · 请尽快开始下载</div>';
+    }
     html += '</div>';
+    // 多候选（多线路）时列出全部，标明可用/失效，允许手动切换：
+    // 这一栏就是为了解决「嗅探到的恰好是打不开的那条」
+    if (info.lines && info.lines.length > 1) {
+      html += '<div class="vdl-lines"><div class="vdl-lines-h">共 ' +
+        info.lines.length + ' 条候选 · 点选切换</div>';
+      for (var li = 0; li < info.lines.length; li++) {
+        var it = info.lines[li];
+        var bad = it.state === 'dead' || it.expired;
+        var mk = bad ? '✗' : (it.state === 'ok' ? '✓' : (it.soon ? '!' : '?'));
+        var cls = 'vdl-line' +
+          (it.url === info.url ? ' on' : '') +
+          (bad ? ' dead' : '');
+        var tail = it.expired ? ' · 已过期' : (it.soon ? ' · 快过期' : '');
+        if (bad && it.code) tail = ' · ' + it.code;
+        html += '<button class="' + cls + '" data-line="' + esc(it.url) + '">' +
+          '<span class="vdl-lm">' + mk + '</span>' +
+          '<span class="vdl-lu">' + esc(shortUrl(it.url) + tail) + '</span></button>';
+      }
+      html += '</div>';
+    }
     if (info.kind === 'hls') {
-      // HLS：同时提供 m3u8 与 mp4 两种下载方式
-      html += '<button class="vdl-btn hl" data-a="hls">缓存 m3u8（离线播放）</button>';
-      html += '<button class="vdl-btn hl" data-a="convert">转 MP4</button>';
+      // HLS 三种产物，别混为一谈：
+      //  package → 自己下 .ts 分片包存 Downloads，可离线、可随时「本地转 MP4」
+      //  convert → 转成单个 mp4（中间分片用完即删）。iOS 上分片由原生 background
+      //            URLSession 代跑，锁屏 / 切 App 继续下载，齐备后回前台 -c copy
+      //            合成；非 iOS 没有系统级后台传输，这条就是前台下完直接出片。
+      //            入口对用户只有一个，不要再并列一个「后台下载」按钮。
+      //  hls     → 系统 AVAssetDownloadTask 的 .movpkg，只能 AVFoundation 播，不能导出
+      html += '<button class="vdl-btn hl" data-a="convert">直接转 MP4（锁屏继续下载）</button>';
+      html += '<button class="vdl-btn" data-a="package">下载 m3u8 分片（可转 MP4）</button>';
+      html += '<button class="vdl-btn" data-a="hls">系统离线缓存（仅播放，不可导出）</button>';
     } else if (info.kind === 'dash') {
       html += '<div class="vdl-card-n" style="padding:10px 12px;">DASH 流（.mpd）暂不支持离线下载，可复制清单链接自行处理。</div>';
-    } else if (info.kind === 'file') {
-      // 直链：立即播放（边播边缓存）+ 下载
+    } else if (info.kind === 'file' || info.kind === 'other') {
+      // 直链（含不带扩展名的播放地址，如 /play?id=1）：立即播放（边播边缓存）+ 下载
       html += '<button class="vdl-btn hl" data-a="play">立即播放（边播边缓存）</button>';
       html += '<button class="vdl-btn hl" data-a="mp4">下载视频</button>';
     }
-    // MSE 且未兜底到直链：无可下载操作
-    if (info.kind !== 'mse') {
+    // MSE 且未兜底到直链 / 还没地址：无可复制的东西
+    if (info.kind !== 'mse' && info.url) {
       html += '<button class="vdl-btn" data-a="copy">复制链接</button>';
     }
     html += '<button class="vdl-btn" data-a="ignore">忽略此条</button>';
     card.innerHTML = html;
     card.addEventListener('click', function (e) {
       var t = e.target;
+      // 先看是不是「切线路」——它没有 data-a，别落到下面的动作分支里
+      var lt = t;
+      while (lt && lt !== card && !(lt.getAttribute && lt.getAttribute('data-line'))) lt = lt.parentNode;
+      if (lt && lt !== card && lt.getAttribute) {
+        e.preventDefault();
+        e.stopPropagation();
+        video.__vdlLine = lt.getAttribute('data-line') || '';
+        toggleCard(video, badge); // 重绘卡片，让下面的动作按钮作用于新选的线路
+        return;
+      }
       while (t && t !== card && !(t.getAttribute && t.getAttribute('data-a'))) t = t.parentNode;
       var a = t && t.getAttribute ? t.getAttribute('data-a') : null;
       if (!a) return;
       e.preventDefault();
       e.stopPropagation();
-      postAction({ action: a, url: info.url, title: info.title });
+      postAction({
+        action: a,
+        url: info.url,
+        title: info.title,
+        // 当前帧地址：本例这种「页面在 A 域、清单在 B 域」的站点很常见，
+        // 跨域 iframe 播放器用主框架地址做 Referer 会被 CDN 判 403
+        referer: location.href,
+        // 页面视频的真实时长（秒）。这是「这条 m3u8 到底是不是页面上正在播的那个
+        // 视频」唯一可靠的外部标尺：候选池里多条清单都能 200、都是合法清单、
+        // 分数打平，靠请求时间决胜就会选到预加载的下一集 / 广告片。
+        // Dart 侧拉到清单后算 Σ#EXTINF 与它比对，对不上就不下、并说明原因。
+        duration: (video && video.duration && isFinite(video.duration))
+          ? Math.round(video.duration * 10) / 10 : 0
+      });
       closeCard();
       if (a === 'ignore') {
         unmark(video);
         video.classList.remove('vdl-video');
         video.__vdlIgnored = true;
+        mev('ignored', 'card');
       } else {
         badge.className = 'vdl-badge vdl-done';
         badge.querySelector('.vdl-tx').textContent = a === 'copy' ? '已复制' : '已加入';
         setTimeout(function () { refreshBadge(badge, video); }, 1800);
       }
     });
-    document.body.appendChild(card);
+    (hostOf() || document.body).appendChild(card);
     var br = badge.getBoundingClientRect();
     var cw = card.offsetWidth || 252;
     var ch = card.offsetHeight || 240;
@@ -411,36 +835,115 @@
     card.style.top = top + 'px';
     currentCard = card;
     currentCardAnchor = badge;
+    currentCardVideo = video;
+    currentCardHasUrl = !!info.url;
     bindDismiss();
+
+    // 卡片内起手的手势：内部没有可滚动的容器时直接吃掉（不带动页面滚），
+    // 有可滚动的（候选列表）交给浏览器滚，靠 overscroll-behavior 阻断链式滚动。
+    // 原生弹层的体感就是这样：在弹层上滑，弹层不动、底下的页面也不动。
+    card.addEventListener('touchstart', function () {
+      cardGesture = 1;
+    }, { passive: true });
+    card.addEventListener('touchend', function () {
+      setTimeout(function () { cardGesture = 0; }, 300);
+    }, { passive: true });
+    card.addEventListener('touchmove', function (e) {
+      var t = e.target;
+      while (t && t !== card.parentNode) {
+        if (t.nodeType === 1) {
+          var oy = '';
+          try { oy = getComputedStyle(t).overflowY; } catch (er) {}
+          if ((oy === 'auto' || oy === 'scroll') && t.scrollHeight > t.clientHeight + 1) return;
+        }
+        t = t.parentNode;
+      }
+      if (e.cancelable) e.preventDefault();
+    }, { passive: false });
+
+    // 打开即校验：把「? 未验证」的候选探成 ✓ / ✗（详见 verifyCardLines）
+    verifyCardLines(card, video, badge, info);
   }
 
   function update() {
     // 清理后（开关关闭）不再重建角标：click/play/观察器等残留监听可能仍会触发
     if (!window.__vdlMarkerInstalled) return;
-    if (!document.body) return;
-    // 先摘掉已从 DOM 移除的角标（它们不会出现在下面的 querySelectorAll 结果里）
+    ticks++;
+    lastUpdateAt = Date.now();
+    // iframe 导航中 / 文档卸载后 document 可能已经不可用（定时器还在跑）
+    if (typeof document === 'undefined' || !document || !document.body) return;
+    // 先摘掉已从 DOM 移除的角标（它们不会出现在下面的收集结果里）
     sweepDetached();
-    var videos = document.querySelectorAll('video');
+    sweepShadowRoots();
+    var videos = collectVideos();
+    // 自愈：一个跟踪中的角标都没有、页面里却有 <video> —— 说明之前的创建流程中断过
+    // （badge 建了一半、挂载点错位、__vdlBadge 残留指向已 detached 的元素）。
+    // 残留引用会让下面 `if (!badge)` 走不进去，永远不再重建；而「开关关→开」的
+    // cleanup 恰好会清残留 —— 这就是「刷新后没角标、关了又开就有了」的机制。
+    if (!marked.length) {
+      for (var pi = 0; pi < videos.length; pi++) {
+        if (videos[pi].__vdlBadge) videos[pi].__vdlBadge = null;
+      }
+    }
     for (var i = 0; i < videos.length; i++) {
       var v = videos[i];
-      if (v.__vdlIgnored) continue;
+      if (v.__vdlIgnored) {
+        if (!v.__vdlSkipNoted) { v.__vdlSkipNoted = 1; mev('skip', 'ignored'); }
+        continue;
+      }
+      // 第一次发现「视频真的在播」→ 补报一次现场诊断。
+      // 用户报的问题就发生在这个时刻，2.5s 的 boot 那次通常还没点播放，数据没用。
+      if (!diagPlayPosted) {
+        var isPlaying = false;
+        try { isPlaying = !v.paused; } catch (e9) {}
+        if (isPlaying) { diagPlayPosted = true; reportDiag('playing'); }
+      }
+      // 换集/换源：src 变了说明是新一条，之前手动选的线路作废
+      var curSrc = srcOf(v);
+      if (curSrc !== v.__vdlSeenSrc) {
+        v.__vdlSeenSrc = curSrc;
+        v.__vdlLine = '';
+      }
       var badge = v.__vdlBadge;
       if (!badge) {
         var src = srcOf(v);
-        if (!src) continue;
-        if (kindOf(src) === 'other') continue;
+        var k0 = src ? kindOf(src) : '';
+        // 没有元素地址（懒赋 src / 只挂了 poster）时，只要嗅探器已经拿到候选（容器
+        // data-url、网络证据、分片目录）就该立刻出角标 —— 旧版这里 `if (!src) continue`，
+        // 于是「刷新后视频明明在旁边、角标不出来，点一下页面才冒出来」，正是本次的 bug
+        var cap0 = (!src || k0 === 'mse' || k0 === 'other') ? capturedFor(v) : null;
+        // 两边都没有：只有「主播放器」级别的 <video> 才立一个中性角标（避免给广告位、
+        // 小窗预览视频满屏挂角标）
+        if (!src && !cap0 && !isMainPlayer(v)) {
+          // 这条不是 bug，是刻意跳过；记一次原因，面板上就不会被误判成「该出没出」
+          if (!v.__vdlSkipNoted) { v.__vdlSkipNoted = 1; mev('skip', 'no-src-small'); }
+          continue;
+        }
         badge = makeBadge(v);
         v.__vdlBadge = badge;
         v.classList.add('vdl-video');
         marked.push({ v: v, b: badge });
+        mev('badge+', k0 || 'none');
         (function (el, b) {
           el.addEventListener('loadedmetadata', function () { refreshBadge(b, el); });
           el.addEventListener('durationchange', function () { refreshBadge(b, el); });
           el.addEventListener('resize', function () { refreshBadge(b, el); });
+          // 起播 = 嗅探器拿到最硬证据的时刻，角标要从「?」翻成「✓」
+          el.addEventListener('playing', function () {
+            refreshBadge(b, el);
+            // 清单/分片的判定可能比 playing 略晚到，补刷两次
+            setTimeout(function () { refreshBadge(b, el); }, 400);
+            setTimeout(function () { refreshBadge(b, el); }, 1500);
+          });
         })(v, badge);
       }
       refreshBadge(badge, v);
       place(badge, v);
+      // 卡片停在「尚未捕获地址」的占位态时，一旦嗅探到地址就原地重绘，
+      // 不用让用户把卡片关掉再点一次
+      if (currentCard && currentCardVideo === v && !currentCardHasUrl && infoOf(v).url) {
+        toggleCard(v, badge);
+      }
     }
     // 有待跟随的角标 → 开启逐帧对齐（脱离文档的会在 tick/sweep 里被摘掉）
     if (marked.length) kick();
@@ -467,16 +970,25 @@
   }
   document.addEventListener('click', onQuick, true);
   document.addEventListener('play', onQuick, true);
+  document.addEventListener('playing', onQuick, true);
+  // 媒体事件不冒泡，但**捕获阶段**能收到（document 在最外层）。
+  // loadeddata/canplay 是「播放器已经拿到数据、地址该有了」的最早信号 ——
+  // 只靠 click/play 的话，站点「自动起播」或「静音预加载」场景会一直等到 1s 轮询。
+  document.addEventListener('loadstart', onQuick, true);
+  document.addEventListener('loadeddata', onQuick, true);
+  document.addEventListener('canplay', onQuick, true);
 
-  // <video>/<source> 的 src 属性变化（点击播放后赋值）→ 即时出角标
+  // <video>/<source> 的 src 属性变化（点击播放后赋值）→ 即时出角标。
+  // 观察 document 本身而不是 documentElement：atDocumentStart 时 <html> 可能还没创建，
+  // 观察 documentElement 会抛（被 catch 吞掉后只剩 1s 轮询，反应迟钝）。
   var srcObserver = null;
   try {
     srcObserver = new MutationObserver(function () { update(); });
-    srcObserver.observe(document.documentElement, {
+    srcObserver.observe(document, {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['src']
+      attributeFilter: ['src', 'poster']
     });
   } catch (e) {}
 
@@ -485,11 +997,216 @@
     var fs = !!(document.fullscreenElement || document.webkitFullscreenElement);
     var el = document.querySelectorAll('.vdl-badge, .vdl-card');
     for (var i = 0; i < el.length; i++) el[i].style.display = fs ? 'none' : '';
+    mev('fullscreen', fs ? 'on' : 'off');
   }
   document.addEventListener('fullscreenchange', fsEvt);
   document.addEventListener('webkitfullscreenchange', fsEvt);
 
+  // ── 现场诊断（每个文档最多两条，进 App 日志）───────────────────────────
+  // 用户反馈「视频在播、角标不出」时，靠这条日志一次分辨到底是哪种情况：
+  //   ① videos=0 但 frames>0 / shadow>0 → 视频在别的帧或 shadow root 里
+  //   ② videos>0 playing>0 但 badged=0 → 建角标条件被卡住
+  //   ③ badged>0 shown=0 → 坐标算出来在视口外（rectOf 换算/祖先隐藏）
+  //   ④ badged>0 covered>0 → 建了但被站点浮层盖住（要上 top-layer）
+  //   ⑤ nativefs>0 → iOS 原生全屏播放，HTML 角标物理上不可能可见
+  var diagBootPosted = false;
+  var diagPlayPosted = false;
+
+  function shortSrc(s) {
+    s = String(s || '');
+    return s.length > 120 ? s.slice(0, 110) + '…' + s.slice(-8) : s;
+  }
+
+  // iframe 清单：跨域帧读不到 contentDocument，但 src 是可读的。
+  // 主框架 videos=0 而 frames>0 时，先看这里判断「视频是不是在帧里」。
+  function frameList() {
+    var out = [];
+    try {
+      var fs = document.querySelectorAll('iframe');
+      for (var i = 0; i < fs.length && out.length < 10; i++) {
+        var f = fs[i];
+        var it = {
+          src: shortSrc(f.src || (f.getAttribute && f.getAttribute('src')) || ''),
+          same: false, sniffer: false, marker: false, videos: -1
+        };
+        try {
+          if (f.contentDocument) {
+            it.same = true;
+            var w = f.contentWindow;
+            it.sniffer = !!(w && w.__vdlSniffInstalled);
+            it.marker = !!(w && w.__vdlMarkerInstalled);
+            try { it.videos = f.contentDocument.querySelectorAll('video').length; } catch (e) {}
+          }
+        } catch (e) {}
+        out.push(it);
+      }
+    } catch (e) {}
+    return out;
+  }
+
+  // 逐个 <video> 给出「为什么有/没有角标」的可读状态：
+  //   badged               有角标且可见
+  //   hidden:<reason>      有角标但被 place() 隐藏（rect-null/zero-size/offscreen）
+  //   ignored              用户点过「忽略此条」
+  //   skipped:no-src-small 没有地址、也不是主播放器尺寸 —— 刻意不挂
+  //   unbadged             本轮理应出角标但没有（自愈逻辑应在下一秒补上）
+  function inspectItems() {
+    var out = [];
+    var vs = collectVideos();
+    for (var i = 0; i < vs.length; i++) {
+      var v = vs[i];
+      var src = srcOf(v);
+      var k = src ? kindOf(src) : '';
+      var cap = null;
+      if (!src || k === 'mse' || k === 'other') {
+        try { cap = capturedFor(v); } catch (e) {}
+      }
+      var b = v.__vdlBadge;
+      var r = null;
+      try { r = rectOf(v); } catch (e) {}
+      var onscreen = !!(r && r.width >= 10 && r.height >= 10 &&
+        r.bottom > 0 && r.top < window.innerHeight &&
+        r.right > 0 && r.left < window.innerWidth);
+      var covered = 0;
+      if (b && b.style.display !== 'none' && onscreen &&
+          typeof document.elementFromPoint === 'function') {
+        try {
+          var br = b.getBoundingClientRect();
+          var hit = document.elementFromPoint(br.left + br.width / 2, br.top + br.height / 2);
+          if (hit && hit !== b && !b.contains(hit)) covered = 1;
+        } catch (e) {}
+      }
+      var state = 'badged';
+      if (!b) {
+        if (v.__vdlIgnored) state = 'ignored';
+        else if (!src && !cap && !isMainPlayer(v)) state = 'skipped:no-src-small';
+        else state = 'unbadged';
+      } else if (b.style.display === 'none') {
+        state = 'hidden:' + (b.__vdlHidden || 'unknown');
+      }
+      out.push({
+        state: state,
+        kind: k || (cap && cap.kind) || 'none',
+        badge: !!b,
+        shown: !!(b && b.style.display !== 'none'),
+        onscreen: onscreen,
+        covered: covered,
+        playing: (function () { try { return !v.paused; } catch (e) { return false; } })(),
+        srcObject: !!v.srcObject,
+        rect: r ? {
+          x: Math.round(r.left), y: Math.round(r.top),
+          w: Math.round(r.width), h: Math.round(r.height)
+        } : null,
+        src: src ? shortSrc(src) : ''
+      });
+    }
+    return out;
+  }
+
+  // 「嗅探诊断」面板每秒读一次的快照。只读，不改任何展示状态。
+  window.__vdlMarkerDiag = function () {
+    try {
+      var vs = collectVideos();
+      var items = inspectItems();
+      var shown = 0, hidden = 0, covered = 0, playing = 0, srcobj = 0;
+      var nativefs = 0, big = 0;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].shown) shown++;
+        if (items[i].badge && !items[i].shown) hidden++;
+        if (items[i].covered) covered++;
+        if (items[i].playing) playing++;
+        if (items[i].srcObject) srcobj++;
+      }
+      for (var j = 0; j < vs.length; j++) {
+        try {
+          if (vs[j].webkitDisplayingFullscreen) nativefs++;
+          if (isMainPlayer(vs[j])) big++;
+        } catch (e) {}
+      }
+      var frames = 0;
+      try { frames = document.querySelectorAll('iframe').length; } catch (e) {}
+      return {
+        v: MVERSION,
+        installed: !!window.__vdlMarkerInstalled,
+        enabled: window.__vdlMarkEnabled !== false,
+        bootAt: MBOOT,
+        lastInjectAt: window.__vdlMarkerLastInjectAt || 0,
+        installedAt: window.__vdlMarkerInstalledAt || 0,
+        injects: window.__vdlMarkerInjectCount || 1,
+        via: window.__vdlMarkerInstalledVia || window.__vdlMarkVia || '',
+        lastVia: window.__vdlMarkVia || '',
+        epoch: mEpoch(),
+        href: location.href,
+        top: window === window.top,
+        readyState: (document && document.readyState) || '',
+        ticks: ticks,
+        lastUpdateAt: lastUpdateAt,
+        videos: vs.length,
+        domVideos: (function () { try { return document.querySelectorAll('video').length; } catch (e) { return 0; } })(),
+        shadowRoots: shadowRoots.length,
+        frames: frames,
+        marked: marked.length,
+        shown: shown, hidden: hidden, covered: covered,
+        playing: playing, srcobj: srcobj, nativefs: nativefs, big: big,
+        fullscreen: !!(document.fullscreenElement || document.webkitFullscreenElement),
+        items: items.slice(0, 10),
+        frameList: frameList(),
+        events: M_EVENTS.slice(-60)
+      };
+    } catch (e) {
+      return { v: MVERSION, installed: false, error: String(e), events: M_EVENTS.slice(-20) };
+    }
+  };
+
+  // 一次性上报（只在 boot / 首次起播各发一条）：带上嗅探池规模、钩子计数和
+  // 每个 video 的状态摘要。App 日志据此就能分清「没脚本 / 没候选 / 有候选但没角标」。
+  function reportDiag(tag) {
+    try {
+      if (!window.__vdlMarkerInstalled) return;
+      var d = window.__vdlMarkerDiag();
+      if (!d) return;
+      var sniff = null;
+      try { sniff = (window.__vdlSniff && window.__vdlSniff.diag) ? window.__vdlSniff.diag() : null; } catch (e) {}
+      var why = [];
+      for (var i = 0; i < (d.items || []).length; i++) why.push(d.items[i].state);
+      postAction({
+        action: 'markerDiag',
+        url: '',
+        tag: tag,
+        frame: d.top ? 'top' : 'sub',
+        videos: d.videos,
+        dom: d.domVideos,
+        shadow: d.shadowRoots,
+        frames: d.frames,
+        playing: d.playing,
+        srcobj: d.srcobj,
+        nativefs: d.nativefs,
+        big: d.big,
+        badged: d.marked,
+        shown: d.shown,
+        hidden: d.hidden,
+        covered: d.covered,
+        fullscreen: d.fullscreen ? 1 : 0,
+        items: why.join(','),
+        injects: d.injects,
+        via: d.via,
+        epoch: d.epoch,
+        cands: sniff ? sniff.counts.all : -1,
+        candOk: sniff ? sniff.counts.ok : -1,
+        candDead: sniff ? sniff.counts.dead : -1,
+        fetch: sniff ? sniff.stats.fetch : -1,
+        xhr: sniff ? sniff.stats.xhr : -1,
+        hooks: sniff ? ((sniff.fetchHooked ? 1 : 0) + '/' + (sniff.xhrHooked ? 1 : 0)) : '',
+        sniffVia: sniff ? sniff.via : '',
+        sniffHookAt: (sniff && sniff.hook) ? sniff.hook.readyState : '',
+        href: d.href
+      });
+    } catch (e) {}
+  }
+  window.setTimeout(function () { diagBootPosted = true; reportDiag('boot'); }, 2500);
+
   window.__vdlCleanup = function () {
+    mev('cleanup', '');
     window.clearInterval(timer);
     window.removeEventListener('scroll', update, true);
     window.removeEventListener('resize', update);
@@ -510,7 +1227,11 @@
     // 元素上残留的 __vdlBadge 必须清掉：否则重新打开标记开关后，
     // update() 会认为角标已存在而不再创建，页面就再也不出角标了
     var all = document.querySelectorAll('video');
-    for (var k = 0; k < all.length; k++) all[k].__vdlBadge = null;
+    for (var k = 0; k < all.length; k++) {
+      all[k].__vdlBadge = null;
+      all[k].__vdlLine = '';
+      all[k].__vdlSeenSrc = undefined;
+    }
     window.__vdlMarkerInstalled = false;
     window.__vdlMarkerSource = null;
     // 通知子框架一起清理（开关关闭）

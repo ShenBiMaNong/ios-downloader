@@ -1,4 +1,6 @@
+import 'dart:async' show Timer, TimeoutException;
 import 'dart:convert';
+import 'dart:io' show Platform;
 
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart'
@@ -41,14 +43,26 @@ class BrowserPageState extends State<BrowserPage> {
 
   /// 地址栏焦点：用户正在输入时不覆盖他写的内容
   final _urlFocus = FocusNode();
-  late final WebViewController _controller;
+  late WebViewController _controller;
+
+  /// WebView 实例代次：强制重置时自增，并作为平台视图的 Key ——
+  /// Key 变了 Flutter 才会拆掉旧 WebView（连带它的数据存储会话与渲染进程）
+  int _viewEpoch = 0;
+
+  /// 强制重置进行中（防重入 + 地址栏下方出进度条）
+  bool _resetting = false;
   String? _sniffer;
   String? _adblock;
   String? _marker;
   String? _redirectGuard;
   String? _noAutoplay;
+  String? _swipe;
   String _currentUrl = '';
   String _pageTitle = '';
+
+  /// 各帧主动上报的标记诊断（iOS 全帧注入时，跨域 iframe 会各报一条）。
+  /// 诊断面板只读得到主框架，子框架的证据靠这里补齐。
+  final List<Map<String, dynamic>> _frameDiags = [];
 
   /// 跳转拦截：本页已处理过的跳转目标（去重，页面切换时清空）
   final Set<String> _handledRedirects = {};
@@ -63,10 +77,25 @@ class BrowserPageState extends State<BrowserPage> {
   /// 上次应用的自动播放拦截开关状态（供 AppData 变更监听去重）
   bool? _lastNoAutoplayApplied;
 
+  /// 上次应用的「点播放即接管」开关状态（供 AppData 变更监听去重）
+  bool? _lastHijackApplied;
+
   @override
   void initState() {
     super.initState();
-    _controller = WebViewController()
+    _controller = _newController();
+    AppData.instance.addListener(_onAppDataChanged);
+    // iOS：把自动播放拦截 + 嗅探脚本注册为 WKUserScript（atDocumentStart + 全帧含跨域 iframe），
+    // 必须在页面脚本之前执行；失败由 onPageStarted/onPageFinished 注入兜底
+    _installEarlyScripts();
+    _initStartPage();
+  }
+
+  /// 建一个 WebView 控制器并挂上导航代理 + JS 通道。
+  /// 单独成方法是因为「强制重置浏览器状态」要整个换掉 WebView 实例：
+  /// 只有重建平台视图才会把卡死的渲染进程一起丢掉，`reload()` 做不到。
+  WebViewController _newController() {
+    return WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (url) {
@@ -75,18 +104,29 @@ class BrowserPageState extends State<BrowserPage> {
           _syncAddress(url);
           _handledRedirects.clear();
           AppData.instance.setLastUrl(url);
+          // 新导航：早期注入若因平台视图晚建而超限放弃过，这里再给一次机会
+          if (!_earlySnifferInstalled) _earlySnifferTries = 0;
           _injectSniffer();
           _installEarlyScripts(); // 已装则秒回；未装（如 WebView 重建）再试一次
           _injectMarker();
           _injectRedirectGuard();
           _injectNoAutoplay();
+          _injectSwipe();
           if (AppData.instance.adBlockEnabled) _injectAdBlock();
+          // 本次导航可能一直停在 interactive（等不到 onPageFinished），由自愈补脚本
+          _scheduleInjectWatchdog();
         },
         // SPA 路由变化（history.pushState / 页内锚点）不会触发 onPageStarted，
         // 只有 onUrlChange 能拿到 —— 否则单页应用里地址栏永远停在首屏地址
         onUrlChange: (change) {
           final url = change.url;
-          if (url != null && url.isNotEmpty) _syncAddress(url);
+          if (url != null && url.isNotEmpty) {
+            _syncAddress(url);
+            // 新文档提交/SPA 路由都会走到这里。真机上有页面 TTFB 很长，onPageStarted
+            // 之后好几秒才提交新文档，按导航起点排的检查可能全部打在旧文档上 ——
+            // 以「地址真正变了」为起点再排一轮，晚提交的文档也能被补上脚本。
+            if (url.startsWith('http')) _scheduleInjectWatchdog();
+          }
         },
         onPageFinished: (url) async {
           _syncAddress(url);
@@ -94,10 +134,17 @@ class BrowserPageState extends State<BrowserPage> {
           await _injectMarker();
           await _injectRedirectGuard();
           await _injectNoAutoplay();
+          await _injectSwipe();
           if (AppData.instance.adBlockEnabled) await _injectAdBlock();
           final t = await _controller.getTitle();
           if (mounted) setState(() => _pageTitle = t ?? '');
           AppData.instance.recordHistory(t ?? '', url);
+          // 导航竞态补刀：onPageStarted 阶段的 evaluateJavaScript 可能打在旧文档上，
+          // onPageFinished 时播放器也常常还没布局出 <video>。1.2s 后再补一次注入
+          // （marker 幂等，已装则秒回）—— 这是「刷新后角标不出」的最后一道兜底。
+          Future<void>.delayed(const Duration(milliseconds: 1200), () {
+            if (mounted) _injectMarker();
+          });
         },
         onWebResourceError: (err) {
           // 主框架加载失败→警告；子资源（广告/图标等）失败→调试级，避免刷屏
@@ -113,12 +160,11 @@ class BrowserPageState extends State<BrowserPage> {
       })
       ..addJavaScriptChannel('redirectAttempt', onMessageReceived: (msg) {
         _handleRedirectAttempt(msg.message);
+      })
+      // 页面左右滑动手势（右滑=后退、左滑=前进）：browser_swipe.js 回传方向
+      ..addJavaScriptChannel('browserGesture', onMessageReceived: (msg) {
+        _handleBrowserGesture(msg.message);
       });
-    AppData.instance.addListener(_onAppDataChanged);
-    // iOS：把自动播放拦截 + 嗅探脚本注册为 WKUserScript（atDocumentStart + 全帧含跨域 iframe），
-    // 必须在页面脚本之前执行；失败由 onPageStarted/onPageFinished 注入兜底
-    _installEarlyScripts();
-    _initStartPage();
   }
 
   /// 按设置决定启动页：空白页 / 上次打开页（无记录时用默认首页兜底）
@@ -131,9 +177,12 @@ class BrowserPageState extends State<BrowserPage> {
         _controller.loadRequest(Uri.parse('about:blank'));
       case BrowserStartPage.lastPage:
         final last = AppData.instance.lastUrl;
-        if (last.isNotEmpty) {
+        // 只恢复真实网页：旧版本可能把 about:blank 之类记成「上次打开页」
+        if (last.startsWith('http://') || last.startsWith('https://')) {
+          AppLog.instance.info('browser', '启动页：恢复上次打开页 $last');
           _load(last);
         } else {
+          AppLog.instance.info('browser', '启动页：无有效记录，打开默认首页 $_defaultUrl');
           _load(_defaultUrl);
         }
     }
@@ -141,6 +190,8 @@ class BrowserPageState extends State<BrowserPage> {
 
   @override
   void dispose() {
+    _watchdogSeq++; // 作废还在执行中的检查
+    _watchdogTimer?.cancel(); // 并取消还没触发的那一拍
     AppData.instance.removeListener(_onAppDataChanged);
     _urlFocus.dispose();
     _urlController.dispose();
@@ -162,17 +213,123 @@ class BrowserPageState extends State<BrowserPage> {
   Future<String> _noAutoplayJs() async =>
       _noAutoplay ??= await rootBundle.loadString('assets/no_autoplay.js');
 
+  Future<String> _swipeJs() async =>
+      _swipe ??= await rootBundle.loadString('assets/browser_swipe.js');
+
   Future<void> _injectSniffer() async {
     try {
       final js = await _snifferJs();
-      // 附带源码：让脚本把自身扩散到同源 iframe（跨域 iframe 由平台限制，跳过）
-      final boot = '\nwindow.__vdlSniffSource=${jsonEncode(js)};\n'
+      // 附带源码：让脚本把自身扩散到同源 iframe（跨域 iframe 由平台限制，跳过）。
+      // via/epoch 是诊断字段：面板据此判断「脚本装的是不是当前 WebView 实例 / 当前文档」。
+      // via 必须写在脚本**前面**：钩子信息是在脚本体里记录的，放后面就只能读到空值。
+      final head = 'window.__vdlSniffVia="dart";window.__vdlViewEpoch=$_viewEpoch;\n';
+      final tail = '\nwindow.__vdlSniffSource=${jsonEncode(js)};\n'
           'if (window.__vdlSniffPropagate) window.__vdlSniffPropagate(window.__vdlSniffSource);';
-      await _controller.runJavaScript(js + boot);
+      await _controller.runJavaScript(head + js + tail);
+      _lastSniffInjectAt = DateTime.now();
+      _lastSniffInjectError = null;
+      AppLog.instance.debug(
+          'browser', '注入嗅探脚本 via=dart epoch=$_viewEpoch $_currentUrl');
     } catch (e, st) {
+      _lastSniffInjectError = '$e';
       AppLog.instance.warn('browser', '注入嗅探脚本失败', e, st);
     }
   }
+
+  /// 导航后的脚本自愈（iOS/Android 通用）。
+  /// `readyState=interactive` 的页面可能永远等不到 onPageFinished（长连接/广告帧拖住 load），
+  /// 而 onPageStarted 阶段的 runJavaScript 又常打在**旧文档**上 —— 新文档就会一段脚本都没有，
+  /// 正是「视频在播、没角标、诊断面板全空」那种现场。这里隔几拍查一次：
+  /// 当前文档缺哪段就补哪段；读不到（页面假死 / 正在换文档）就跳过，绝不硬塞。
+  void _scheduleInjectWatchdog() {
+    final seq = ++_watchdogSeq;
+    // 用可取消的 Timer（而不是 await Future.delayed）：新导航/重置/dispose 时能把
+    // 还在等待的那一拍直接取消。否则 widget 测试收尾会因 pending timer 失败。
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+    if (!mounted) return;
+    // 绝对时间点 0.4/1.2/2.6/5/9/15/25 秒；相邻两拍的间隔便于用单个 Timer 串联
+    const gaps = <int>[400, 800, 1400, 2400, 4000, 6000, 10000];
+    var i = 0;
+    void tick() {
+      if (!mounted || seq != _watchdogSeq) return;
+      _watchdogTimer = Timer(Duration(milliseconds: gaps[i]), () async {
+        if (!mounted || seq != _watchdogSeq) return;
+        if (_currentUrl.startsWith('http')) {
+          final missing = await _scriptsMissing();
+          if (!mounted || seq != _watchdogSeq) return;
+          if (missing != null) {
+            AppLog.instance.warn('browser',
+                '脚本自愈：当前文档缺$missing，已补注入（第 ${i + 1} 次检查） $_currentUrl');
+            await _injectSniffer();
+            await _injectMarker();
+            await _injectRedirectGuard();
+            await _injectNoAutoplay();
+            await _injectSwipe();
+            if (AppData.instance.adBlockEnabled) await _injectAdBlock();
+          }
+        }
+        if (!mounted || seq != _watchdogSeq) return;
+        i++;
+        // 查到「已装」也继续走完后几拍：400ms 时 JS 可能还打在旧文档上（也有脚本），
+        // 真正的新文档要等它接管后再确认一次。
+        if (i < gaps.length) tick();
+      });
+    }
+
+    tick();
+  }
+
+  /// 当前文档缺哪些脚本：'嗅探脚本' / '标记脚本' / '嗅探+标记脚本'；两者都在 → null；
+  /// 读不到（超时/异常）也返回 null —— 不能把「查不了」当成「缺」来反复注入。
+  Future<String?> _scriptsMissing() async {
+    try {
+      final raw = await _controller.runJavaScriptReturningResult(
+        '(function(){var s=!!window.__vdlSniffInstalled,m=!!window.__vdlMarkerInstalled;'
+        'return s&&m?"":(s?"marker":(m?"sniff":"both"));})()',
+      ).timeout(const Duration(milliseconds: 1200));
+      final v = '$raw'.replaceAll('"', '');
+      if (v.isEmpty) return null;
+      if (v == 'sniff') return '嗅探脚本';
+      if (v == 'marker') return '标记脚本';
+      if (v == 'both') return '嗅探+标记脚本';
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 诊断面板的「立即补注入」：补当前文档 + 再试一次早期注入（影响后续文档）。
+  Future<void> _repairScripts() async {
+    try {
+      if (!_earlySnifferInstalled) {
+        _earlySnifferTries = 0;
+        await _installEarlyScripts();
+      }
+      await _injectSniffer();
+      await _injectMarker();
+      await _injectRedirectGuard();
+      await _injectNoAutoplay();
+      await _injectSwipe();
+      if (AppData.instance.adBlockEnabled) await _injectAdBlock();
+      AppLog.instance.info('browser', '诊断面板：手动补注入完成 $_currentUrl');
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '诊断面板：手动补注入失败', e, st);
+    }
+  }
+
+  /// 面板 / 报告用：App 侧（非页内）的注入状态。
+  Map<String, dynamic> _diagAppState() => <String, dynamic>{
+        'viewEpoch': _viewEpoch,
+        'currentUrl': _currentUrl,
+        'earlyInstalled': _earlySnifferInstalled,
+        'earlyChannelMissing': _earlyChannelMissing,
+        'earlyTries': _earlySnifferTries,
+        'lastSniffAt': _lastSniffInjectAt?.toIso8601String(),
+        'sniffError': _lastSniffInjectError,
+        'lastMarkerAt': _lastMarkerInjectAt?.toIso8601String(),
+        'markerError': _lastMarkerInjectError,
+      };
 
   /// iOS 早期注入：把脚本注册为 WKUserScript（atDocumentStart + 全帧含跨域）。
   /// 相比 onPageFinished 注入的两个优势：
@@ -182,55 +339,115 @@ class BrowserPageState extends State<BrowserPage> {
   /// 非 iOS（无此原生通道）或 WebView 尚未创建时静默跳过/重试，不影响 Android。
   static const _sniffBridge = MethodChannel('video_downloader/sniffer');
   bool _earlySnifferInstalled = false;
+  bool _earlyChannelMissing = false;
+  bool _earlyInstallInFlight = false;
   int _earlySnifferTries = 0;
 
+  /// 最近一次 Dart 侧注入的结果（诊断面板 / 报告用）。
+  DateTime? _lastSniffInjectAt;
+  String? _lastSniffInjectError;
+  DateTime? _lastMarkerInjectAt;
+  String? _lastMarkerInjectError;
+
+  /// 导航后的脚本自愈：页面还在加载（readyState=interactive）时 onPageFinished 尚未触发，
+  /// onPageStarted 的 runJavaScript 又可能打在旧文档上 —— 新文档会一段脚本都没有。
+  /// 表现就是「页面在播、没有角标，诊断面板全空」。隔几拍查一次，缺了就补。
+  /// 序号用于作废「已在执行中」的旧序列（Timer 只能取消还没触发的那一拍）。
+  int _watchdogSeq = 0;
+
+  /// 当前待触发的自愈检查（可取消；dispose / 新导航 / 强制重置时取消）。
+  Timer? _watchdogTimer;
+
   Future<void> _installEarlyScripts() async {
-    if (_earlySnifferInstalled || _earlySnifferTries > 12) return;
+    // 重试次数只用于「平台视图还没建好」的短时轮询；每次新导航会把计数清零
+    //（冷启动时平台视图可能晚于 6 秒，旧逻辑一超限就整场会话都不再尝试早期注入）。
+    if (_earlySnifferInstalled || _earlyInstallInFlight) return;
+    if (_earlySnifferTries > 12) return;
     _earlySnifferTries++;
+    _earlyInstallInFlight = true;
+    var retry = false;
     try {
-      // 顺序：自动播放拦截在嗅探器之前（先拿到 play() 的原生引用）
-      final scripts = [await _noAutoplayJs(), await _snifferJs()];
+      // 开关快照要取已加载的持久化值（initState 时 AppData 可能还没读完文件）
+      await AppData.instance.ensureLoaded();
+      // 顺序：自动播放拦截在嗅探器之前（先拿到 play() 的原生引用）；
+      // 视频标记最后（依赖嗅探器的 __vdlSniff，且要读前面写入的 __vdlMarkEnabled）。
+      // marker 进 WKUserScript 的意义：每个新文档自动装上角标，不再依赖
+      // onPageStarted/onPageFinished 的 runJavaScript —— 那条路在导航竞态下会把脚本
+      // 打到旧文档上，症状就是「刷新页面角标不出、开关关→开又有了」。
+      final scripts = [
+        // 每个文档（含跨域 iframe）都会先跑这一条：记录脚本来源与 WebView 代次。
+        // 面板里 via=early 说明走的是 WKUserScript 早期注入，dart 说明是导航回调补的。
+        'window.__vdlSniffVia="early";window.__vdlMarkVia="early";'
+            'window.__vdlViewEpoch=$_viewEpoch;',
+        'window.__vdlMarkEnabled=${AppData.instance.videoMarkEnabled};',
+        await _noAutoplayJs(),
+        await _snifferJs(),
+        await _markerJs(),
+        // 手势导航：touch 监听也要赶在页面脚本之前挂上（页面可能自己吞 touch）
+        await _swipeJs(),
+      ];
       final ok = await _sniffBridge
               .invokeMethod<bool>('installUserScripts', scripts) ??
           false;
       if (ok) {
         _earlySnifferInstalled = true;
-        AppLog.instance
-            .info('browser', 'iOS 早期注入成功（WKUserScript 全帧：自动播放拦截 + 嗅探）');
+        _earlyChannelMissing = false;
+        AppLog.instance.info('browser',
+            'iOS 早期注入成功（WKUserScript 全帧：自动播放拦截 + 嗅探 + 视频标记）');
         return;
       }
+      retry = true; // WebView 平台视图尚未创建 → 稍后重试
     } on MissingPluginException {
+      _earlyChannelMissing = true;
       return; // Android / 桌面：无此通道，走 onPageStarted/onPageFinished 注入
-    } on PlatformException {
-      return;
+    } on PlatformException catch (e) {
+      AppLog.instance.warn('browser', 'iOS 早期注入通道报错', e);
+      retry = true;
     } catch (e, st) {
       AppLog.instance.warn('browser', 'iOS 早期注入异常', e, st);
-      return;
+      retry = true;
+    } finally {
+      _earlyInstallInFlight = false;
     }
-    // WebView 平台视图尚未创建 → 稍后重试
-    if (mounted) {
+    if (retry && mounted) {
       Future<void>.delayed(const Duration(milliseconds: 500), _installEarlyScripts);
     }
   }
 
   /// 自动播放拦截：脚本自身幂等（已装则立即返回），开关值另行注入。
   /// 关掉开关时走 `__vdlNoAutoplaySetEnabled(false)` 把原型方法还原，无需刷新页面。
+  /// 「点播放即接管」也由同一脚本实现（共用 play() 钩子与手势判据），任一开关开启都要确保脚本已注入。
   Future<void> _injectNoAutoplay() async {
     try {
       final on = AppData.instance.blockAutoplayEnabled;
-      if (on) {
+      final hijack = AppData.instance.playHijackEnabled;
+      if (on || hijack) {
         // 先设标志再注入：脚本只在该值不是 bool 时才用 sessionStorage 里的历史值兜底，
         // 否则「关过开关 → 再打开」会被历史值覆盖成关闭
-        await _controller.runJavaScript('window.__vdlNoAutoplayEnabled=true;');
+        await _controller.runJavaScript('window.__vdlNoAutoplayEnabled=$on;');
         await _controller.runJavaScript(await _noAutoplayJs());
       } else {
         await _controller
             .runJavaScript('if (window.__vdlNoAutoplaySetEnabled) '
                 'window.__vdlNoAutoplaySetEnabled(false);');
       }
+      // 接管开关独立同步：脚本未装时只设窗口变量，装上后由 setter 一并写 sessionStorage
+      // （供下个页面 atDocumentStart 阶段读取，那时 Dart 还没机会注入）
+      await _controller.runJavaScript('window.__vdlHijackEnabled=$hijack;'
+          'if (window.__vdlNoAutoplaySetHijack) window.__vdlNoAutoplaySetHijack($hijack);');
       _lastNoAutoplayApplied = on;
+      _lastHijackApplied = hijack;
     } catch (e, st) {
       AppLog.instance.warn('browser', '注入自动播放拦截脚本失败', e, st);
+    }
+  }
+
+  /// 左右滑动手势：脚本自身幂等（已装则立即返回），无开关、常开
+  Future<void> _injectSwipe() async {
+    try {
+      await _controller.runJavaScript(await _swipeJs());
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '注入手势脚本失败', e, st);
     }
   }
 
@@ -254,20 +471,41 @@ class BrowserPageState extends State<BrowserPage> {
   }
 
   /// 页面视频标记（方案A）：开关打开才注入；关闭时清理已注入的标记
-  Future<void> _injectMarker() async {
+  ///
+  /// 串行化：注入/清理必须按调用顺序执行。「关→开」会连续调两次本方法（一次 cleanup、
+  /// 一次注入），二者都是 async（await loadString + runJavaScript），并发时完成顺序
+  /// 不确定 —— 注入先完成、cleanup 后执行的话，角标就被清没了，表现为「开关关了又开，
+  /// 角标时有时无」。用 Future 链排队，前一个跑完再跑下一个。
+  Future<void>? _markerChain;
+
+  Future<void> _injectMarker() {
+    final prev = _markerChain;
+    final task = prev == null ? _doInjectMarker() : prev.then((_) => _doInjectMarker());
+    _markerChain = task.catchError((_) {});
+    return task;
+  }
+
+  Future<void> _doInjectMarker() async {
     try {
       if (AppData.instance.videoMarkEnabled) {
         final js = await _markerJs();
-        // 附带源码：脚本自扩散到同源 iframe，让 iframe 内播放器也能出角标
-        final boot = '\nwindow.__vdlMarkerSource=${jsonEncode(js)};\n'
+        // 先纠正开关再注入：WKUserScript 里的开关是安装时快照，用户改过设置后
+        // 新文档可能带着旧值（marker 看到 false 会直接不启动）。前缀一行就地修正。
+        // 附带源码：脚本自扩散到同源 iframe，让 iframe 内播放器也能出角标。
+        final code = 'window.__vdlMarkEnabled=true;window.__vdlMarkVia="dart";'
+            'window.__vdlViewEpoch=$_viewEpoch;\n$js\n'
+            'window.__vdlMarkerSource=${jsonEncode(js)};\n'
             'if (window.__vdlMarkerPropagate) window.__vdlMarkerPropagate(window.__vdlMarkerSource);';
-        await _controller.runJavaScript(js + boot);
+        await _controller.runJavaScript(code);
       } else {
-        await _controller.runJavaScript(
+        await _controller.runJavaScript('window.__vdlMarkEnabled=false;'
             'window.__vdlMarkerSource=null; if (window.__vdlCleanup) window.__vdlCleanup();');
       }
       _lastMarkerApplied = AppData.instance.videoMarkEnabled;
+      _lastMarkerInjectAt = DateTime.now();
+      _lastMarkerInjectError = null;
     } catch (e, st) {
+      _lastMarkerInjectError = '$e';
       AppLog.instance.warn('browser', '注入视频标记脚本失败', e, st);
     }
   }
@@ -305,7 +543,8 @@ class BrowserPageState extends State<BrowserPage> {
     if (AppData.instance.videoMarkEnabled != _lastMarkerApplied) {
       _injectMarker();
     }
-    if (AppData.instance.blockAutoplayEnabled != _lastNoAutoplayApplied) {
+    if (AppData.instance.blockAutoplayEnabled != _lastNoAutoplayApplied ||
+        AppData.instance.playHijackEnabled != _lastHijackApplied) {
       _injectNoAutoplay();
     }
   }
@@ -332,6 +571,11 @@ class BrowserPageState extends State<BrowserPage> {
       final action = (j['action'] as String?) ?? '';
       final url = (j['url'] as String?) ?? '';
       final title = (j['title'] as String?) ?? '';
+      // 页内标记卡不带 referer → 用主框架地址；「点播放即接管」会带当前帧地址，
+      // 跨域 iframe 播放器必须用它，否则 CDN 拿主框架 Referer 直接 403
+      final referer = (j['referer'] as String?) ?? '';
+      // 页面播放器报告的时长：下载前用来核对「这条清单是不是同一个视频」
+      final pageDur = (j['duration'] as num?)?.toDouble() ?? 0;
       // 自动播放拦截脚本的一次性上报（每个文档最多一条）：不弹 toast，只进系统日志，
       // 便于排查「为什么这个页面的视频不自动播了」
       if (action == 'autoplayBlocked') {
@@ -341,8 +585,54 @@ class BrowserPageState extends State<BrowserPage> {
         );
         return;
       }
+      // 标记层诊断（每个文档最多两条：boot + 首次发现播放）：排查「角标不出来」时，
+      // 这行日志就能分清是 video 在别的帧/shadow 里（frames/shadow > 0、dom=0）、
+      // 还是角标建了被盖住（covered > 0）、还是 iOS 原生全屏播放（nativefs > 0）。
+      if (action == 'markerDiag') {
+        // 各帧的快照留一份在内存里：面板能显示跨域 iframe 自己的诊断
+        //（主框架 runJavaScript 够不到跨域帧，它们只能自己通过 videoAction 上报）。
+        _frameDiags.add(<String, dynamic>{
+          ...j,
+          '_at': DateTime.now().toIso8601String(),
+        });
+        if (_frameDiags.length > 20) _frameDiags.removeAt(0);
+        final videos = (j['videos'] as num?)?.toInt() ?? 0;
+        final big = (j['big'] as num?)?.toInt() ?? 0;
+        final playing = (j['playing'] as num?)?.toInt() ?? 0;
+        final badged = (j['badged'] as num?)?.toInt() ?? 0;
+        final shown = (j['shown'] as num?)?.toInt() ?? 0;
+        // 用户报的现场症状：主播放器在播，但一个角标都没有 / 有角标但全都不可见。
+        // 这类上报自动升为 warn，不必等用户自己去翻日志。
+        final noBadge = videos > 0 && big > 0 && playing > 0 && badged == 0;
+        final nothingVisible = playing > 0 && badged > 0 && shown == 0;
+        AppLog.instance.log(
+          (noBadge || nothingVisible) ? LogLevel.warn : LogLevel.info,
+          'browser',
+          '标记诊断[${j['tag'] ?? ''}] 帧=${j['frame']} 视频=$videos(dom=${j['dom']} '
+              'shadow=${j['shadow']} frames=${j['frames']}) 播放中=$playing '
+              'srcObj=${j['srcobj']} 原生全屏=${j['nativefs']} 大播放器=$big '
+              '角标=$badged 可见=$shown 隐藏=${j['hidden'] ?? 0} '
+              '被遮挡=${j['covered'] ?? 0} 候选=${j['cands'] ?? '?'}'
+              '(ok=${j['candOk'] ?? '?'} dead=${j['candDead'] ?? '?'}) '
+              '请求=${j['fetch'] ?? '?'}/${j['xhr'] ?? '?'} 钩子=${j['hooks'] ?? '?'} '
+              '注入=${j['injects'] ?? '?'} via=${j['via'] ?? ''}'
+              ' snifferVia=${j['sniffVia'] ?? ''} epoch=${j['epoch'] ?? '?'} '
+              '挂钩时=${j['sniffHookAt'] ?? '?'} '
+              '状态=${j['items'] ?? ''} ${j['href'] ?? ''}',
+        );
+        return;
+      }
       if (url.isEmpty) return;
-      final v = VideoInfo(url: url, frameUrl: _currentUrl, pageTitle: title);
+      // referer/duration 必须一路传到下载器：嗅探是在 WKWebView 里做的（自带
+      // 站点 Cookie 和正确 origin），而下载在原生 URLSession / Dio 里发 ——
+      // 不带这两个就必然出现「页面能播、探测也 ok，一下载就 403/网络问题」。
+      final v = VideoInfo(
+        url: url,
+        frameUrl: _currentUrl,
+        pageTitle: title,
+        referer: referer,
+        duration: pageDur,
+      );
       switch (action) {
         case 'play':
           // 立即播放（边播边缓存）：先停掉页内播放，避免双音源
@@ -350,7 +640,7 @@ class BrowserPageState extends State<BrowserPage> {
           final item = await PlaybackCacher.instance.start(
             url: url,
             title: title.isNotEmpty ? title : '网页视频',
-            referer: _currentUrl,
+            referer: v.effectiveReferer,
           );
           if (item == null) {
             _toast('无法播放该视频');
@@ -366,23 +656,36 @@ class BrowserPageState extends State<BrowserPage> {
           break;
         case 'mp4':
           if (!_isDirectMedia(v)) {
-            _toast('该链接不是可直接下载的视频文件');
+            _toast('不是可下载的视频文件');
             return;
           }
           // 页内播放器继续播着会让系统一直挂「正在播放」媒体通知，且白耗流量
           await _pausePageVideos();
           DownloadManager.instance.download(v);
-          _toast('已加入下载队列，进度见「资源库」');
+          // iOS 走原生后台传输（锁屏后系统继续下）；安卓/模拟器仍是前台 Dio 链
+          _toast(Platform.isIOS ? '已开始下载，锁屏后继续' : '已加入下载');
+          break;
+        case 'package':
+          // 自己下 .ts 分片包（产物可离线、可随时「本地转 MP4」），
+          // 与 case 'hls' 的系统 .movpkg 离线缓存是两条完全不同的链路
+          await _pausePageVideos();
+          ConvertManager.instance.downloadM3u8(v);
+          _toast('已开始下载分片包');
           break;
         case 'hls':
           await _pausePageVideos();
-          HlsManager.instance.start(url, title.isNotEmpty ? title : 'HLS视频');
-          _toast('已开始 HLS 离线下载，进度见「资源库」');
+          HlsManager.instance.start(url, title.isNotEmpty ? title : 'HLS视频',
+              referer: v.effectiveReferer);
+          _toast('已开始离线下载');
           break;
         case 'convert':
           await _pausePageVideos();
+          // iOS：分片交给系统后台进程，锁屏继续下，齐备后回 App 自动 -c copy 合成。
+          // 其它平台没有系统级后台传输，是前台下完直接出片。
           ConvertManager.instance.convert(v);
-          _toast('已开始 m3u8 → mp4 转换，进度见「资源库」');
+          _toast(Platform.isIOS
+              ? '已开始转 MP4，锁屏后继续下载'
+              : '已开始转换');
           break;
         case 'copy':
           Clipboard.setData(ClipboardData(text: url));
@@ -399,7 +702,7 @@ class BrowserPageState extends State<BrowserPage> {
     }
   }
 
-  /// 暂停页内所有 <video>/<audio>，并清掉页面设置的 Media Session：
+  /// 暂停页内所有 `<video>`/`<audio>`，并清掉页面设置的 Media Session：
   /// 一来避免下载/本地播放时页内继续出声、白耗流量，
   /// 二来避免浏览器/系统一直挂着「正在播放」的媒体通知（下载期间尤其明显）。
   Future<void> _pausePageVideos() async {
@@ -412,6 +715,195 @@ class BrowserPageState extends State<BrowserPage> {
     } catch (e, st) {
       AppLog.instance.warn('browser', '暂停页内播放失败', e, st);
     }
+  }
+
+  /// 页面左右滑动手势（browser_swipe.js）：右滑=后退、左滑=前进，
+  /// 与地址栏后退/前进按钮同语义。无历史时 goBack/goForward 由 WebView 自行忽略。
+  void _handleBrowserGesture(String raw) {
+    try {
+      final j = jsonDecode(raw) as Map<String, dynamic>;
+      if (j['action'] != 'swipe') return;
+      final dir = (j['direction'] as String?) ?? '';
+      final url = (j['url'] as String?) ?? _currentUrl;
+      switch (dir) {
+        case 'back':
+          AppLog.instance.info('browser', '手势右滑 → 后退（$url）');
+          _controller.goBack();
+        case 'forward':
+          AppLog.instance.info('browser', '手势左滑 → 前进（$url）');
+          _controller.goForward();
+      }
+    } catch (e) {
+      AppLog.instance
+          .warn('browser', '解析 browserGesture 消息失败: ${_truncate(raw)}', e);
+    }
+  }
+
+  /// 注销当前源的 ServiceWorker + 清空它的 CacheStorage（脚本自身返回 Promise）。
+  /// 「刷新也没用」有一半出在这里：站点 ServiceWorker 用 cache-first 把半截响应
+  /// 喂给每一个新文档，reload() 读的正是同一份缓存，永远修不好。
+  /// 同一份脚本两处用：iOS 交给原生 evaluateJavaScript（它会等这里返回的 Promise 落定，
+  /// 页内注销与清 CacheStorage 才算真的做完）；没有原生桥时（Android）直接 runJavaScript
+  /// 尽力而为。脚本按当前源生效，且自身不抛异常。
+  static const _serviceWorkerCleanupJs = r'''
+(function () {
+  var jobs = [];
+  try {
+    if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+      jobs.push(navigator.serviceWorker.getRegistrations().then(function (rs) {
+        return Promise.all((rs || []).map(function (r) {
+          try { return r.unregister(); } catch (e) { return null; }
+        }));
+      }));
+    }
+  } catch (e) {}
+  try {
+    if (window.caches && caches.keys) {
+      jobs.push(caches.keys().then(function (ks) {
+        return Promise.all((ks || []).map(function (k) {
+          try { return caches.delete(k); } catch (e) { return null; }
+        }));
+      }));
+    }
+  } catch (e) {}
+  return Promise.all(jobs).then(function () { return 1; }, function () { return 0; });
+})();
+''';
+
+  /// 「强制重置浏览器状态」菜单入口：先确认，免得误触把导航历史清掉
+  Future<void> _confirmForceReset() async {
+    if (_resetting) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        // 标题刻意与菜单项文案不同：让测试/无障碍能按文本唯一找到那一项
+        title: const Text('确定要强制重置浏览器状态？'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: const [
+            Text('适用于「页面加载一半就卡住、点刷新也没用」。依次做四件事：'),
+            SizedBox(height: 8),
+            Text('1. 停掉当前还在跑的加载'),
+            Text('2. 注销 ServiceWorker，清空它的 CacheStorage'),
+            Text('3. 清掉 HTTP 内存/磁盘缓存（登录 Cookie 与站点数据不动）'),
+            Text('4. 销毁并重建 WebView 实例，重新加载本页'),
+            SizedBox(height: 8),
+            Text('第 4 步是刷新做不到的：卡死的渲染进程只有重建才换得掉。'),
+            Text('代价：前进/后退历史清空（仍停在当前地址），页内播放中断。'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('立即重置'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) await _forceReset();
+  }
+
+  /// 强制重置浏览器状态。「加载一半卡住、刷新也没用」的三条成因，reload() 一条都治不了：
+  /// 1) 渲染进程假死 —— 只有销毁重建 WKWebView 才会换新进程；
+  /// 2) 坏缓存 / ServiceWorker 把半截响应喂给每个新文档 —— 要清 HTTP 缓存 + SW 注册；
+  /// 3) 旧请求还在占连接 —— 由原生 resetWebsiteData 先 stopLoading。
+  /// Cookie 与站点存储有意保留：一个自救按钮不该把已登录的站点全登出。
+  Future<void> _forceReset() async {
+    if (_resetting) return;
+    setState(() => _resetting = true);
+    final target = _currentUrl.isNotEmpty ? _currentUrl : _urlController.text.trim();
+    final reloadUri = target.isEmpty ? null : Uri.tryParse(target);
+    try {
+      final cleared = await _resetWebsiteData();
+      // 换控制器 == 换 WebView 实例：旧实例连同它的渲染进程、内存缓存、正在跑的页内
+      // 脚本一起销毁（新实例的 configuration 也拿不到旧实例那份 WKUserScript）
+      _handledRedirects.clear();
+      _frameDiags.clear();
+      _markerChain = null;
+      _watchdogSeq++; // 旧实例的检查序列作废（新实例起来后会重新排）
+      _watchdogTimer?.cancel();
+      setState(() {
+        _viewEpoch++;
+        _controller = _newController();
+      });
+      AppLog.instance.info('browser',
+          '强制重置浏览器状态：$target（清缓存=${cleared ? 'ok' : '未生效'}）');
+      _toast(cleared ? '已重建浏览器，正在重新加载' : '已重建浏览器实例（缓存清理未生效）');
+      // 等这一帧把旧 WebView 平台视图真正拆掉，再动新实例：早了的话原生按视图树找到的
+      // 还是旧实例，WKUserScript 会装进正在销毁的那个，新页面反而没角标
+      //（和 v0.3.5 修的「刷新后角标不出」同一个坑）。
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _earlySnifferInstalled = false;
+        _earlySnifferTries = 0;
+        _installEarlyScripts();
+        // 装脚本只是一次通道往返，给它 250ms，别让重置卡在白屏上。
+        // 真没装上也不影响正确性：onPageStarted/onPageFinished 的 runJavaScript 照样注入，
+        // 且 _installEarlyScripts 自身会重试，下一次导航起 WKUserScript 就位。
+        Timer(const Duration(milliseconds: 250), () {
+          if (!mounted) return;
+          final uri = reloadUri;
+          if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
+            _urlController.text = uri.toString();
+            _controller.loadRequest(uri);
+          }
+          // 进度条走到「新实例真的开始加载」为止，而不是 setState 一结束就灭
+          _endReset();
+        });
+      });
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '强制重置浏览器状态失败', e, st);
+      _toast('重置失败，详情见日志');
+      _endReset();
+    }
+  }
+
+  /// 结束重置态（进度条 + 菜单项禁用）
+  void _endReset() {
+    if (mounted && _resetting) setState(() => _resetting = false);
+  }
+
+  /// 限时跑一步重置：WebView 假死时这些调用可能永远不返回，
+  /// 卡在任何一步上都等于「重置按钮也没用」—— 超时/异常只记日志，继续往下走。
+  Future<void> _timebox(Future<void> Function() op, String step) async {
+    try {
+      await op().timeout(const Duration(milliseconds: 1500));
+    } catch (e) {
+      AppLog.instance.warn('browser', '重置：$step 未完成，跳过继续', e);
+    }
+  }
+
+  /// iOS：原生侧注销 ServiceWorker + 清 HTTP 缓存（保留 Cookie），返回是否清成功。
+  /// 非 iOS 无此桥接 → 只做页内注销，重建实例那一步照样有效。
+  ///
+  /// 「桥没成功」的形态不止一种：通道未注册抛 MissingPluginException、原生侧执行报错、
+  /// 假死导致超时、回包为空。这些都同一条兜底路 —— 页内自己注销。以前只认
+  /// MissingPluginException，于是 iOS 上一次桥失败就等于静默放弃了 ServiceWorker 清理，
+  /// 而它正是「刷新也治不好」那半条成因。
+  Future<bool> _resetWebsiteData() async {
+    String? status;
+    try {
+      // 回包是状态串（sw=页内注销结果 cache=清缓存），出问题时日志能分清哪步没成
+      status = await _sniffBridge
+          .invokeMethod<String>('resetWebsiteData', [_serviceWorkerCleanupJs])
+          .timeout(const Duration(seconds: 8));
+    } on TimeoutException {
+      AppLog.instance.warn('browser', '重置：原生清缓存超时，改走页内注销 + 重建 WebView');
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '重置：原生清网站数据不可用，改走页内注销', e, st);
+    }
+    if (status != null) {
+      AppLog.instance.info('browser', '重置：原生清网站数据 $status');
+      return true;
+    }
+    await _timebox(
+        () => _controller.runJavaScript(_serviceWorkerCleanupJs), '注销 ServiceWorker');
+    return false;
   }
 
   /// 跳转拦截：脚本发现「非用户点击」的自动跳转时回调。
@@ -500,6 +992,24 @@ class BrowserPageState extends State<BrowserPage> {
         .showSnackBar(SnackBar(content: Text(msg), duration: const Duration(seconds: 2)));
   }
 
+  /// 打开实时嗅探诊断面板（实现见文件底部 _SniffDiagSheet）。
+  /// 面板只读，不改开关、不触发下载；关掉即停止轮询。
+  void _showSniffDiagnostics() {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (ctx) => _SniffDiagSheet(
+        controller: _controller,
+        viewEpoch: _viewEpoch,
+        currentUrl: _currentUrl,
+        frameDiags: () => List<Map<String, dynamic>>.unmodifiable(_frameDiags),
+        appState: _diagAppState,
+        onRepair: _repairScripts,
+      ),
+    );
+  }
+
   /// 日志用：截断过长的原始消息
   static String _truncate(String s, [int max = 300]) =>
       s.length <= max ? s : '${s.substring(0, max)}…（共 ${s.length} 字符）';
@@ -555,6 +1065,17 @@ class BrowserPageState extends State<BrowserPage> {
                 AppData.instance
                     .setBlockAutoplay(!AppData.instance.blockAutoplayEnabled);
                 setState(() {});
+              } else if (v == 'playhijack') {
+                final on = !AppData.instance.playHijackEnabled;
+                AppData.instance.setPlayHijack(on);
+                setState(() {});
+                if (on) {
+                  _toast('点播放即接管：已开启');
+                }
+              } else if (v == 'forcereset') {
+                _confirmForceReset();
+              } else if (v == 'sniffdiag') {
+                _showSniffDiagnostics();
               }
             },
             itemBuilder: (ctx) => [
@@ -626,6 +1147,53 @@ class BrowserPageState extends State<BrowserPage> {
                   ],
                 ),
               ),
+              PopupMenuItem(
+                value: 'playhijack',
+                child: Row(
+                  children: [
+                    Icon(
+                      AppData.instance.playHijackEnabled
+                          ? Icons.check_box
+                          : Icons.check_box_outline_blank,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      AppData.instance.playHijackEnabled
+                          ? '点播放即接管：开'
+                          : '点播放即接管：关',
+                    ),
+                  ],
+                ),
+              ),
+              const PopupMenuDivider(),
+              // 不是开关，是一次性动作：页面加载一半卡住、刷新无效时用（见 _forceReset）
+              PopupMenuItem(
+                value: 'forcereset',
+                enabled: !_resetting,
+                child: Row(
+                  children: [
+                    Icon(
+                      _resetting ? Icons.hourglass_top : Icons.autorenew,
+                      size: 18,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(_resetting ? '正在重置…' : '强制重置浏览器状态'),
+                  ],
+                ),
+              ),
+              const PopupMenuDivider(),
+              // 只读面板：随时看当前页的嗅探/标记现场，不影响任何开关
+              PopupMenuItem(
+                value: 'sniffdiag',
+                child: Row(
+                  children: const [
+                    Icon(Icons.bug_report_outlined, size: 18),
+                    SizedBox(width: 8),
+                    Text('嗅探诊断（当前页）'),
+                  ],
+                ),
+              ),
             ],
           ),
           IconButton(
@@ -676,8 +1244,16 @@ class BrowserPageState extends State<BrowserPage> {
               ],
             ),
           ),
+          // 重置要清缓存 + 重建实例，耗时可见（避免看起来「点了没反应」）
+          if (_resetting) const LinearProgressIndicator(minHeight: 2),
           // 页内角标（video_marker.js）是唯一的视频入口，不再额外挂底部列表
-          Expanded(child: WebViewWidget(controller: _controller)),
+          // key：强制重置时靠换 key 让 Flutter 拆掉旧 WebView 平台视图，换新实例
+          Expanded(
+            child: WebViewWidget(
+              key: ValueKey(_viewEpoch),
+              controller: _controller,
+            ),
+          ),
         ],
       ),
     );
@@ -837,3 +1413,960 @@ class BrowserPageState extends State<BrowserPage> {
     );
   }
 }
+
+/// 实时嗅探诊断面板。
+///
+/// 用户报「视频在播，角标有时出有时不出」时，不必连电脑抓包：
+///   ① 脚本层：嗅探/标记是否装进**当前文档**（installed / via / epoch / readyState）
+///   ② 采集层：fetch/XHR 钩子是否还在、各采集通道计数、候选池状态分布
+///   ③ 展示层：每个 `<video>` 有没有角标；没有时是「小窗跳过 / 被隐藏 / 被遮挡」哪一种
+/// 面板每秒从主框架取一次快照；跨域 iframe 的快照由各帧自己的 markerDiag 上报补齐。
+class _SniffDiagSheet extends StatefulWidget {
+  const _SniffDiagSheet({
+    required this.controller,
+    required this.viewEpoch,
+    required this.currentUrl,
+    required this.frameDiags,
+    required this.appState,
+    required this.onRepair,
+  });
+
+  final WebViewController controller;
+  final int viewEpoch;
+  final String currentUrl;
+  final List<Map<String, dynamic>> Function() frameDiags;
+
+  /// App 侧注入状态（早期注入是否成功、上一次 Dart 注入的时间/错误）。
+  /// 页内快照全空时，只有这些字段能区分「脚本没装」「脚本装错 WebView」「页面还没加载完」。
+  final Map<String, dynamic> Function() appState;
+
+  /// 手动补注入：面板发现当前文档缺脚本时由用户触发，成功后重新拉快照。
+  final Future<void> Function() onRepair;
+
+  @override
+  State<_SniffDiagSheet> createState() => _SniffDiagSheetState();
+}
+
+class _SniffDiagSheetState extends State<_SniffDiagSheet> {
+  /// 取主框架快照。安全包一层：任何一段脚本没装，都返回 null/error 而不是抛异常，
+  /// 面板仍能把「哪一段没装」显示出来。
+  static const String _diagJs = r'''
+(function () {
+  function safe(fn) { try { return fn(); } catch (e) { return { error: String(e) }; } }
+  return JSON.stringify({
+    flags: {
+      sniffInstalled: !!window.__vdlSniffInstalled,
+      markerInstalled: !!window.__vdlMarkerInstalled,
+      markEnabled: (window.__vdlMarkEnabled === false) ? false
+        : (window.__vdlMarkEnabled === true ? true : null),
+      sniffVia: window.__vdlSniffVia || '',
+      markVia: window.__vdlMarkVia || '',
+      sniffVersion: window.__vdlSniffVersion || '',
+      markerVersion: window.__vdlMarkerVersion || '',
+      viewEpoch: (window.__vdlViewEpoch === undefined ? null : window.__vdlViewEpoch),
+      readyState: document.readyState,
+      href: location.href
+    },
+    sniff: (window.__vdlSniff && window.__vdlSniff.diag)
+      ? safe(function () { return window.__vdlSniff.diag(); }) : null,
+    marker: window.__vdlMarkerDiag
+      ? safe(function () { return window.__vdlMarkerDiag(); }) : null,
+    // 页内脚本全没装时，至少要知道「当前文档是不是用户看的那一页」：
+    // videos>0 说明页面对了、只是脚本没进来；全 0 说明读到的是旧/空白文档。
+    page: safe(function () { return {
+      videos: document.querySelectorAll('video').length,
+      iframes: document.querySelectorAll('iframe').length,
+      body: !!document.body,
+      title: String(document.title || '').slice(0, 120),
+      visibility: document.visibilityState || '',
+      isTop: window === window.top
+    }; })
+  });
+})()
+''';
+
+  Map<String, dynamic>? _snap;
+  String? _error;
+  DateTime? _at;
+  Timer? _timer;
+  bool _busy = false;
+  bool _repairing = false;
+
+  /// WebView 自己认为的当前地址（与 _currentUrl 可能不同：后者来自导航回调）。
+  /// 页内 location.href 跟它对不上，才是「读到旧文档」的硬证据。
+  String? _nativeUrl;
+
+  /// 缺脚本日志的节流时间（面板每秒刷新，不能每秒刷一条 WARN）。
+  DateTime? _lastMissingLogAt;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) => _refresh());
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _refresh() async {
+    // 页面假死时 runJavaScript 可能迟迟不回；上一轮没回来就跳过这一拍，避免堆积
+    if (_busy) return;
+    _busy = true;
+    try {
+      final raw = await widget.controller
+          .runJavaScriptReturningResult(_diagJs)
+          .timeout(const Duration(seconds: 3));
+      final map = _asDiagMapOrNull(raw);
+      String? native;
+      try {
+        native = await widget.controller
+            .currentUrl()
+            .timeout(const Duration(milliseconds: 800));
+      } catch (_) {}
+      if (!mounted) return;
+      setState(() {
+        _snap = map;
+        _nativeUrl = native;
+        _error = map == null ? '页面没有返回可解析的诊断数据' : null;
+        _at = DateTime.now();
+      });
+      // 面板打开期间发现「当前文档缺脚本」就留一条证据（20s 内不重复），
+      // 用户直接关掉面板也能在系统日志里回看当时的状态。
+      if (map != null) {
+        final f = _asDiagMap(map['flags']);
+        final p = _asDiagMap(map['page']);
+        final missing = f['sniffInstalled'] != true ||
+            (f['markerInstalled'] != true && f['markEnabled'] != false);
+        final last = _lastMissingLogAt;
+        if (missing &&
+            (last == null ||
+                DateTime.now().difference(last) > const Duration(seconds: 20))) {
+          _lastMissingLogAt = DateTime.now();
+          AppLog.instance.warn(
+            'browser',
+            '诊断面板：当前文档缺脚本 sniff=${f['sniffInstalled']} '
+                'marker=${f['markerInstalled']} enabled=${f['markEnabled']} '
+                'readyState=${f['readyState']} 页内视频=${p['videos']} '
+                'iframe=${p['iframes']} 标题=${p['title']} '
+                'href=${f['href']} webview=${_nativeUrl ?? '?'}',
+          );
+        }
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$e';
+        _at = DateTime.now();
+      });
+    } finally {
+      _busy = false;
+    }
+  }
+
+  /// 快照里没有脚本时，由用户点一下：补注入 → 等页面执行 → 重新拉快照。
+  Future<void> _repair() async {
+    if (_repairing) return;
+    setState(() => _repairing = true);
+    try {
+      await widget.onRepair();
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      await _refresh();
+      if (!mounted) return;
+      final flags = _asDiagMap(_snap?['flags']);
+      final fixed = flags['sniffInstalled'] == true &&
+          (flags['markerInstalled'] == true || flags['markEnabled'] == false);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(fixed
+            ? '已补注入：当前文档的脚本就位'
+            : '补注入已发出，但当前文档仍读不到脚本（详见下方与系统日志）'),
+        duration: const Duration(seconds: 3),
+      ));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('补注入失败：$e')),
+      );
+    } finally {
+      if (mounted) setState(() => _repairing = false);
+    }
+  }
+
+  String _reportText() {
+    final b = StringBuffer();
+    b.writeln('视频下载器 · 嗅探诊断');
+    b.writeln('采集时间：${_at?.toIso8601String() ?? '（未采集）'}');
+    b.writeln('当前页：${widget.currentUrl}');
+    b.writeln('WebView.currentUrl()：${_nativeUrl ?? '（未读到）'}');
+    b.writeln('WebView 代次：${widget.viewEpoch}');
+    if (_error != null) b.writeln('读取错误：$_error');
+    b.writeln();
+    b.writeln('=== App 侧注入状态 ===');
+    b.writeln(const JsonEncoder.withIndent('  ').convert(widget.appState()));
+    b.writeln();
+    b.writeln('=== 主框架快照 ===');
+    b.writeln(const JsonEncoder.withIndent('  ').convert(_snap ?? <String, dynamic>{}));
+    final frames = widget.frameDiags();
+    b.writeln();
+    b.writeln('=== 各帧上报（${frames.length} 条，旧→新）===');
+    for (final f in frames) {
+      b.writeln(const JsonEncoder.withIndent('  ').convert(f));
+    }
+    return b.toString();
+  }
+
+  Future<void> _copy() async {
+    final text = _reportText();
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已复制诊断报告（${text.length} 字符）')),
+    );
+  }
+
+  void _writeLog() {
+    final full = _reportText();
+    final text = full.length > 30000
+        ? '${full.substring(0, 30000)}\n…（已截断）'
+        : full;
+    AppLog.instance.info('browser', '嗅探诊断报告（${widget.currentUrl}）\n$text');
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已写入系统日志，可在设置 → 系统日志查看/导出')),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final maxH = MediaQuery.of(context).size.height * 0.88;
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: maxH),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _header(context),
+            if (_error != null) _errorBanner(context),
+            Flexible(child: _body(context)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _header(BuildContext context) {
+    final at = _at == null ? '等待采集…' : '更新于 ${_diagHms(_at!)} · 每秒自动刷新';
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 8, 4),
+      child: Row(
+        children: [
+          const Icon(Icons.bug_report_outlined, size: 20),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('嗅探诊断', style: Theme.of(context).textTheme.titleMedium),
+                Text(at, style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: '立即刷新',
+            icon: const Icon(Icons.refresh),
+            onPressed: _refresh,
+          ),
+          IconButton(
+            tooltip: '复制报告',
+            icon: const Icon(Icons.copy_all),
+            onPressed: _copy,
+          ),
+          IconButton(
+            tooltip: '写入系统日志',
+            icon: const Icon(Icons.save_alt),
+            onPressed: _writeLog,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _errorBanner(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      color: const Color(0xFFFEF3C7),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Text(
+        '读取失败：$_error',
+        style: const TextStyle(fontSize: 11, color: Color(0xFF92400E)),
+      ),
+    );
+  }
+
+  Widget _body(BuildContext context) {
+    final snap = _snap;
+    if (snap == null) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text('正在读取页面脚本状态…'),
+        ),
+      );
+    }
+    final flags = _asDiagMap(snap['flags']);
+    final sniff = _asDiagMap(snap['sniff']);
+    final marker = _asDiagMap(snap['marker']);
+    final page = _asDiagMap(snap['page']);
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+      children: [
+        _missingScriptBanner(flags, page),
+        _section(context, '脚本与钩子', _flagSection(context, flags, sniff)),
+        _section(context, '采集计数', _statsSection(context, sniff)),
+        _section(context, '视频 / 角标', _markerSection(context, marker)),
+        _section(context, '候选地址（按分数）', _candidatesSection(context, sniff)),
+        _section(context, '每个 <video> 的状态', _itemsSection(context, marker)),
+        _section(context, '时间线（新 → 旧）', _timelineSection(context, sniff, marker)),
+        _section(context, '各帧上报（跨域 iframe 靠这里）', _framesSection(context)),
+        _section(context, '怎么看这张表', _legendSection(context)),
+      ],
+    );
+  }
+
+  Widget _section(BuildContext context, String title, Widget child) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: Theme.of(context).textTheme.titleSmall),
+          const SizedBox(height: 6),
+          child,
+        ],
+      ),
+    );
+  }
+
+  /// 页内一段脚本都没有时的「定位 + 自救」横幅。
+  /// 旧面板在这里只能看到 flags 全空，分不清是没注入、注入到旧文档、还是页面没加载完；
+  /// 现在把 App 侧的注入状态并排摆出来，并给一个明确的补注入入口。
+  Widget _missingScriptBanner(
+    Map<String, dynamic> flags,
+    Map<String, dynamic> page,
+  ) {
+    final markEnabled = flags['markEnabled'];
+    final missSniff = flags['sniffInstalled'] != true;
+    // 标记开关关着时脚本主动退出，不算「没注入」
+    final missMarker = flags['markerInstalled'] != true && markEnabled != false;
+    if (!missSniff && !missMarker) return const SizedBox.shrink();
+
+    final app = widget.appState();
+    final early = app['earlyInstalled'] == true;
+    final channelMissing = app['earlyChannelMissing'] == true;
+    final tries = _asDiagInt(app['earlyTries']);
+    final ready = '${flags['readyState'] ?? '?'}';
+    final loading = ready == 'loading' || ready == 'interactive';
+    final href = '${flags['href'] ?? ''}';
+    final address = _nativeUrl ?? widget.currentUrl;
+    final urlDiff = href.isNotEmpty && address.isNotEmpty && href != address;
+    final lastSniffAt = DateTime.tryParse('${app['lastSniffAt'] ?? ''}');
+    final lastMarkerAt = DateTime.tryParse('${app['lastMarkerAt'] ?? ''}');
+    final missing = <String>[
+      if (missSniff) '嗅探',
+      if (missMarker) '标记',
+    ].join(' + ');
+
+    return Container(
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFEF2F2),
+        border: Border.all(color: const Color(0xFFFCA5A5)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '当前文档没有装$missing脚本',
+            style: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: Color(0xFF991B1B),
+            ),
+          ),
+          const SizedBox(height: 4),
+          if (loading)
+            Text(
+              '页面还在加载（readyState=$ready），onPageFinished 的兜底注入尚未执行 —— '
+              '这类页面常常因为长连接/广告帧一直停在 interactive。',
+              style: const TextStyle(fontSize: 12, height: 1.35),
+            )
+          else
+            const Text(
+              '页面已加载完仍读不到脚本：导航回调的注入很可能打在了正在卸载的旧文档上。',
+              style: TextStyle(fontSize: 12, height: 1.35),
+            ),
+          if (!early && !channelMissing)
+            Text(
+              '早期注入未成功（第 $tries 次尝试）；WebView 刚创建时平台视图可能还没就绪。',
+              style: const TextStyle(fontSize: 12, height: 1.35),
+            ),
+          if (channelMissing)
+            const Text(
+              '无早期注入通道（Android 正常，全部走 Dart 注入）。',
+              style: TextStyle(fontSize: 12, height: 1.35),
+            ),
+          if (urlDiff)
+            Text(
+              '页内地址：$href\n'
+              '页内标题：${page['title'] ?? ''}\n'
+              'WebView 地址：$address\n'
+              '两者不一致，读到的可能不是当前页面。',
+              style: const TextStyle(fontSize: 11.5, height: 1.35),
+            ),
+          const SizedBox(height: 4),
+          Text(
+            '页面本身：<video> ${_asDiagInt(page['videos'])} 个 · '
+            'iframe ${_asDiagInt(page['iframes'])} 个 · '
+            'body ${page['body'] == true ? '已创建' : '未创建'}'
+            '${page['isTop'] == false ? ' · 不是主框架' : ''}'
+            ' —— 视频数大于 0 说明页面对了，只是脚本没进来。',
+            style: const TextStyle(fontSize: 11.5, height: 1.35),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 10,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              FilledButton.tonalIcon(
+                onPressed: _repairing ? null : _repair,
+                icon: _repairing
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.build_circle_outlined, size: 18),
+                label: Text(_repairing ? '正在补注入…' : '立即补注入'),
+              ),
+              Text(
+                'App 侧：早期注入${early ? '成功' : (channelMissing ? '通道不可用' : '未成功')}'
+                ' · 代次 ${widget.viewEpoch}'
+                '${lastSniffAt == null ? '' : ' · Dart 嗅探 ${_diagHms(lastSniffAt)}'}'
+                '${lastMarkerAt == null ? '' : ' · Dart 标记 ${_diagHms(lastMarkerAt)}'}',
+                style: const TextStyle(fontSize: 11, color: Color(0xFF64748B)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _flagSection(
+    BuildContext context,
+    Map<String, dynamic> flags,
+    Map<String, dynamic> sniff,
+  ) {
+    final chips = <Widget>[];
+    final sniffInstalled = flags['sniffInstalled'] == true;
+    final markerInstalled = flags['markerInstalled'] == true;
+    final enabled = flags['markEnabled'];
+    final epoch = _asDiagIntOrNull(flags['viewEpoch']);
+
+    chips.add(_tag(context, sniffInstalled ? '嗅探脚本已装' : '嗅探脚本未装',
+        ok: sniffInstalled, bad: !sniffInstalled));
+    chips.add(_tag(context, markerInstalled ? '标记脚本已装' : '标记脚本未装',
+        ok: markerInstalled, bad: !markerInstalled));
+    if (enabled == false) {
+      chips.add(_tag(context, '标记开关：关', bad: true));
+    } else if (enabled == true) {
+      chips.add(_tag(context, '标记开关：开', ok: true));
+    } else {
+      chips.add(_tag(context, '标记开关：未读到'));
+    }
+    if (epoch == null) {
+      chips.add(_tag(context, 'WebView 代次：未读到'));
+    } else if (epoch != widget.viewEpoch) {
+      chips.add(_tag(context, '代次不一致 $epoch≠${widget.viewEpoch}', bad: true));
+    } else {
+      chips.add(_tag(context, '代次一致 $epoch', ok: true));
+    }
+    final flagsVia = '${flags['sniffVia'] ?? ''}';
+    final via = sniff.isNotEmpty ? '${sniff['via'] ?? ''}' : flagsVia;
+    final lastVia = sniff.isNotEmpty ? '${sniff['lastVia'] ?? ''}' : '';
+    final markVia = '${flags['markVia'] ?? ''}';
+    final app = widget.appState();
+    final early = app['earlyInstalled'] == true;
+    final channelMissing = app['earlyChannelMissing'] == true;
+    chips.add(_tag(
+      context,
+      early
+          ? '早期注入：成功'
+          : (channelMissing ? '早期注入：通道不可用' : '早期注入：未成功'),
+      ok: early,
+      bad: !early && !channelMissing,
+    ));
+    chips.add(_tag(context, '嗅探注入 ${via.isEmpty ? '未知' : via}'));
+    // 安装来源与最近一次补注入不同（典型：early 装上了，Dart 兜底又补了一次）——
+    // 这说明注入链路本身没问题，不用再怀疑「脚本没装」。
+    if (lastVia.isNotEmpty && lastVia != via) {
+      chips.add(_tag(context, '最近补注入 $lastVia'));
+    }
+    chips.add(_tag(context, '标记注入 ${markVia.isEmpty ? '未知' : markVia}'));
+    chips.add(_tag(context, '文档 ${flags['readyState'] ?? '?'}'));
+    // 导航竞态的一条硬证据：脚本读到的 location 和 WebView 地址不是同一个文档
+    //（onPageStarted 的 runJavaScript 可能打在正在卸载的旧文档上）。
+    final jsHref = '${flags['href'] ?? ''}';
+    final addr = _nativeUrl ?? widget.currentUrl;
+    if (jsHref.isNotEmpty &&
+        addr.isNotEmpty &&
+        jsHref != addr) {
+      chips.add(_tag(context, '脚本文档≠WebView 地址（可能打在旧文档）'));
+    }
+    if (sniff.isNotEmpty) {
+      final fetchHooked = sniff['fetchHooked'] == true;
+      final xhrHooked = sniff['xhrHooked'] == true;
+      chips.add(_tag(context, 'fetch 钩子${fetchHooked ? '在' : '丢'}',
+          ok: fetchHooked, bad: !fetchHooked));
+      chips.add(_tag(context, 'XHR 钩子${xhrHooked ? '在' : '丢'}',
+          ok: xhrHooked, bad: !xhrHooked));
+      chips.add(_tag(context, '脚本注入 ${_asDiagInt(sniff['injects'])} 次'));
+    }
+    return Wrap(spacing: 6, runSpacing: 6, children: chips);
+  }
+
+  Widget _statsSection(BuildContext context, Map<String, dynamic> sniff) {
+    if (sniff.isEmpty) {
+      return const Text('嗅探脚本没有执行，采集计数不可用。');
+    }
+    final stats = _asDiagMap(sniff['stats']);
+    final hook = _asDiagMap(sniff['hook']);
+    final hookReady = '${hook['readyState'] ?? '?'}';
+    // loading = 页面还在解析，钩子装得够早；complete/interactive = 页面脚本已跑过，
+    // 站点若缓存了原生 fetch / XHR.open，后续请求会全部绕过嗅探。
+    final late = hookReady == 'complete' || hookReady == 'interactive';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: [
+            _tag(context, 'DOM 扫描 ${_asDiagInt(stats['collect'])}'),
+            _tag(context, '属性扫描 ${_asDiagInt(stats['attr'])}'),
+            _tag(context, '资源时间线 ${_asDiagInt(stats['perf'])}'),
+            _tag(context, '脚本解析 ${_asDiagInt(stats['script'])}'),
+            _tag(context, 'fetch ${_asDiagInt(stats['fetch'])}'),
+            _tag(context, 'XHR ${_asDiagInt(stats['xhr'])}'),
+            _tag(context, '播放锚定 ${_asDiagInt(stats['anchor'])}'),
+            _tag(context, '主动探测 ${_asDiagInt(stats['probe'])}'),
+            _tag(context, '点击 ${_asDiagInt(stats['click'])}'),
+          ],
+        ),
+        if (hook.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(
+              '挂钩时机：$hookReady · via=${hook['via'] ?? '?'}'
+              '${late ? ' —— 晚于页面脚本；站点若缓存过原生 fetch/XHR，后续请求抓不到' : ''}',
+              style: TextStyle(
+                fontSize: 12,
+                height: 1.35,
+                color: late ? const Color(0xFFB45309) : null,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _markerSection(BuildContext context, Map<String, dynamic> marker) {
+    if (marker.isEmpty) {
+      return const Text('标记脚本没有提供诊断（可能未注入）。');
+    }
+    final videos = _asDiagInt(marker['videos']);
+    final marked = _asDiagInt(marker['marked']);
+    final shown = _asDiagInt(marker['shown']);
+    final playing = _asDiagInt(marker['playing']);
+    final big = _asDiagInt(marker['big']);
+    final frames = _asDiagInt(marker['frames']);
+    final items = _asDiagMapList(marker['items']);
+
+    String verdict;
+    Color? color;
+    if (marker['enabled'] == false) {
+      verdict = '标记开关处于关闭状态 —— 脚本会主动退出，不是没注入';
+      color = const Color(0xFFB91C1C);
+    } else if (marker['installed'] != true) {
+      verdict = '标记脚本未安装 —— 角标逻辑根本没启动';
+      color = const Color(0xFFB91C1C);
+    } else if (videos == 0 && frames > 0) {
+      verdict = '主框架没有 <video>，视频可能在 iframe 里 —— 看「各帧上报」';
+      color = const Color(0xFFB45309);
+    } else if (videos > 0 && playing > 0 && big > 0 && marked == 0) {
+      verdict = '主播放器在播，但一个角标都没建 —— 看下面每个 video 的 state';
+      color = const Color(0xFFB91C1C);
+    } else if (marked > 0 && shown == 0) {
+      final reasons = items.map((e) => '${e['state']}').join('、');
+      verdict = '角标建了但全部不可见（$reasons）';
+      color = const Color(0xFFB91C1C);
+    } else if (shown > 0) {
+      verdict = '角标可见';
+      color = const Color(0xFF166534);
+    } else {
+      verdict = '暂时没有可标记的视频';
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          verdict,
+          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: color),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '视频 $videos（DOM ${_asDiagInt(marker['domVideos'])} · '
+          'shadow ${_asDiagInt(marker['shadowRoots'])} · 帧 $frames） · '
+          '播放中 $playing · 大播放器 $big',
+        ),
+        Text(
+          '角标 $marked · 可见 $shown · 隐藏 ${_asDiagInt(marker['hidden'])} · '
+          '被遮挡 ${_asDiagInt(marker['covered'])}',
+        ),
+        Text(
+          'update ${_asDiagInt(marker['ticks'])} 次 · 最后 ${_ageText(marker['lastUpdateAt'])} · '
+          '注入 ${_asDiagInt(marker['injects'])} 次',
+        ),
+      ],
+    );
+  }
+
+  Widget _candidatesSection(BuildContext context, Map<String, dynamic> sniff) {
+    if (sniff.isEmpty) {
+      return const Text('没有嗅探脚本快照。');
+    }
+    final counts = _asDiagMap(sniff['counts']);
+    final cands = _asDiagMapList(sniff['cands']);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          '共 ${_asDiagInt(counts['all'])} 条 · ok ${_asDiagInt(counts['ok'])} · '
+          'dead ${_asDiagInt(counts['dead'])} · 未验证 ${_asDiagInt(counts['guess'])} · '
+          '播放锚定 ${_asDiagInt(counts['play'])}',
+        ),
+        const SizedBox(height: 6),
+        if (cands.isEmpty)
+          const Text('候选池为空 —— 页面没有发出可识别的视频请求，也没有可扫描的地址。'),
+        for (final c in cands.take(12)) _candidateRow(context, c),
+        if (cands.length > 12) const Text('…仅显示前 12 条，完整列表在「复制报告」里'),
+      ],
+    );
+  }
+
+  Widget _candidateRow(BuildContext context, Map<String, dynamic> c) {
+    final st = '${c['st'] ?? ''}';
+    final mark = st == 'ok' ? '✓' : (st == 'dead' ? '✗' : '?');
+    final color = st == 'ok'
+        ? const Color(0xFF16A34A)
+        : (st == 'dead' ? const Color(0xFFDC2626) : const Color(0xFF64748B));
+    final kind = '${c['k'] ?? ''}'.toUpperCase();
+    final code = _asDiagInt(c['code']);
+    final extras = <String>[
+      '${c['sc'] ?? 0} 分',
+      '${c['src'] ?? ''}',
+      '${c['age'] ?? 0}s 前',
+      if (code > 0) 'HTTP $code',
+      if (c['play'] == 1) '播放锚定',
+      if (c['expired'] == true) '已过期',
+      if (c['soon'] == true) '快过期',
+    ].where((s) => s.isNotEmpty).join(' · ');
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(mark, style: TextStyle(fontWeight: FontWeight.bold, color: color)),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('$kind · $extras', style: const TextStyle(fontSize: 12)),
+                Text(
+                  '${c['u'] ?? ''}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 10.5,
+                    color: Color(0xFF64748B),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _itemsSection(BuildContext context, Map<String, dynamic> marker) {
+    final items = _asDiagMapList(marker['items']);
+    if (items.isEmpty) {
+      return const Text('没有收集到 <video>（可能还没创建，或只在跨域 iframe 里）。');
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [for (final it in items) _itemRow(context, it)],
+    );
+  }
+
+  Widget _itemRow(BuildContext context, Map<String, dynamic> it) {
+    final state = '${it['state'] ?? ''}';
+    final color = state == 'badged'
+        ? const Color(0xFF16A34A)
+        : (state.startsWith('skipped') || state.startsWith('hidden')
+            ? const Color(0xFFB45309)
+            : (state == 'ignored'
+                ? const Color(0xFF64748B)
+                : const Color(0xFFB91C1C)));
+    final rect = _asDiagMap(it['rect']);
+    final rectText = rect.isEmpty
+        ? 'rect=?'
+        : '${rect['w']}×${rect['h']} @ ${rect['x']},${rect['y']}';
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '$state · ${it['kind']}',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: color),
+          ),
+          Text(
+            '角标=${it['badge']} 可见=${it['shown']} 在视口=${it['onscreen']} '
+            '被挡=${it['covered']} 播放中=${it['playing']} '
+            'srcObject=${it['srcObject']} $rectText',
+            style: const TextStyle(fontSize: 11, height: 1.3),
+          ),
+          if ('${it['src'] ?? ''}'.isNotEmpty)
+            Text(
+              '${it['src']}',
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 10.5,
+                color: Color(0xFF64748B),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _timelineSection(
+    BuildContext context,
+    Map<String, dynamic> sniff,
+    Map<String, dynamic> marker,
+  ) {
+    final events = <Map<String, dynamic>>[];
+    for (final e in _asDiagMapList(sniff['events'])) {
+      events.add(<String, dynamic>{...e, '_side': '嗅探'});
+    }
+    for (final e in _asDiagMapList(marker['events'])) {
+      events.add(<String, dynamic>{...e, '_side': '标记'});
+    }
+    if (events.isEmpty) return const Text('暂无事件。');
+    events.sort((a, b) => _asDiagInt(b['t']).compareTo(_asDiagInt(a['t'])));
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [for (final e in events.take(30)) _eventRow(context, e)],
+    );
+  }
+
+  Widget _eventRow(BuildContext context, Map<String, dynamic> e) {
+    final t = _asDiagInt(e['t']);
+    final time = t > 0 ? _diagHms(DateTime.fromMillisecondsSinceEpoch(t)) : '--:--:--';
+    final ev = '${e['ev'] ?? ''}';
+    final color = ev == 'dead'
+        ? const Color(0xFFDC2626)
+        : (ev == 'ok' || ev == 'play' || ev == 'show' || ev == 'badge+'
+            ? const Color(0xFF16A34A)
+            : (ev == 'hide' || ev == 'skip' || ev == 'ignored'
+                ? const Color(0xFFB45309)
+                : null));
+    final parts = <String>[
+      '${e['_side'] ?? ''}',
+      ev,
+      if ('${e['x'] ?? ''}'.isNotEmpty) '${e['x']}',
+      if ('${e['k'] ?? ''}'.isNotEmpty) '${e['k']}',
+      if ('${e['st'] ?? ''}'.isNotEmpty) '${e['st']}',
+      if (_asDiagInt(e['sc']) > 0) '${e['sc']}分',
+      if ('${e['u'] ?? ''}'.isNotEmpty) '${e['u']}',
+    ];
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Text(
+        '$time  ${parts.join(' · ')}',
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(fontFamily: 'monospace', fontSize: 10.5, color: color),
+      ),
+    );
+  }
+
+  Widget _framesSection(BuildContext context) {
+    final frames = widget.frameDiags();
+    if (frames.isEmpty) {
+      return const Text('尚未收到子帧上报（页面加载 2.5s 后 / 首次起播时各报一次）。');
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (final d in frames.reversed.take(8)) _frameRow(context, d),
+      ],
+    );
+  }
+
+  Widget _frameRow(BuildContext context, Map<String, dynamic> d) {
+    final at = DateTime.tryParse('${d['_at'] ?? ''}');
+    final time = at == null ? '--:--:--' : _diagHms(at.toLocal());
+    final bad = _asDiagInt(d['playing']) > 0 &&
+        _asDiagInt(d['badged']) == 0 &&
+        _asDiagInt(d['big']) > 0;
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '$time · ${d['frame'] ?? '?'} · ${d['tag'] ?? ''} · '
+            '视频 ${d['videos'] ?? '?'} · 角标 ${d['badged'] ?? '?'}/${d['shown'] ?? '?'} · '
+            '候选 ${d['cands'] ?? '?'}',
+            style: TextStyle(
+              fontSize: 11.5,
+              fontWeight: FontWeight.w600,
+              color: bad ? const Color(0xFFB91C1C) : null,
+            ),
+          ),
+          Text(
+            '状态 ${d['items'] ?? ''} · via ${d['via'] ?? '?'} · '
+            'epoch ${d['epoch'] ?? '?'} · ${d['href'] ?? ''}',
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 10.5, color: Color(0xFF64748B)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _legendSection(BuildContext context) {
+    const lines = <String>[
+      'badged：角标已建且在视口内。',
+      'hidden:rect-null / zero-size / offscreen：角标建了但坐标算不出 / 尺寸为 0 / 移出视口。',
+      'skipped:no-src-small：没有地址且小于 240×135，按规则不挂角标（不是 bug）。',
+      'unbadged：本该出角标却没建，下一秒自愈逻辑会再试。',
+      '候选 ok=拿到 2xx/内容证据，dead=确认失效，guess=还没被请求验证。',
+      '挂钩时=complete/interactive：嗅探脚本晚于页面脚本，站点缓存过原生 fetch/XHR 时会抓不到请求。',
+      '顶部红框=当前文档一段脚本都没有：先看 readyState 与「页面本身」的 video 数，'
+          '再点「立即补注入」；补完仍为空说明读到的不是当前页/页面拒绝脚本。',
+      '脚本自愈=每次导航后按 0.4/1.2/2.6/5/9/15/25 秒各查一次，缺脚本就自动补，系统日志里记 WARN。',
+    ];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (final l in lines)
+          Padding(
+            padding: const EdgeInsets.only(top: 3),
+            child: Text('· $l', style: const TextStyle(fontSize: 11, height: 1.35)),
+          ),
+      ],
+    );
+  }
+
+  Widget _tag(BuildContext context, String text, {bool ok = false, bool bad = false}) {
+    final bg = bad
+        ? const Color(0xFFFEE2E2)
+        : (ok ? const Color(0xFFDCFCE7) : const Color(0xFFF1F5F9));
+    final fg = bad
+        ? const Color(0xFF991B1B)
+        : (ok ? const Color(0xFF166534) : const Color(0xFF334155));
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(text, style: TextStyle(fontSize: 11, color: fg)),
+    );
+  }
+}
+
+Map<String, dynamic>? _asDiagMapOrNull(dynamic raw) {
+  dynamic v = raw;
+  try {
+    if (v is String) {
+      if (v.trim().isEmpty) return null;
+      v = jsonDecode(v);
+      // 个别平台会把「返回字符串」再编码一层，解两次以兼容
+      if (v is String) v = jsonDecode(v);
+    }
+  } catch (_) {
+    return null;
+  }
+  if (v is Map<String, dynamic>) return v;
+  if (v is Map) return v.map((k, val) => MapEntry('$k', val));
+  return null;
+}
+
+Map<String, dynamic> _asDiagMap(dynamic v) {
+  if (v is Map<String, dynamic>) return v;
+  if (v is Map) return v.map((k, val) => MapEntry('$k', val));
+  return const <String, dynamic>{};
+}
+
+List<Map<String, dynamic>> _asDiagMapList(dynamic v) {
+  if (v is List) {
+    return v
+        .whereType<Map>()
+        .map((e) => e.map((k, val) => MapEntry('$k', val)))
+        .toList();
+  }
+  return const <Map<String, dynamic>>[];
+}
+
+int _asDiagInt(dynamic v, [int fallback = 0]) {
+  if (v is num) return v.toInt();
+  return int.tryParse('$v') ?? fallback;
+}
+
+int? _asDiagIntOrNull(dynamic v) {
+  if (v is num) return v.toInt();
+  return int.tryParse('$v');
+}
+
+String _diagHms(DateTime t) {
+  final l = t.toLocal();
+  String p(int n) => n.toString().padLeft(2, '0');
+  return '${p(l.hour)}:${p(l.minute)}:${p(l.second)}';
+}
+
+String _ageText(dynamic t) {
+  final ms = _asDiagInt(t);
+  if (ms <= 0) return '?';
+  final s = ((DateTime.now().millisecondsSinceEpoch - ms) / 1000).round();
+  if (s < 0) return '?';
+  return '${s}s';
+}
+

@@ -97,6 +97,17 @@ class SettingsPage extends StatelessWidget {
                   onChanged: (v) => data.setBlockAutoplay(v),
                 ),
               ),
+              _section(
+                context,
+                '点播放即接管',
+                '网页里点播放器时，把拿到的视频直链交给 App 播放器播放（可边播边缓存、无页面广告、后台播放）。'
+                '只对能拿到 http 直链的播放器生效；blob:/MSE、DRM 加密、DASH 流一律放行给网页自己播，'
+                '所以开启后仍然存在「有些站点没变化」的情况，属于预期',
+                Switch(
+                  value: data.playHijackEnabled,
+                  onChanged: (v) => data.setPlayHijack(v),
+                ),
+              ),
               const _GroupHeader('播放'),
               _section(
                 context,
@@ -116,7 +127,7 @@ class SettingsPage extends StatelessWidget {
               _section(
                 context,
                 '按住加速倍速',
-                '按住视频右半边以该倍速快进，按住左半边持续快退，松开恢复',
+                '长按视频任意位置以该倍速加速播放，松开恢复',
                 SegmentedButton<double>(
                   segments: const [
                     ButtonSegment(value: 1.5, label: Text('1.5×')),
