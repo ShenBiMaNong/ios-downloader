@@ -14,7 +14,7 @@ import 'file_names.dart';
 import 'hls_manager.dart';
 import 'm3u8_convert.dart';
 
-enum DownloadStatus { queued, downloading, done, failed }
+enum DownloadStatus { queued, downloading, paused, done, failed }
 
 class DownloadTask {
   final String id;
@@ -38,9 +38,11 @@ class DownloadTask {
     DateTime? startedAt,
   }) : startedAt = startedAt ?? DateTime.now();
 
-  /// 失败/中断后是否保留有 .part 文件、可断点续传
+  /// 失败/中断/手动暂停后是否保留有 .part 文件、可断点续传
   bool get canResume {
-    if (status != DownloadStatus.failed) return false;
+    if (status != DownloadStatus.failed && status != DownloadStatus.paused) {
+      return false;
+    }
     if (partPath == null || partPath!.isEmpty) return false;
     try {
       return File(partPath!).existsSync();
@@ -106,6 +108,8 @@ class DownloadManager extends ChangeNotifier {
   late final Dio _dio;
   final List<DownloadTask> _tasks = [];
   final Map<String, CancelToken> _cancels = {};
+  /// 真·取消（放弃续传）的任务 id：_run 收尾时不再落 pending、清掉残留 .part
+  final Set<String> _discard = {};
   bool _loaded = false;
 
   List<DownloadTask> get tasks => List.unmodifiable(_tasks);
@@ -169,7 +173,8 @@ class DownloadManager extends ChangeNotifier {
             if (j is! Map<String, dynamic>) continue;
             final t = DownloadTask.fromPendingJson(j);
             if (_tasks.any((x) => x.id == t.id)) continue;
-            t.status = DownloadStatus.failed;
+            // 上次中断/暂停的断点任务：恢复为「已暂停」，可继续下载
+            t.status = DownloadStatus.paused;
             // 无 part 记录的无效 pending，直接清理
             if (t.partPath == null || t.partPath!.isEmpty) {
               final pend = File(entity.path);
@@ -250,6 +255,14 @@ class DownloadManager extends ChangeNotifier {
   }
 
   Future<void> _run(DownloadTask task) async {
+    // 入队瞬间被暂停（pause 先于本方法生效）→ 不再开跑，直接落断点
+    if (task.status == DownloadStatus.paused) {
+      task.speed = 0;
+      task.eta = null;
+      notifyListeners();
+      await _savePending(task);
+      return;
+    }
     task.status = DownloadStatus.downloading;
     task.error = null;
     task.progress = 0;
@@ -391,8 +404,18 @@ class DownloadManager extends ChangeNotifier {
           await (e.response!.data as ResponseBody).stream.drain<void>();
         } catch (_) {}
       }
+      if (_discard.remove(task.id)) {
+        // 真·取消：不再保存断点；兜底清掉中断后可能残留的 .part
+        try {
+          final pf = task.partPath == null ? null : File(task.partPath!);
+          if (pf != null && await pf.exists()) await pf.delete();
+        } catch (_) {}
+        return;
+      }
       if (cancel.isCancelled) {
-        task.status = DownloadStatus.failed;
+        // 手动暂停（pause 已先把状态置为 paused）或旧路径的中断：
+        // 保留 .part 与断点记录，可继续下载
+        task.status = DownloadStatus.paused;
         task.error = '已暂停，可继续下载';
         AppLog.instance.info('download', '下载已暂停: ${task.title}');
       } else {
@@ -412,8 +435,55 @@ class DownloadManager extends ChangeNotifier {
     }
   }
 
-  void cancel(String id) {
-    _cancels.remove(id)?.cancel();
+  /// 手动暂停：中断在途请求，保留 .part 与断点记录，可随时「继续下载」
+  void pause(String id) {
+    for (final t in _tasks) {
+      if (t.id != id) continue;
+      if (t.status != DownloadStatus.queued &&
+          t.status != DownloadStatus.downloading) {
+        return;
+      }
+      t.status = DownloadStatus.paused;
+      t.error = '已暂停，可继续下载';
+      t.speed = 0;
+      t.eta = null;
+      notifyListeners();
+      if (_cancels.containsKey(id)) {
+        // 在途请求：先置 paused，_run 的 catch 会保持该状态并落断点记录
+        _cancels.remove(id)?.cancel();
+      } else {
+        // 尚未真正开跑（queued）：直接落断点记录，重启后仍可继续
+        _savePending(t);
+      }
+      return;
+    }
+  }
+
+  /// 取消下载：中断在途请求，删除 .part 与断点记录，任务移出列表（放弃续传）
+  Future<void> cancel(String id) async {
+    DownloadTask? t;
+    for (final x in _tasks) {
+      if (x.id == id) {
+        t = x;
+        break;
+      }
+    }
+    if (t == null) return;
+    final hadToken = _cancels.remove(id) != null;
+    _discard.add(id);
+    _tasks.removeWhere((x) => x.id == id);
+    try {
+      final dir = await downloadsDir();
+      final pend = File(p.join(dir.path, '$id.pending.json'));
+      if (await pend.exists()) await pend.delete();
+      if (t.partPath != null && t.partPath!.isNotEmpty) {
+        final f = File(t.partPath!);
+        if (await f.exists()) await f.delete();
+      }
+    } catch (_) {}
+    // 没有在途 _run 会来消费 _discard 标记，直接清掉
+    if (!hadToken) _discard.remove(id);
+    notifyListeners();
   }
 
   /// 移动单个已保存视频到文件夹（'' = 移回「全部」）。

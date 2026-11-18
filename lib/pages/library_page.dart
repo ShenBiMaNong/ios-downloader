@@ -106,6 +106,7 @@ class _LibraryPageState extends State<LibraryPage> {
         kind: 'mp4',
         active: active,
         failed: failed,
+        paused: t.status == DownloadStatus.paused,
         progress: t.progress,
         speedText: active ? formatSpeed(t.speed) : null,
         etaText: active ? formatEta(t.eta) : null,
@@ -141,8 +142,9 @@ class _LibraryPageState extends State<LibraryPage> {
         size: 0,
         created: t.startedAt,
         kind: 'm3u8',
-        active: !t.done && !t.failed,
+        active: !t.done && !t.failed && !t.paused,
         failed: t.failed,
+        paused: t.paused,
         progress: t.progress,
         etaText: t.done || t.failed ? null : formatEta(t.eta),
         hlsTaskId: t.taskId,
@@ -408,7 +410,7 @@ class _LibraryPageState extends State<LibraryPage> {
       List<LibraryItem> all) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final playable = !it.active && !it.failed;
+    final playable = !it.active && !it.failed && !it.paused;
     final m3u8Pkg = it.kind == 'm3u8' &&
         it.hlsTaskId == null &&
         it.localPath != null &&
@@ -499,6 +501,12 @@ class _LibraryPageState extends State<LibraryPage> {
         } else {
           HlsManager.instance.cancel(it.hlsTaskId ?? it.id);
         }
+      case 'pause':
+        if (it.kind == 'mp4') {
+          DownloadManager.instance.pause(it.id);
+        } else if (it.kind == 'm3u8') {
+          HlsManager.instance.pause(it.hlsTaskId ?? it.id);
+        }
       case 'resume':
         if (it.kind == 'convert') {
           ConvertManager.instance.retry(it.id);
@@ -537,7 +545,8 @@ class _LibraryPageState extends State<LibraryPage> {
 
   /// 更多操作菜单项（宫格/列表共用，按条目状态取）
   List<PopupMenuEntry<String>> _moreMenuItems(LibraryItem it) {
-    final playable = !it.active && !it.failed;
+    final playable = !it.active && !it.failed && !it.paused;
+    final isCache = it.id.startsWith(PlaybackCacher.idPrefix);
     final m3u8Pkg = it.kind == 'm3u8' &&
         it.hlsTaskId == null &&
         it.localPath != null &&
@@ -552,8 +561,18 @@ class _LibraryPageState extends State<LibraryPage> {
         const PopupMenuItem(value: 'hlsplay', child: Text('边下边看')),
       if (m3u8Pkg)
         const PopupMenuItem(value: 'convert', child: Text('本地转 MP4')),
-      if (it.active && it.kind != 'convert')
-        const PopupMenuItem(value: 'cancel', child: Text('取消')),
+      // 下载中：手动暂停（边播边缓存任务没有暂停概念，只提供取消）
+      if (it.active && it.kind != 'convert') ...[
+        if (!isCache)
+          const PopupMenuItem(value: 'pause', child: Text('暂停下载')),
+        const PopupMenuItem(
+          value: 'cancel',
+          child: Text('取消下载', style: TextStyle(color: Colors.red)),
+        ),
+      ],
+      // 已暂停：继续下载（放弃走下方「删除」）
+      if (it.paused && it.resumable)
+        const PopupMenuItem(value: 'resume', child: Text('继续下载')),
       if (it.failed && it.resumable)
         const PopupMenuItem(value: 'resume', child: Text('继续下载')),
       if (it.failed)
@@ -578,6 +597,11 @@ class _LibraryPageState extends State<LibraryPage> {
       bg = scheme.errorContainer;
       content =
           Icon(Icons.error_outline, size: 40, color: scheme.onErrorContainer);
+    } else if (it.paused) {
+      // 手动暂停：中性底色 + 暂停图标，区别于失败（红）与进行中（转圈）
+      bg = scheme.surfaceContainerHighest;
+      content = Icon(Icons.pause_circle_filled,
+          size: 40, color: scheme.onSurfaceVariant);
     } else if (it.active) {
       bg = scheme.primaryContainer;
       if (it.kind == 'convert') {
@@ -661,27 +685,30 @@ class _LibraryPageState extends State<LibraryPage> {
     );
   }
 
-  /// 封面右下角快捷操作（取消/继续/本地转 MP4；已完成条目点按封面即播放）
+  /// 封面右下角快捷操作（暂停/继续/取消/本地转 MP4；已完成条目点按封面即播放）
   Widget? _coverAction(LibraryItem it, int index, List<LibraryItem> all) {
     if (it.active && it.kind != 'convert') {
-      // 进行中：取消 + 边播边缓存（mp4）/ 边下边看（HLS）
-      final cancel = _smallFab(Icons.close, '取消', () {
-        if (it.id.startsWith(PlaybackCacher.idPrefix)) {
-          PlaybackCacher.instance.cancel(it.id);
-        } else if (it.kind == 'mp4') {
-          DownloadManager.instance.cancel(it.id);
-        } else {
-          HlsManager.instance.cancel(it.hlsTaskId ?? it.id);
-        }
-      });
+      // 进行中：暂停（下载任务）+ 边播边缓存（mp4）/ 边下边看（HLS）；
+      // 边播边缓存任务没有暂停概念，保留原来的取消
+      final secondary = it.id.startsWith(PlaybackCacher.idPrefix)
+          ? _smallFab(Icons.close, '取消下载', () {
+              PlaybackCacher.instance.cancel(it.id);
+            })
+          : _smallFab(Icons.pause_circle_outline, '暂停下载', () {
+              if (it.kind == 'mp4') {
+                DownloadManager.instance.pause(it.id);
+              } else {
+                HlsManager.instance.pause(it.hlsTaskId ?? it.id);
+              }
+            });
       final play = it.kind == 'mp4'
           ? _smallFab(Icons.play_circle_outline, '边播边缓存（立即播放）',
               () => _playCaching(it))
           : _smallFab(Icons.play_circle_outline, '边下边看',
               () => _playHlsCaching(it));
-      return Row(mainAxisSize: MainAxisSize.min, children: [play, cancel]);
+      return Row(mainAxisSize: MainAxisSize.min, children: [play, secondary]);
     }
-    if (it.failed && it.resumable) {
+    if ((it.paused || it.failed) && it.resumable) {
       return _smallFab(Icons.play_arrow, '继续下载', () {
         if (it.kind == 'convert') {
           ConvertManager.instance.retry(it.id);
@@ -1057,7 +1084,7 @@ class _LibraryPageState extends State<LibraryPage> {
               itemBuilder: (ctx) => more,
             ),
       onTap: () {
-        if (!it.active && !it.failed) _play(all, index);
+        if (!it.active && !it.failed && !it.paused) _play(all, index);
       },
     );
   }
@@ -1235,9 +1262,9 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   /// 缩略图源：本地文件 / HLS 离线任务 id / 原始地址（老条目兜底）。
-  /// 进行中、失败条目不出图（保留原来的进度/错误封面）。
+  /// 进行中、失败、暂停条目不出图（保留原来的进度/暂停/错误封面）。
   ({String? path, String? taskId, String? url})? _thumbSource(LibraryItem it) {
-    if (it.active || it.failed) return null;
+    if (it.active || it.failed || it.paused) return null;
     final raw = it.url ?? '';
     final remote = raw.startsWith('http') ? raw : null;
     final remoteOnly = remote == null ? null : (path: null, taskId: null, url: remote);
@@ -1259,6 +1286,9 @@ class _LibraryPageState extends State<LibraryPage> {
 
   Widget _leadingIcon(LibraryItem it) {
     if (it.failed) return const Icon(Icons.error, color: Colors.red);
+    if (it.paused) {
+      return const Icon(Icons.pause_circle_filled, color: Colors.blueGrey);
+    }
     if (it.active) {
       if (it.kind == 'convert') {
         return const Icon(Icons.transform, color: Colors.teal);
@@ -1280,6 +1310,11 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   String _subtitle(LibraryItem it) {
+    if (it.paused) {
+      // 手动暂停：显示已下载的进度，不当作错误
+      final pct = '${(it.progress * 100).toStringAsFixed(0)}%';
+      return '已暂停 · 已下载 $pct';
+    }
     if (it.failed) {
       final s = _shortError(it.error);
       return (s.startsWith('失败') || s.startsWith('已')) ? s : '失败：$s';

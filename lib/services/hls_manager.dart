@@ -99,6 +99,7 @@ class HlsTask {
   Duration? eta; // 按进度速率估算
   bool done = false;
   bool failed = false;
+  bool paused = false; // 手动暂停（保留断点记录，可继续下载）
   String? error;
 
   /// 原生下载任务是否已创建成功（建任务失败时条目仍在列表里，
@@ -112,8 +113,8 @@ class HlsTask {
     DateTime? startedAt,
   }) : startedAt = startedAt ?? DateTime.now();
 
-  /// 失败/中断后可点击「继续下载」（未建过原生任务的失败条目由 retry 重新发起）
-  bool get resumable => failed;
+  /// 失败/暂停/中断后可点击「继续下载」（未建过原生任务的失败条目由 retry 重新发起）
+  bool get resumable => failed || paused;
 }
 
 /// HLS 离线下载管理（MVP-2）
@@ -165,7 +166,8 @@ class HlsManager extends ChangeNotifier {
               title: (j['title'] as String?) ?? '',
               startedAt: DateTime.tryParse((j['startedAt'] as String?) ?? ''),
             )
-              ..failed = true
+              ..paused = true
+              ..failed = false
               ..startedOk = true
               ..error = '已暂停，可继续下载';
             tasks.add(t);
@@ -182,6 +184,8 @@ class HlsManager extends ChangeNotifier {
         for (final id in matched) {
           for (final t in tasks) {
             if (t.taskId == id) {
+              // 原生侧仍有在途任务 → 恢复为进行中
+              t.paused = false;
               t.failed = false;
               t.error = null;
               break;
@@ -244,6 +248,12 @@ class HlsManager extends ChangeNotifier {
       _clearPending(task.taskId);
       AppLog.instance.info('hls', 'HLS 离线缓存完成: ${task.title}');
     } else if (e['done'] == false) {
+      if (task.paused) {
+        // 手动暂停触发的原生中断：保持暂停态，不显示为失败
+        task.error = '已暂停，可继续下载';
+        notifyListeners();
+        return;
+      }
       task.failed = true;
       final err = (e['error'] as String?) ?? '下载中断，可点击继续';
       task.error = err;
@@ -293,7 +303,7 @@ class HlsManager extends ChangeNotifier {
     }
   }
 
-  /// 继续下载失败/中断的任务（原生重建下载任务，同一 taskId）
+  /// 继续下载失败/暂停/中断的任务（原生重建下载任务，同一 taskId）
   Future<void> retry(String taskId) async {
     HlsTask? task;
     for (final t in tasks) {
@@ -302,7 +312,7 @@ class HlsManager extends ChangeNotifier {
         break;
       }
     }
-    if (task == null || task.done || !task.failed) return;
+    if (task == null || task.done || (!task.failed && !task.paused)) return;
     // 从未成功创建过原生任务（建任务即失败）：没有可续传的任务，直接重发
     if (!task.startedOk) {
       tasks.remove(task);
@@ -310,6 +320,7 @@ class HlsManager extends ChangeNotifier {
       await start(task.url, task.title);
       return;
     }
+    task.paused = false;
     task.failed = false;
     task.error = null;
     task.progress = 0;
@@ -325,6 +336,27 @@ class HlsManager extends ChangeNotifier {
     }
   }
 
+  /// 手动暂停：中断原生下载任务，保留断点记录，可继续下载
+  Future<void> pause(String taskId) async {
+    HlsTask? task;
+    for (final t in tasks) {
+      if (t.taskId == taskId) {
+        task = t;
+        break;
+      }
+    }
+    if (task == null || task.done || task.failed || task.paused) return;
+    task.paused = true;
+    task.error = '已暂停，可继续下载';
+    notifyListeners();
+    // 先落断点记录再中断原生任务：即使原生回调晚到也不会丢状态
+    await _persistPending(task);
+    if (task.startedOk) {
+      await HlsDownloader.cancel(taskId);
+    }
+  }
+
+  /// 取消下载：中断原生任务、删除断点记录，条目移出列表（放弃续传）
   Future<void> cancel(String taskId) async {
     HlsTask? task;
     for (final t in tasks) {
@@ -334,15 +366,12 @@ class HlsManager extends ChangeNotifier {
       }
     }
     if (task == null) return;
-    // 没有真正在跑的原生任务（未建成功 / 已是失败态的历史记录）：
-    // 取消 = 把条目连同断点记录一起清掉，否则点「取消」毫无反应
-    if (!task.startedOk || task.failed) {
-      tasks.remove(task);
-      await _removePending(task.taskId);
-      notifyListeners();
-      return;
+    tasks.remove(task);
+    await _removePending(taskId);
+    if (task.startedOk && !task.done) {
+      await HlsDownloader.cancel(taskId);
     }
-    await HlsDownloader.cancel(taskId);
+    notifyListeners();
   }
 
   /// 播放：下载完成走离线播放（本地 .movpkg）；

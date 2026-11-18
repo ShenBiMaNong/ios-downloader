@@ -317,7 +317,7 @@ class PlaybackCacher extends ChangeNotifier {
       if (t.url == url &&
           (t.status == DownloadStatus.queued ||
               t.status == DownloadStatus.downloading)) {
-        DownloadManager.instance.cancel(t.id);
+        DownloadManager.instance.pause(t.id);
         return;
       }
     }

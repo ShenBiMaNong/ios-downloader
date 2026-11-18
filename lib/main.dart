@@ -272,7 +272,9 @@ class _HomeShellState extends State<HomeShell> {
         n++;
       }
     }
-    n += HlsManager.instance.tasks.where((t) => !t.done && !t.failed).length;
+    n += HlsManager.instance
+        .tasks.where((t) => !t.done && !t.failed && !t.paused)
+        .length;
     n += ConvertManager.instance.tasks.where((t) => !t.done && !t.failed).length;
     n += PlaybackCacher.instance.tasks.where((t) => !t.done && !t.failed).length;
     return n;

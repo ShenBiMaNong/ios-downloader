@@ -20,6 +20,7 @@ class LibraryItem {
   final String kind; // mp4 | m3u8 | convert
   final bool active;
   final bool failed;
+  final bool paused; // 手动暂停（保留断点，可继续下载）
   final double progress; // 0~1（进行中）
   final String? speedText; // 如 "3.2 MB/s"（HLS 无网速，显示 null）
   final String? etaText; // 如 "剩余约 40 秒"
@@ -41,6 +42,7 @@ class LibraryItem {
     required this.active,
     required this.failed,
     required this.progress,
+    this.paused = false,
     this.speedText,
     this.etaText,
     this.localPath,
