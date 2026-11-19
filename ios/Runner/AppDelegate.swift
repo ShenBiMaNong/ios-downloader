@@ -922,6 +922,12 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
   /// 事件节流：每个作业最多每 0.5s 推一次（几百个 task 每个都写 state.json 会把 IO 打满）
   private var lastEmitAt: [String: Date] = [:]
   private static let emitInterval: TimeInterval = 0.5
+  /// 用户主动 pause 的作业。pause 也会让系统回 -999，必须和「系统把传输掐了」
+  /// 区分开：前者保持 paused，后者也要落到可续传的 paused，绝不能一直假装在下。
+  private var pausingJobs = Set<String>()
+  /// 作业最近一次真有传输活动（建 task / 收到字节 / 完成一片）的时间。
+  /// 只用于日志与诊断，不作为对账依据——对账看的是「还有没有在途 task」。
+  private var lastActivity: [String: Date] = [:]
 
   override init() {
     super.init()
@@ -1043,6 +1049,9 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
     lock.lock()
     diskBytes[jobId] = skippedBytes
     lastEmitAt.removeValue(forKey: jobId)
+    lastActivity[jobId] = Date()
+    // 重新提交 = 用户点了继续 / 重试，清掉上一轮的用户暂停标记
+    pausingJobs.remove(jobId)
     lock.unlock()
 
     if pending.isEmpty {
@@ -1052,8 +1061,23 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
       return true
     }
 
+    // 建不起 task 的分片永远不会回调，finished 也就永远追不上 total —— 这里
+    // 当场记失败，让作业能正常收尾；否则列表会卡在「下载中」，只能取消。
+    var unstarted: [String] = []
     for part in pending {
-      startTask(jobId: jobId, part: part, headers: headers)
+      if !startTask(jobId: jobId, part: part, headers: headers) {
+        unstarted.append(part["name"] as? String ?? "?")
+      }
+    }
+    if !unstarted.isEmpty {
+      if let updated = updateState(jobId, { s in
+        s["finished"] = (s["finished"] as? Int ?? 0) + unstarted.count
+        s["failed"] = (s["failed"] as? Int ?? 0) + unstarted.count
+        s["error"] = "无法创建下载任务: \(unstarted.first ?? "?")"
+        self.finalizeIfNeeded(&s)
+      }) {
+        emit(updated)
+      }
     }
     return true
   }
@@ -1081,6 +1105,7 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
     lock.lock()
     taskJob[task.taskIdentifier] = jobId
     live[task.taskIdentifier] = LiveBytes(jobId: jobId)
+    lastActivity[jobId] = Date()
     lock.unlock()
     task.resume()
     return true
@@ -1096,6 +1121,9 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
       result(false)
       return
     }
+    lock.lock()
+    pausingJobs.insert(jobId)
+    lock.unlock()
     session.getAllTasks { [weak self] tasks in
       guard let self else { result(false); return }
       let mine = tasks.filter {
@@ -1154,49 +1182,62 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
       }
     }
     let resume = (st["resume"] as? [String: String]) ?? [:]
-    let base = URL(fileURLWithPath: workDir)
-    var restarted = 0
-    for part in parts {
-      guard let name = part["name"] as? String else { continue }
-      if hasNonEmptyFile(base.appendingPathComponent(name).path) { continue }
-      let data = resume[name].flatMap { Data(base64Encoded: $0) }
-      if startTask(jobId: jobId, part: part, headers: headers, resumeData: data) {
-        restarted += 1
+    // 先问系统「这个作业还有哪些分片在跑」：自动续传 / 手动续传都可能和正在
+    // 运行的 task 撞车，重复写同一目标文件会双重计数、甚至落盘错乱。
+    session.getAllTasks { [weak self] tasks in
+      guard let self else { result(false); return }
+      var inFlight = Set<String>()
+      for t in tasks where t.state == .running || t.state == .suspended {
+        guard let r = self.resolve(task: t), r.0 == jobId else { continue }
+        inFlight.insert(r.1)
       }
-    }
-    // 计数按磁盘重建：上一轮失败会把这片记进 finished/failed，不清掉的话
-    // finalizeIfNeeded 会在新一轮还没下完时就把作业判成 ready
-    let onDisk = scanDone(workDir, parts: parts)
-    let total = st["total"] as? Int ?? 0
-    // 重新拉起任务 → downloading；一片没拉起但磁盘已齐 → ready；
-    // 剩下的就是「还有片没下完且拉不起来」（比如 URL 已失效）→ paused，
-    // 让用户看到可继续的状态而不是错误
-    let next: String
-    if restarted > 0 {
-      next = "downloading"
-    } else if onDisk.done >= total {
-      next = "ready"
-    } else {
-      next = "paused"
-    }
-    // 这里是 if let 而不是 guard let：拿到状态才记账并回 true，拿不到走 else 回 false。
-    // 写成 guard 会直接编译不过——guard 的条件后必须紧跟 else。
-    if let st2 = updateState(jobId, { s in
-      s["done"] = onDisk.done
-      s["finished"] = onDisk.done
-      s["failed"] = 0
-      s["bytes"] = Int(onDisk.bytes)
-      s.removeValue(forKey: "error")
-      s["state"] = next
-    }) {
-      lock.lock()
-      diskBytes[jobId] = onDisk.bytes
-      lastEmitAt.removeValue(forKey: jobId)
-      lock.unlock()
-      emit(st2)
-      result(true)
-    } else {
-      result(false)
+      let base = URL(fileURLWithPath: workDir)
+      var restarted = 0
+      for part in parts {
+        guard let name = part["name"] as? String else { continue }
+        if inFlight.contains(name) { continue }
+        if self.hasNonEmptyFile(base.appendingPathComponent(name).path) { continue }
+        let data = resume[name].flatMap { Data(base64Encoded: $0) }
+        if self.startTask(jobId: jobId, part: part, headers: headers, resumeData: data) {
+          restarted += 1
+        }
+      }
+      // 计数按磁盘重建：上一轮失败会把这片记进 finished/failed，不清掉的话
+      // finalizeIfNeeded 会在新一轮还没下完时就把作业判成 ready
+      let onDisk = self.scanDone(workDir, parts: parts)
+      let total = st["total"] as? Int ?? 0
+      // 重新拉起任务（或本来就有在途）→ downloading；磁盘已齐 → ready；
+      // 剩下的就是「还有片没下完且拉不起来」（比如 URL 已失效）→ paused，
+      // 让用户看到可继续的状态而不是错误
+      let next: String
+      if restarted > 0 || !inFlight.isEmpty {
+        next = "downloading"
+      } else if onDisk.done >= total {
+        next = "ready"
+      } else {
+        next = "paused"
+      }
+      // 这里是 if let 而不是 guard let：拿到状态才记账并回 true，拿不到走 else 回 false。
+      // 写成 guard 会直接编译不过——guard 的条件后必须紧跟 else。
+      if let st2 = self.updateState(jobId, { s in
+        s["done"] = onDisk.done
+        s["finished"] = onDisk.done
+        s["failed"] = 0
+        s["bytes"] = Int(onDisk.bytes)
+        s.removeValue(forKey: "error")
+        s["state"] = next
+      }) {
+        self.lock.lock()
+        self.diskBytes[jobId] = onDisk.bytes
+        self.lastEmitAt.removeValue(forKey: jobId)
+        self.lastActivity[jobId] = Date()
+        self.pausingJobs.remove(jobId)
+        self.lock.unlock()
+        self.emit(st2)
+        result(true)
+      } else {
+        result(false)
+      }
     }
   }
 
@@ -1278,6 +1319,8 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
     }
     diskBytes.removeValue(forKey: jobId)
     lastEmitAt.removeValue(forKey: jobId)
+    pausingJobs.remove(jobId)
+    lastActivity.removeValue(forKey: jobId)
   }
 
   private func listJobs(result: @escaping FlutterResult) {
@@ -1294,14 +1337,56 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
         return
       }
       var inflow: [String: (written: Int64, expected: Int64)] = [:]
+      var inFlight: [String: Int] = [:]
       for t in tasks where t.state == .running || t.state == .suspended {
         guard let jobId = self.jobId(of: t) else { continue }
+        inFlight[jobId, default: 0] += 1
         var e = inflow[jobId] ?? (written: 0, expected: 0)
         if t.countOfBytesReceived > 0 { e.written += t.countOfBytesReceived }
         if t.countOfBytesExpectedToReceive > 0 { e.expected += t.countOfBytesExpectedToReceive }
         inflow[jobId] = e
       }
-      result(base.map { self.jobPayload($0.0, $0.1, inflow: inflow) })
+      var out = [[String: Any]]()
+      for (jobId, st) in base {
+        var state = st
+        let active = inFlight[jobId] ?? 0
+        // 反向自愈：state 是 paused 但系统里确实还有在途 task（-999 与续传 /
+        // 回前台对账撞车时可能误标）→ 恢复 downloading，别让用户以为停了。
+        if (state["state"] as? String ?? "downloading") == "paused", active > 0 {
+          if let fixed = self.updateState(jobId, { s in
+            s["state"] = "downloading"
+            s.removeValue(forKey: "error")
+          }) {
+            state = fixed
+          } else {
+            state["state"] = "downloading"
+            state.removeValue(forKey: "error")
+          }
+        }
+        // 没有任何在途 task 的 downloading 作业已经不可能自行前进：最后的 delegate
+        // 回调可能在系统唤醒间隙丢了，或会话被系统回收（强杀 App 后只留下 state）。
+        // 以磁盘为准对账：分片齐 → ready；缺片不改状态，交给 Dart 侧自动续传。
+        if (state["state"] as? String ?? "downloading") == "downloading", active == 0 {
+          let parts = state["parts"] as? [[String: Any]] ?? []
+          let onDisk = self.scanDone(state["workDir"] as? String ?? "", parts: parts)
+          self.lock.lock()
+          self.diskBytes[jobId] = onDisk.bytes
+          self.lock.unlock()
+          let total = state["total"] as? Int ?? 0
+          if total > 0, onDisk.done >= total {
+            if let fixed = self.updateState(jobId, { s in
+              s["done"] = onDisk.done
+              s["bytes"] = Int(onDisk.bytes)
+              let failed = s["failed"] as? Int ?? 0
+              s["state"] = failed > 0 ? "failed" : "ready"
+            }) {
+              state = fixed
+            }
+          }
+        }
+        out.append(self.jobPayload(jobId, state, inflow: inflow, active: active))
+      }
+      result(out)
     }
   }
 
@@ -1309,7 +1394,8 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
   /// 两者对分片作业是「已落盘 + 在途」相加（不重叠）；单文件作业的在途量就是全部
   /// 已下量，Content-Length 由系统给出，不再需要估算标记。
   private func jobPayload(_ jobId: String, _ st: [String: Any],
-    inflow: [String: (written: Int64, expected: Int64)]
+    inflow: [String: (written: Int64, expected: Int64)],
+    active: Int = 0
   ) -> [String: Any] {
     let p = progress(for: jobId, state: st)
     var bytes = p.bytes
@@ -1345,6 +1431,9 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
       "bytesEstimated": estimated,
       "single": single,
       "error": st["error"] as? String ?? "",
+      // 在途 task 数：0 = 没有系统侧传输在跑。Dart 靠它区分「真在下载」
+      // 和「state 写着 downloading 但已经没人推了」，后者要自动续传。
+      "active": active,
     ]
   }
 
@@ -1458,6 +1547,7 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
       if totalBytesExpectedToWrite > 0 { c.expected = totalBytesExpectedToWrite }
       live[tid] = c
       taskJob[tid] = jobId
+      lastActivity[jobId] = Date()
     }
     lock.unlock()
     guard let jid = jobId, shouldEmit(jid), let st = loadState(jid) else { return }
@@ -1469,7 +1559,24 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
     downloadTask: URLSessionDownloadTask,
     didFinishDownloadingTo location: URL
   ) {
-    guard let resolved = resolve(task: downloadTask) else { return }
+    lock.lock()
+    let cachedJob = taskJob[downloadTask.taskIdentifier] ?? Self.jobIdOf(downloadTask)
+    lock.unlock()
+    guard let resolved = resolve(task: downloadTask) else {
+      // 定位不到分片（taskDescription 丢 + 原始 URL 对不上 parts）也要记账：
+      // 直接 return 会让 finished 永远差一片，作业卡在 downloading 直到用户取消。
+      if let jid = cachedJob, !jid.isEmpty,
+        let updated = updateState(jid, { s in
+          s["finished"] = (s["finished"] as? Int ?? 0) + 1
+          s["failed"] = (s["failed"] as? Int ?? 0) + 1
+          if s["error"] == nil { s["error"] = "无法定位分片文件" }
+          self.finalizeIfNeeded(&s)
+        })
+      {
+        emit(updated)
+      }
+      return
+    }
     let jobId = resolved.0
     let name = resolved.1
     let st = resolved.2
@@ -1497,6 +1604,7 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
     if ok { diskBytes[jobId, default: 0] += fileSize(dest.path) }
     live.removeValue(forKey: tid)
     taskJob.removeValue(forKey: tid)
+    lastActivity[jobId] = Date()
     let diskNow = diskBytes[jobId] ?? 0
     lock.unlock()
 
@@ -1525,27 +1633,52 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
     let tid = task.taskIdentifier
     lock.lock()
+    let cachedJob = taskJob[tid]
     live.removeValue(forKey: tid)
     taskJob.removeValue(forKey: tid)
     lock.unlock()
     // 成功路径已在 didFinishDownloadingTo 里计过 finished，这里只补失败
     guard let error else { return }
     let ns = error as NSError
-    // 主动暂停 / 取消（-999）不是失败：计入 failed 会把「已暂停」的作业标成
-    // 失败态，用户回来看到的就不是「已暂停」而是错误，且 finalize 会提前把
-    // 整个作业判成 failed
+    // 取消（-999）分两种，处理完全不同：
+    //  · 用户主动暂停 → pauseJob 已经（或即将）把作业落成 paused，这里不掺和；
+    //  · 系统回收会话 / 强杀 App 后的残留 → 作业再也不会自己前进，必须落成
+    //    paused，否则 state 永远停在 downloading，列表只剩「取消」且速度定格。
     if ns.domain == NSURLErrorDomain, ns.code == NSURLErrorCancelled {
       // 这里也不写 resume：pauseJob 走 cancel(byProducingResumeData:)，系统保证
       // 那条回调先于本回调，断点已经存过了；再存一次会和「删除作业」的 clearJob
       // 打架（删除后又被这条路径把 state.json 写回来）
+      guard let resolved = resolve(task: task) else { return }
+      let jobId = resolved.0
+      lock.lock()
+      let userPaused = pausingJobs.contains(jobId)
+      // 同一作业还有别的分片在途：让它继续跑，最后一个任务收尾时会正常 finalize。
+      // 这里若直接落 paused，Dart 会在中途收到「已暂停」——假失败。
+      var others = 0
+      for (_, jid) in taskJob where jid == jobId { others += 1 }
+      lock.unlock()
+      if userPaused || others > 0 { return }
+      // 既不是用户暂停、也没有别的分片在跑：作业不会再自己前进（系统回收了
+      // 会话 / 强杀后的残留 task），落成可续传的 paused，别让 state 永远停在
+      // downloading —— 那正是「列表只剩取消、速度定格」的样子。
+      if let updated = updateState(jobId, { s in
+        if (s["state"] as? String ?? "downloading") == "downloading" {
+          s["state"] = "paused"
+        }
+        if s["error"] == nil { s["error"] = "传输被系统中断" }
+      }) {
+        emit(updated)
+      }
       return
     }
     // 真失败：留下断点，用户点「继续」时按断点续传
     if let data = ns.userInfo[NSURLSessionDownloadTaskResumeData] as? Data, !data.isEmpty {
       storeResume(task: task, data: data)
     }
-    guard let resolved = resolve(task: task) else { return }
-    let jobId = resolved.0
+    // 定位不到作业也要记账（缓存 jobId 兜底），否则 finished 永远差这几片
+    guard let jobId = resolve(task: task)?.0 ?? cachedJob ?? Self.jobIdOf(task) else {
+      return
+    }
     if let updated = updateState(jobId, { state in
       state["finished"] = (state["finished"] as? Int ?? 0) + 1
       state["failed"] = (state["failed"] as? Int ?? 0) + 1
@@ -1644,12 +1777,25 @@ final class NativeSegmentBridge: NSObject, URLSessionDownloadDelegate, FlutterSt
 
   private func finalizeIfNeeded(_ state: inout [String: Any]) {
     let total = state["total"] as? Int ?? 0
+    guard total > 0 else { return }
     let finished = state["finished"] as? Int ?? 0
-    guard total > 0, finished >= total,
-      (state["state"] as? String ?? "downloading") == "downloading"
-    else { return }
-    let failed = state["failed"] as? Int ?? 0
-    state["state"] = failed > 0 ? "failed" : "ready"
+    let done = state["done"] as? Int ?? 0
+    let cur = state["state"] as? String ?? "downloading"
+    // paused 也允许收尾：暂停恰好发生在最后一片落盘之后时，用户回来看到的
+    // 应该是「待合成」而不是永远停在「已暂停」。
+    guard cur == "downloading" || cur == "paused" else { return }
+    // finished 之外的判据：delegate 回调丢过一次时 finished 会永远差几片，
+    // 但磁盘上分片是齐的 —— 以 done 为准才是真进度。
+    guard finished >= total || done >= total else { return }
+    if done >= total {
+      state["state"] = "ready"
+    } else if (state["failed"] as? Int ?? 0) > 0 {
+      state["state"] = "failed"
+    } else {
+      // 计数异常（finished 到位但既没成功也没失败），不能报 ready，交回可续传态
+      state["state"] = "paused"
+      if state["error"] == nil { state["error"] = "部分分片未完成" }
+    }
   }
 
   private func emit(_ state: [String: Any]) {

@@ -181,6 +181,24 @@ void main() {
   /// 这类 IO 在 fake-async zone 里不会完成，之后注入时就会永远挂住
   Future<void> pumpBrowser(WidgetTester tester) async {
     await tester.runAsync(() async {
+      // 把注入链会用到的资产先全部读进 rootBundle 缓存，且只在这块真实异步区里读。
+      // 只靠「initState 顺带读了几个」不够：_installEarlyScripts 前面还等着
+      // AppData.ensureLoaded()，60ms 窗口里未必轮到资产；而漏在 fake-async zone 里
+      // 的 loadString 在这个用例结束后永远不会完成，缓存里留个坏 Future 给下一个用例，
+      // 「加载页面时注入手势脚本本体」就是这么反复挂的（v0.3.10/v0.3.13 同款）。
+      // 预读之后，注入函数在 fake 区里 await 到的都是已完成的 Future，只剩 microtask，
+      // pump 一次就够，断言不再赌资产 IO 的时机。
+      for (final key in const [
+        'assets/no_autoplay.js',
+        'assets/fullscreen.js',
+        'assets/sniffer.js',
+        'assets/video_marker.js',
+        'assets/redirect_guard.js',
+        'assets/browser_swipe.js',
+        'assets/adblock.js',
+      ]) {
+        await rootBundle.loadString(key);
+      }
       await tester.pumpWidget(const MaterialApp(home: BrowserPage()));
       await Future<void>.delayed(const Duration(milliseconds: 60));
     });

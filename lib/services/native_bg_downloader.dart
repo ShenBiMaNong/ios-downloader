@@ -153,6 +153,10 @@ class NativeJobStatus {
   final bool single;
   final String? error;
 
+  /// 系统侧在途 task 数。0 = 没有任何传输在跑；state 仍写着 downloading 时
+  /// 说明作业已经「没人推了」（回调丢了 / 会话被回收），调用方应自动续传。
+  final int active;
+
   const NativeJobStatus({
     required this.jobId,
     required this.state,
@@ -164,6 +168,7 @@ class NativeJobStatus {
     this.bytesEstimated = false,
     this.single = false,
     this.error,
+    this.active = 0,
   });
 
   factory NativeJobStatus.fromMap(Map<String, dynamic> j) => NativeJobStatus(
@@ -177,6 +182,7 @@ class NativeJobStatus {
         bytesEstimated: (j['bytesEstimated'] as bool?) ?? false,
         single: (j['single'] as bool?) ?? false,
         error: j['error'] as String?,
+        active: (j['active'] as num?)?.toInt() ?? 0,
       );
 
   bool get isReady => state == 'ready';
