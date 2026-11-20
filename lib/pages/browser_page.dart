@@ -57,6 +57,7 @@ class BrowserPageState extends State<BrowserPage> {
   String? _redirectGuard;
   String? _noAutoplay;
   String? _swipe;
+  String? _fullscreen;
   String _currentUrl = '';
   String _pageTitle = '';
 
@@ -111,6 +112,7 @@ class BrowserPageState extends State<BrowserPage> {
           _injectMarker();
           _injectRedirectGuard();
           _injectNoAutoplay();
+          _injectFullscreen();
           _injectSwipe();
           if (AppData.instance.adBlockEnabled) _injectAdBlock();
           // 本次导航可能一直停在 interactive（等不到 onPageFinished），由自愈补脚本
@@ -134,6 +136,7 @@ class BrowserPageState extends State<BrowserPage> {
           await _injectMarker();
           await _injectRedirectGuard();
           await _injectNoAutoplay();
+          await _injectFullscreen();
           await _injectSwipe();
           if (AppData.instance.adBlockEnabled) await _injectAdBlock();
           final t = await _controller.getTitle();
@@ -216,6 +219,12 @@ class BrowserPageState extends State<BrowserPage> {
   Future<String> _swipeJs() async =>
       _swipe ??= await rootBundle.loadString('assets/browser_swipe.js');
 
+  /// 网页全屏兜底：iPhone 的 WKWebView 没有 Fullscreen API，站点播放器的全屏
+  /// 按钮调 requestFullscreen 会静默失败。脚本把请求转到 video 原生全屏（或 CSS
+  /// 铺满），必须在站点脚本之前装好 —— 站点可能一加载就探测并缓存 API 引用。
+  Future<String> _fullscreenJs() async =>
+      _fullscreen ??= await rootBundle.loadString('assets/fullscreen.js');
+
   Future<void> _injectSniffer() async {
     try {
       final js = await _snifferJs();
@@ -265,6 +274,7 @@ class BrowserPageState extends State<BrowserPage> {
             await _injectMarker();
             await _injectRedirectGuard();
             await _injectNoAutoplay();
+            await _injectFullscreen();
             await _injectSwipe();
             if (AppData.instance.adBlockEnabled) await _injectAdBlock();
           }
@@ -310,6 +320,7 @@ class BrowserPageState extends State<BrowserPage> {
       await _injectMarker();
       await _injectRedirectGuard();
       await _injectNoAutoplay();
+      await _injectFullscreen();
       await _injectSwipe();
       if (AppData.instance.adBlockEnabled) await _injectAdBlock();
       AppLog.instance.info('browser', '诊断面板：手动补注入完成 $_currentUrl');
@@ -381,6 +392,8 @@ class BrowserPageState extends State<BrowserPage> {
             'window.__vdlViewEpoch=$_viewEpoch;',
         'window.__vdlMarkEnabled=${AppData.instance.videoMarkEnabled};',
         await _noAutoplayJs(),
+        // 全屏兜底也要赶在站点脚本之前：站点常在加载时就探测/缓存 Fullscreen API
+        await _fullscreenJs(),
         await _snifferJs(),
         await _markerJs(),
         // 手势导航：touch 监听也要赶在页面脚本之前挂上（页面可能自己吞 touch）
@@ -448,6 +461,17 @@ class BrowserPageState extends State<BrowserPage> {
       await _controller.runJavaScript(await _swipeJs());
     } catch (e, st) {
       AppLog.instance.warn('browser', '注入手势脚本失败', e, st);
+    }
+  }
+
+  /// 网页全屏兜底：脚本自身幂等（已装则立即返回），无开关、常开。
+  /// 站点播放器的全屏按钮在 iPhone 上普遍调 requestFullscreen，而 WKWebView 没有
+  /// 实现这个 API —— 不补这一层，按钮就是「点了没反应」。
+  Future<void> _injectFullscreen() async {
+    try {
+      await _controller.runJavaScript(await _fullscreenJs());
+    } catch (e, st) {
+      AppLog.instance.warn('browser', '注入网页全屏兜底脚本失败', e, st);
     }
   }
 

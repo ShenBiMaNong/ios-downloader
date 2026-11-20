@@ -166,6 +166,21 @@ class ConvertManager extends ChangeNotifier {
   final Set<String> _nativeFinishing = {};
   bool _loaded = false;
 
+  /// 原生作业的前台看护定时器（只在有 native 作业时存在）。
+  /// 后台期间系统不回调 delegate，最后几个分片的回调可能在唤醒间隙丢掉；
+  /// 光靠事件会让作业永远停在「下载中」且不再有任何后续事件 —— 必须主动对账。
+  Timer? _nativeWatch;
+
+  /// jobId → 连续「state=downloading 但没有在途 task」的轮数
+  final Map<String, int> _nativeIdlePolls = {};
+
+  /// jobId → 本次运行里自动续传的次数（避免坏链接把定时器变成死循环）
+  final Map<String, int> _nativeAutoResumes = {};
+
+  /// jobId → 连续「原生查不到这个作业」的轮数。偶发的通道失败不该把还在
+  /// 正常下载的作业判成「记录丢失」，连续两轮才认。
+  final Map<String, int> _nativeMissingPolls = {};
+
   /// 启动时恢复未完成的转换任务（复用保留的分片工作目录）
   Future<void> ensureLoaded() async {
     if (_loaded) return;
@@ -213,7 +228,7 @@ class ConvertManager extends ChangeNotifier {
       }
       if (tasks.isNotEmpty) notifyListeners();
       // 冷启动对账：后台分片可能已在系统进程里下完，但事件整段丢失。
-      await _resumeNativeJobs();
+      await _resumeNativeJobs(resetSpeed: true);
     } catch (e, st) {
       AppLog.instance.error('convert', '启动时恢复转换任务失败', e, st);
     }
@@ -296,6 +311,11 @@ class ConvertManager extends ChangeNotifier {
     task.error = null;
     task.progress = 0;
     task.doneSegments = 0;
+    task.stage = '';
+    // 上一轮的自愈计数清零：用户主动续传 = 重新给几次自动恢复的机会
+    _nativeIdlePolls.remove(task.id);
+    _nativeAutoResumes.remove(task.id);
+    _nativeMissingPolls.remove(task.id);
     // 上一轮的「仍要合成」入口随续传清掉：是否还能强合，由新一轮下载结果决定
     task.failedSegments = 0;
     task.canForceMerge = false;
@@ -423,6 +443,12 @@ class ConvertManager extends ChangeNotifier {
       await NativeBgDownloader.cancel(id);
     }
     tasks.removeWhere((x) => x.id == id);
+    _nativeIdlePolls.remove(id);
+    _nativeAutoResumes.remove(id);
+    _nativeMissingPolls.remove(id);
+    if (!tasks.any((t) => t.mode == 'native' && !t.done && !t.failed)) {
+      _stopNativeWatch();
+    }
     try {
       if (t?.workDir != null && Directory(t!.workDir!).existsSync()) {
         await Directory(t.workDir!).delete(recursive: true);
@@ -733,11 +759,19 @@ class ConvertManager extends ChangeNotifier {
     final prevAt = t.bytesSampledAt;
     if (bytes > t.bytes && prevAt != null) {
       final dt = now.difference(prevAt).inMilliseconds / 1000.0;
-      // dt 太小除出来是尖峰；太大说明刚从后台回来，那段流量不是「当前速度」
-      if (dt >= 0.4 && dt <= 5.0) {
+      // dt 太小除出来是尖峰；8s 的上限是为了兼容 6s 一轮的对账轮询——
+      // 超过这个间隔说明刚从后台回来，那段流量不是「当前速度」
+      if (dt >= 0.4 && dt <= 8.0) {
         final inst = (bytes - t.bytes) / dt;
         t.speed = t.speed <= 0 ? inst : t.speed * 0.55 + inst * 0.45;
       }
+    } else if (prevAt != null &&
+        bytes <= t.bytes &&
+        now.difference(prevAt).inSeconds >= 3) {
+      // 字节不再增长：保留上一轮的速度，列表会一直显示「有速度」但其实卡住了，
+      // 用户看到的就是「速度固定不动、大小不变」。3s 没动静就必须归零。
+      t.speed = 0;
+      t.eta = null;
     }
     t.bytes = bytes;
     if (bytesTotal > 0) {
@@ -755,6 +789,8 @@ class ConvertManager extends ChangeNotifier {
     if (t.speed > 0 && t.bytesTotal > t.bytes) {
       final secs = ((t.bytesTotal - t.bytes) / t.speed).ceil();
       t.eta = secs > 0 ? Duration(seconds: secs) : null;
+    } else {
+      t.eta = null;
     }
   }
 
@@ -844,6 +880,8 @@ class ConvertManager extends ChangeNotifier {
     // 刻意不 await 下载完成：这一步交给系统，Dart 侧不留长任务。
     AppLog.instance.info(
         'convert', '已提交原生后台分片作业: ${task.title}（${parts.length} 个文件）');
+    // 前台下看护：事件只在前台可靠，丢了最后几片时靠对账把作业救回来
+    _ensureNativeWatch();
   }
 
   /// 分片齐备后合成 mp4。系统唤醒窗口只有几秒，ffmpeg -c copy 必须放前台做。
@@ -902,6 +940,8 @@ class ConvertManager extends ChangeNotifier {
     // 分片数用原生上报的真实值（真实落盘片数），不要由字节比反推
     if (segTotal > 0) task.totalSegments = segTotal;
     task.doneSegments = segDone;
+    _nativeIdlePolls.remove(id);
+    _nativeMissingPolls.remove(id);
     if (bytes > 0) {
       _applyByteProgress(
           task, bytes, bytesTotal, (e['bytesEstimated'] as bool?) ?? false);
@@ -911,6 +951,9 @@ class ConvertManager extends ChangeNotifier {
     if (segTotal > 0 && task.bytesTotal <= task.bytes) {
       task.progress = (segDone / segTotal).clamp(0.0, 1.0).toDouble();
     }
+    // 分片已经齐了但原生没来得及把 state 翻成 ready（最后几个回调在系统唤醒
+    // 间隙里丢了）：事件这一层也要认，否则就等 6s 对账轮询兜底。
+    final allDone = segTotal > 0 && segDone >= segTotal;
     switch (e['state'] as String? ?? 'downloading') {
       case 'ready':
         task.stage = 'ready';
@@ -927,40 +970,94 @@ class ConvertManager extends ChangeNotifier {
         }
         task.canForceMerge = true;
         unawaited(_savePending(task));
+      case 'paused':
+        // 系统把传输掐了 / 用户暂停：不能继续伪装「下载中」，落成可续传的暂停态
+        task.failed = true;
+        task.stage = 'paused';
+        final err = e['error'] as String? ?? '';
+        task.error = err.isEmpty ? '已暂停，点「继续下载」续传' : err;
+        if (task.totalSegments > task.doneSegments) {
+          task.failedSegments = task.totalSegments - task.doneSegments;
+        }
+        task.canForceMerge = task.doneSegments > 0;
+        unawaited(_savePending(task));
       default:
-        task.stage = 'downloading';
+        if (allDone) {
+          task.stage = 'ready';
+          unawaited(_finishNative(task));
+        } else {
+          task.stage = 'downloading';
+        }
     }
     notifyListeners();
   }
 
   /// App 回前台 / 冷启动对账：后台期间事件可能整段丢失，以原生磁盘状态为准。
-  Future<void> onResume() => _resumeNativeJobs();
+  Future<void> onResume() => _resumeNativeJobs(resetSpeed: true);
 
-  Future<void> _resumeNativeJobs() async {
-    final natives = tasks
-        .where((t) => t.mode == 'native' && !t.done)
-        .toList(growable: false);
-    if (natives.isEmpty) return;
+  /// 前台看护：每 6s 对账一次。只在有 native 作业没结束时存在，作业收尾即停。
+  void _ensureNativeWatch() {
+    if (_nativeWatch != null) return;
+    if (!tasks.any((t) => t.mode == 'native' && !t.done && !t.failed)) return;
+    _nativeWatch = Timer.periodic(const Duration(seconds: 6), (_) {
+      unawaited(_pollNative());
+    });
+  }
+
+  void _stopNativeWatch() {
+    _nativeWatch?.cancel();
+    _nativeWatch = null;
+    _nativeIdlePolls.clear();
+    _nativeMissingPolls.clear();
+  }
+
+  Future<void> _pollNative() async {
+    if (!tasks.any((t) => t.mode == 'native' && !t.done && !t.failed)) {
+      _stopNativeWatch();
+      return;
+    }
+    await _resumeNativeJobs(autoResume: true);
+  }
+
+  Future<void> _resumeNativeJobs(
+      {bool autoResume = false, bool resetSpeed = false}) async {
+    final natives =
+        tasks.where((t) => t.mode == 'native' && !t.done).toList(growable: false);
+    if (natives.isEmpty) {
+      _stopNativeWatch();
+      return;
+    }
     final byId = <String, NativeJobStatus>{
       for (final s in await NativeBgDownloader.listJobs()) s.jobId: s,
     };
+    var stillActive = false;
     for (final t in natives) {
       final s = byId[t.id];
       if (s == null) {
-        if (!t.failed) {
+        final n = (_nativeMissingPolls[t.id] ?? 0) + 1;
+        _nativeMissingPolls[t.id] = n;
+        _nativeIdlePolls.remove(t.id);
+        if (n >= 2 && !t.failed) {
           t.failed = true;
           t.stage = 'failed';
           t.error = '作业记录丢失';
+        } else if (!t.failed) {
+          t.stage = 'downloading';
+          stillActive = true; // 再给一轮确认，别因为一次通道抖动就停掉看护
         }
         continue;
       }
+      _nativeMissingPolls.remove(t.id);
       if (s.workDir.isNotEmpty && Directory(s.workDir).existsSync()) {
         t.workDir = s.workDir;
       }
       if (s.bytes > 0) {
-        // 这批字节是系统在后台代下的，不能当成瞬时速度：先清基线再采样
-        t.bytesSampledAt = null;
-        t.speed = 0;
+        // 后台代下的那批字节不能当瞬时速度：回前台/冷启动时先清基线再采样。
+        // 6s 的对账轮询不能这么清 —— 否则前台速度每 6s 闪一次 0。
+        if (resetSpeed) {
+          t.bytesSampledAt = null;
+          t.speed = 0;
+        }
         _applyByteProgress(t, s.bytes, s.bytesTotal, s.bytesEstimated);
       }
       // 分片数以原生磁盘状态为准（冷启动后 Dart 侧的内存计数已丢失）
@@ -970,7 +1067,9 @@ class ConvertManager extends ChangeNotifier {
       if (t.bytesTotal <= t.bytes) {
         t.progress = s.progress;
       }
-      if (s.isReady) {
+      final allDone = s.total > 0 && s.done >= s.total;
+      if (s.isReady || (allDone && !s.isFailed)) {
+        _nativeIdlePolls.remove(t.id);
         t.failed = false;
         t.error = null;
         t.stage = 'ready';
@@ -986,13 +1085,69 @@ class ConvertManager extends ChangeNotifier {
           t.failedSegments = t.totalSegments - t.doneSegments;
         }
         t.canForceMerge = true;
+        _nativeIdlePolls.remove(t.id);
+      } else if (s.isPaused) {
+        // 暂停不是错误，但也不能继续显示「下载中」：归入可续传态，
+        // 列表出现「继续下载」（resumable 由 workDir 决定）
+        t.failed = true;
+        t.stage = 'paused';
+        final err = s.error ?? '';
+        t.error = err.isEmpty ? '已暂停，点「继续下载」续传' : err;
+        if (t.totalSegments > t.doneSegments) {
+          t.failedSegments = t.totalSegments - t.doneSegments;
+        }
+        t.canForceMerge = t.doneSegments > 0;
+        _nativeIdlePolls.remove(t.id);
       } else {
         t.failed = false;
         t.error = null;
         t.stage = 'downloading';
+        var keepWatching = true;
+        // 自动续传：state 还在 downloading，但系统里已经没有任何在途 task
+        // （回调丢了 / 会话被回收）。连续两轮都这样才动手，避免和刚提交的
+        // task 抢跑；在途 task 还在时绝不重复建 task（会重复写同一目标文件）。
+        if (autoResume && s.total > 0 && s.done < s.total && s.active <= 0) {
+          final n = (_nativeIdlePolls[t.id] ?? 0) + 1;
+          _nativeIdlePolls[t.id] = n;
+          if (n >= 2) {
+            _nativeIdlePolls[t.id] = 0;
+            final tries = (_nativeAutoResumes[t.id] ?? 0) + 1;
+            _nativeAutoResumes[t.id] = tries;
+            if (tries <= 3) {
+              AppLog.instance.warn('convert',
+                  '原生作业无在途传输 ${s.done}/${s.total}，自动续传（第 $tries 次）: ${t.title}');
+              final ok = await NativeBgDownloader.resume(t.id);
+              if (!ok) {
+                AppLog.instance.warn('convert', '自动续传调用失败: ${t.title}');
+              }
+            } else {
+              // 续传也拉不起来（签名过期 / 源站拒绝）：交给用户点「继续下载」，
+              // 那条路会重拉清单、换新地址，比在这里死循环有用
+              t.failed = true;
+              t.stage = 'failed';
+              t.error = '下载中断，点「继续下载」重试';
+              if (t.totalSegments > t.doneSegments) {
+                t.failedSegments = t.totalSegments - t.doneSegments;
+              }
+              t.canForceMerge = t.doneSegments > 0;
+              keepWatching = false;
+              unawaited(_savePending(t));
+              AppLog.instance.warn('convert',
+                  '自动续传仍未恢复，标记为可续传: ${t.title}（${s.done}/${s.total}）');
+            }
+          }
+        } else {
+          _nativeIdlePolls[t.id] = 0;
+        }
+        if (keepWatching) stillActive = true;
       }
     }
     notifyListeners();
+    if (stillActive) {
+      _ensureNativeWatch();
+    } else {
+      _stopNativeWatch();
+    }
   }
 
   // ---------- 收尾（mp4 输出 → Downloads） ----------
